@@ -96,7 +96,7 @@ pub struct ClusterConfig {
     pub enforce_hardware_attestation: bool,
 
     /// Whether the attestation challenge nonce is strictly verified during enrollment.
-    /// When true, attestationChallenge must match SHA-256(pairing_token || node_id).
+    /// When true, attestationChallenge must match SHA-256("{pairing_token}:{node_id}").
     /// Default: false (permits staged mobile client rollout without breaking legacy clients).
     /// Traces to: [INV-002], [NFR-SEC-001]
     pub require_attestation_challenge: bool,

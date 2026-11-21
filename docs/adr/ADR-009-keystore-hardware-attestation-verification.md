@@ -45,7 +45,7 @@ We introduce an Android KeyStore Hardware Attestation verification engine and pr
    - If the public keys do not match, enrollment is immediately rejected to prevent attestation forwarding attacks.
 
 6. **Staged Challenge Nonce Support (`ANDROGRID_REQUIRE_ATTESTATION_CHALLENGE`):**
-   - Attestation challenge verification supports staged rollout via `require_attestation_challenge`. When enabled, `attestationChallenge` is verified against `SHA-256(pairing_token || node_id)`. When disabled, challenge verification logs a diagnostic notice for legacy client compatibility.
+   - Attestation challenge verification supports staged rollout via `require_attestation_challenge`. When enabled, `attestationChallenge` is verified against `SHA-256("{pairing_token}:{node_id}")` with a colon delimiter to prevent concatenation collisions. When disabled, challenge verification logs a diagnostic notice for legacy client compatibility.
 
 7. **Pre-Authentication DoS Protection & Input Bounding:**
    - Attestation parsing and cryptographic verification execute inside `token_store.redeem_with` only after token validation and rate limiting succeed.

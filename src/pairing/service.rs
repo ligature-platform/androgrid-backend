@@ -58,10 +58,7 @@ pub struct HttpEnrollResponse {
 }
 
 /// Maximum number of certificates allowed in an attestation chain PEM submission.
-pub const MAX_ATTESTATION_CHAIN_LEN: usize = 6;
-
-/// Maximum allowed total byte size for attestation certificate chain PEM submissions (32 KiB).
-pub const MAX_ATTESTATION_PEM_BYTES: usize = 32 * 1024;
+pub use crate::pairing::attestation::{MAX_ATTESTATION_CHAIN_LEN, MAX_ATTESTATION_PEM_BYTES};
 
 /// Shared application state for bootstrap enrollment services.
 #[derive(Clone)]
@@ -743,5 +740,127 @@ mod tests {
         );
         assert!(!body.client_cert_pem.is_empty());
         assert!(!body.ca_cert_pem.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_grpc_enrollment_with_required_challenge_success_and_mismatch() {
+        use crate::pairing::attestation::{
+            build_test_key_description_der, AttestationSecurityLevel,
+        };
+        use rcgen::CustomExtension;
+
+        let (base_ctx, _ca_key, _ca_pem) = create_test_context();
+
+        // 1. Root CA setup
+        let mut root_params = CertificateParams::default();
+        root_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        root_params
+            .distinguished_name
+            .push(DnType::CommonName, "Test Root");
+        let root_key = KeyPair::generate().unwrap();
+        let root_cert = root_params.self_signed(&root_key).unwrap();
+        let root_spki = root_key.public_key_der();
+
+        let verifier = Arc::new(HardwareAttestationVerifier::with_custom_roots(&[root_spki]));
+        let enforced_ctx = EnrollmentContext::with_hardware_attestation(
+            Arc::clone(&base_ctx.token_store),
+            Arc::clone(&base_ctx.signer),
+            true,
+            true, // require_attestation_challenge = true
+            Some(verifier),
+        );
+        let service = EnrollmentServiceImpl::with_context(enforced_ctx);
+
+        let node_id = "worker-challenge-test";
+        let record = base_ctx
+            .token_store
+            .generate_token(Some(node_id.to_string()), Some(300))
+            .expect("Token generation");
+
+        let (csr_pem, worker_key) = generate_test_csr(node_id);
+
+        // Case A: Matching challenge SHA-256("{token}:{node_id}")
+        let matching_digest = ring::digest::digest(
+            &ring::digest::SHA256,
+            format!("{}:{node_id}", record.token).as_bytes(),
+        );
+        let valid_ext_der = build_test_key_description_der(
+            3,
+            AttestationSecurityLevel::TrustedEnvironment,
+            4,
+            AttestationSecurityLevel::TrustedEnvironment,
+            matching_digest.as_ref(),
+        );
+        let mut leaf_params = CertificateParams::default();
+        leaf_params
+            .distinguished_name
+            .push(DnType::CommonName, node_id);
+        leaf_params
+            .custom_extensions
+            .push(CustomExtension::from_oid_content(
+                &[1, 3, 6, 1, 4, 1, 11129, 2, 1, 17],
+                valid_ext_der,
+            ));
+        let leaf_cert = leaf_params
+            .signed_by(&worker_key, &root_cert, &root_key)
+            .unwrap();
+
+        let req = tonic::Request::new(EnrollWorkerRequest {
+            pairing_token: record.token.clone(),
+            node_id: node_id.to_string(),
+            csr_pem: csr_pem.clone(),
+            attestation_certificate_chain_pem: vec![leaf_cert.pem(), root_cert.pem()],
+        });
+
+        let resp = service.enroll_worker(req).await.expect("RPC call");
+        let body = resp.into_inner();
+        assert!(
+            body.success,
+            "Matching challenge must succeed: {}",
+            body.error_message
+        );
+        assert!(!body.client_cert_pem.is_empty());
+
+        // Case B: Mismatched challenge
+        let record_mismatch = base_ctx
+            .token_store
+            .generate_token(Some(node_id.to_string()), Some(300))
+            .expect("Token generation");
+        let wrong_ext_der = build_test_key_description_der(
+            3,
+            AttestationSecurityLevel::TrustedEnvironment,
+            4,
+            AttestationSecurityLevel::TrustedEnvironment,
+            b"wrong-challenge-nonce",
+        );
+        let mut wrong_leaf_params = CertificateParams::default();
+        wrong_leaf_params
+            .distinguished_name
+            .push(DnType::CommonName, node_id);
+        wrong_leaf_params
+            .custom_extensions
+            .push(CustomExtension::from_oid_content(
+                &[1, 3, 6, 1, 4, 1, 11129, 2, 1, 17],
+                wrong_ext_der,
+            ));
+        let wrong_leaf_cert = wrong_leaf_params
+            .signed_by(&worker_key, &root_cert, &root_key)
+            .unwrap();
+
+        let req_mismatch = tonic::Request::new(EnrollWorkerRequest {
+            pairing_token: record_mismatch.token.clone(),
+            node_id: node_id.to_string(),
+            csr_pem: csr_pem.clone(),
+            attestation_certificate_chain_pem: vec![wrong_leaf_cert.pem(), root_cert.pem()],
+        });
+
+        let resp_mismatch = service.enroll_worker(req_mismatch).await.expect("RPC call");
+        let body_mismatch = resp_mismatch.into_inner();
+        assert!(!body_mismatch.success, "Mismatched challenge must fail");
+        assert!(
+            body_mismatch.error_message.contains("challenge mismatch"),
+            "Error must specify challenge mismatch, got: {}",
+            body_mismatch.error_message
+        );
     }
 }
