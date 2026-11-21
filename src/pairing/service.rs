@@ -15,6 +15,7 @@ use std::sync::Arc;
 use tonic::{Request, Response as TonicResponse, Status};
 use tracing::{error, info, warn};
 
+use crate::pairing::attestation::{AttestationError, HardwareAttestationVerifier};
 use crate::pairing::signer::{CaSigner, SignedWorkerCert, SignerError};
 use crate::pairing::token::{PairingError, PairingTokenStore, RedeemActionError};
 use crate::proto::androgrid::v1::enrollment_service_server::EnrollmentService;
@@ -31,6 +32,10 @@ pub struct HttpEnrollRequest {
 
     /// PEM-encoded PKCS#10 Certificate Signing Request.
     pub csr_pem: String,
+
+    /// Optional PEM-encoded Android KeyStore hardware attestation certificate chain.
+    #[serde(default)]
+    pub attestation_certificate_chain_pem: Vec<String>,
 }
 
 /// HTTP JSON response body for device bootstrap enrollment.
@@ -57,12 +62,15 @@ pub struct HttpEnrollResponse {
 pub struct EnrollmentContext {
     pub token_store: Arc<PairingTokenStore>,
     pub signer: Arc<CaSigner>,
+    pub enforce_hardware_attestation: bool,
+    pub attestation_verifier: Arc<HardwareAttestationVerifier>,
 }
 
-/// Unified enrollment error distinguishing token/rate-limit errors from CSR signing errors.
+/// Unified enrollment error distinguishing token/rate-limit errors from CSR signing and attestation errors.
 pub enum EnrollFailure {
     Pairing(PairingError),
     Signer(SignerError),
+    Attestation(AttestationError),
 }
 
 impl std::fmt::Display for EnrollFailure {
@@ -70,21 +78,68 @@ impl std::fmt::Display for EnrollFailure {
         match self {
             EnrollFailure::Pairing(e) => e.fmt(f),
             EnrollFailure::Signer(e) => e.fmt(f),
+            EnrollFailure::Attestation(e) => e.fmt(f),
         }
     }
 }
 
 impl EnrollmentContext {
-    /// Atomically validates the pairing token, signs the worker CSR, and marks
-    /// the token as redeemed only after certificate issuance succeeds.
+    /// Constructs a new EnrollmentContext with default hardware attestation settings.
+    pub fn new(token_store: Arc<PairingTokenStore>, signer: Arc<CaSigner>) -> Self {
+        Self {
+            token_store,
+            signer,
+            enforce_hardware_attestation: false,
+            attestation_verifier: Arc::new(HardwareAttestationVerifier::new()),
+        }
+    }
+
+    /// Constructs an EnrollmentContext with explicit hardware attestation enforcement policy and verifier.
+    pub fn with_hardware_attestation(
+        token_store: Arc<PairingTokenStore>,
+        signer: Arc<CaSigner>,
+        enforce_hardware_attestation: bool,
+        attestation_verifier: Option<Arc<HardwareAttestationVerifier>>,
+    ) -> Self {
+        Self {
+            token_store,
+            signer,
+            enforce_hardware_attestation,
+            attestation_verifier: attestation_verifier
+                .unwrap_or_else(|| Arc::new(HardwareAttestationVerifier::new())),
+        }
+    }
+
+    /// Atomically validates the pairing token, verifies the KeyStore hardware attestation chain
+    /// (if enforced or provided), signs the worker CSR, and marks the token as redeemed
+    /// only after certificate issuance succeeds.
     ///
-    /// Traces to: [INV-002], [NFR-SEC-001], [REQ-OP-001]
+    /// Traces to: [INV-001], [INV-002], [NFR-SEC-001], [REQ-OP-001]
     pub fn redeem_and_sign(
         &self,
         token: &str,
         node_id: &str,
         csr_pem: &str,
+        attestation_chain_pem: &[String],
     ) -> Result<SignedWorkerCert, EnrollFailure> {
+        // Enforce or validate Android KeyStore hardware attestation chain
+        if self.enforce_hardware_attestation {
+            if attestation_chain_pem.is_empty() {
+                return Err(EnrollFailure::Attestation(AttestationError::AttestationRequired));
+            }
+            let csr_spki = CaSigner::extract_p256_csr_spki(csr_pem)
+                .map_err(EnrollFailure::Signer)?;
+            self.attestation_verifier
+                .verify_chain(attestation_chain_pem, &csr_spki)
+                .map_err(EnrollFailure::Attestation)?;
+        } else if !attestation_chain_pem.is_empty() {
+            let csr_spki = CaSigner::extract_p256_csr_spki(csr_pem)
+                .map_err(EnrollFailure::Signer)?;
+            self.attestation_verifier
+                .verify_chain(attestation_chain_pem, &csr_spki)
+                .map_err(EnrollFailure::Attestation)?;
+        }
+
         self.token_store
             .redeem_with(token, node_id, |_| {
                 self.signer.sign_worker_csr(csr_pem, node_id)
@@ -107,11 +162,13 @@ impl EnrollmentServiceImpl {
     /// Constructs a new EnrollmentServiceImpl with the provided context.
     pub fn new(token_store: Arc<PairingTokenStore>, signer: Arc<CaSigner>) -> Self {
         Self {
-            context: EnrollmentContext {
-                token_store,
-                signer,
-            },
+            context: EnrollmentContext::new(token_store, signer),
         }
+    }
+
+    /// Constructs an EnrollmentServiceImpl with a pre-configured EnrollmentContext.
+    pub fn with_context(context: EnrollmentContext) -> Self {
+        Self { context }
     }
 }
 
@@ -155,7 +212,7 @@ impl EnrollmentService for EnrollmentServiceImpl {
 
         info!(node_id = %node_id, "Processing gRPC worker enrollment request [REQ-OP-001]");
 
-        match self.context.redeem_and_sign(token, node_id, csr_pem) {
+        match self.context.redeem_and_sign(token, node_id, csr_pem, &req.attestation_certificate_chain_pem) {
             Ok(signed) => {
                 info!(node_id = %node_id, "Successfully issued mTLS client certificate [INV-002]");
                 Ok(TonicResponse::new(EnrollWorkerResponse {
@@ -176,6 +233,15 @@ impl EnrollmentService for EnrollmentServiceImpl {
             }
             Err(EnrollFailure::Signer(e)) => {
                 error!(node_id = %node_id, error = %e, "Failed to sign worker CSR");
+                Ok(TonicResponse::new(EnrollWorkerResponse {
+                    success: false,
+                    client_cert_pem: String::new(),
+                    ca_cert_pem: String::new(),
+                    error_message: e.to_string(),
+                }))
+            }
+            Err(EnrollFailure::Attestation(e)) => {
+                warn!(node_id = %node_id, error = %e, "Worker hardware attestation rejected");
                 Ok(TonicResponse::new(EnrollWorkerResponse {
                     success: false,
                     client_cert_pem: String::new(),
@@ -222,7 +288,7 @@ async fn handle_http_enroll(
 
     info!(node_id = %node_id, "Processing HTTP worker enrollment request [REQ-OP-001]");
 
-    match context.redeem_and_sign(token, node_id, csr_pem) {
+    match context.redeem_and_sign(token, node_id, csr_pem, &payload.attestation_certificate_chain_pem) {
         Ok(signed) => {
             info!(node_id = %node_id, "Successfully issued mTLS client certificate via HTTP [INV-002]");
             (
@@ -270,6 +336,19 @@ async fn handle_http_enroll(
             )
                 .into_response()
         }
+        Err(EnrollFailure::Attestation(e)) => {
+            warn!(node_id = %node_id, error = %e, "HTTP worker hardware attestation rejected");
+            (
+                StatusCode::FORBIDDEN,
+                Json(HttpEnrollResponse {
+                    success: false,
+                    client_cert_pem: String::new(),
+                    ca_cert_pem: String::new(),
+                    error_message: e.to_string(),
+                }),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -294,10 +373,7 @@ mod tests {
         let token_store = Arc::new(PairingTokenStore::default());
 
         (
-            EnrollmentContext {
-                token_store,
-                signer,
-            },
+            EnrollmentContext::new(token_store, signer),
             ca_key,
             ca_cert.pem(),
         )
@@ -329,6 +405,7 @@ mod tests {
             pairing_token: record.token.clone(),
             node_id: node_id.to_string(),
             csr_pem: csr_pem.clone(),
+            attestation_certificate_chain_pem: Vec::new(),
         });
 
         // 1. Initial enrollment must succeed
@@ -347,6 +424,7 @@ mod tests {
             pairing_token: record.token,
             node_id: node_id.to_string(),
             csr_pem,
+            attestation_certificate_chain_pem: Vec::new(),
         });
 
         let repeat_resp = service.enroll_worker(repeat_req).await.expect("RPC call");
@@ -372,6 +450,7 @@ mod tests {
             pairing_token: record.token,
             node_id: "impostor-worker".to_string(),
             csr_pem,
+            attestation_certificate_chain_pem: Vec::new(),
         });
 
         let resp = service.enroll_worker(req).await.expect("RPC call");
@@ -397,6 +476,7 @@ mod tests {
             pairing_token: record.token.clone(),
             node_id: node_id.to_string(),
             csr_pem: "NOT A VALID CSR".to_string(),
+            attestation_certificate_chain_pem: Vec::new(),
         });
         let bad_resp = service.enroll_worker(bad_req).await.expect("RPC call");
         assert!(!bad_resp.into_inner().success);
@@ -407,6 +487,7 @@ mod tests {
             pairing_token: record.token,
             node_id: node_id.to_string(),
             csr_pem,
+            attestation_certificate_chain_pem: Vec::new(),
         });
         let good_resp = service.enroll_worker(good_req).await.expect("RPC call");
         let body = good_resp.into_inner();
@@ -415,5 +496,173 @@ mod tests {
             "Retry with valid CSR must succeed: {}",
             body.error_message
         );
+    }
+
+    #[tokio::test]
+    async fn test_grpc_enrollment_rejects_missing_attestation_when_enforced() {
+        let (base_ctx, _ca_key, _ca_pem) = create_test_context();
+        let enforced_ctx = EnrollmentContext::with_hardware_attestation(
+            Arc::clone(&base_ctx.token_store),
+            Arc::clone(&base_ctx.signer),
+            true, // enforce hardware attestation
+            None,
+        );
+        let service = EnrollmentServiceImpl::with_context(enforced_ctx);
+
+        let node_id = "worker-no-attestation";
+        let record = base_ctx
+            .token_store
+            .generate_token(Some(node_id.to_string()), Some(300))
+            .expect("Token generation");
+
+        let (csr_pem, _key) = generate_test_csr(node_id);
+        let req = tonic::Request::new(EnrollWorkerRequest {
+            pairing_token: record.token.clone(),
+            node_id: node_id.to_string(),
+            csr_pem: csr_pem.clone(),
+            attestation_certificate_chain_pem: Vec::new(), // No attestation chain
+        });
+
+        let resp = service.enroll_worker(req).await.expect("RPC call");
+        let body = resp.into_inner();
+        assert!(!body.success, "Must reject enrollment without attestation when enforced");
+        assert!(body.error_message.contains("Hardware attestation chain required"));
+
+        // Single-use token must NOT be burned by a failed attestation check
+        let retry_token = base_ctx.token_store.redeem_token(&record.token, node_id);
+        assert!(retry_token.is_ok(), "Token should remain unredeemed on attestation rejection");
+    }
+
+    #[tokio::test]
+    async fn test_grpc_enrollment_rejects_software_attestation_when_enforced() {
+        use crate::pairing::attestation::build_test_key_description_der;
+        use crate::pairing::attestation::AttestationSecurityLevel;
+        use rcgen::CustomExtension;
+
+        let (base_ctx, _ca_key, _ca_pem) = create_test_context();
+
+        // Generate test attestation root
+        let mut root_params = CertificateParams::default();
+        root_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        root_params.distinguished_name.push(DnType::CommonName, "Test Hardware Root");
+        let root_key = KeyPair::generate().unwrap();
+        let root_cert = root_params.self_signed(&root_key).unwrap();
+        let root_spki = root_key.public_key_der();
+
+        let verifier = Arc::new(HardwareAttestationVerifier::with_custom_roots(&[root_spki]));
+        let enforced_ctx = EnrollmentContext::with_hardware_attestation(
+            Arc::clone(&base_ctx.token_store),
+            Arc::clone(&base_ctx.signer),
+            true,
+            Some(verifier),
+        );
+        let service = EnrollmentServiceImpl::with_context(enforced_ctx);
+
+        let node_id = "worker-software-attest";
+        let record = base_ctx
+            .token_store
+            .generate_token(Some(node_id.to_string()), Some(300))
+            .expect("Token generation");
+
+        let (csr_pem, worker_key) = generate_test_csr(node_id);
+
+        // Build leaf certificate containing Software security level attestation
+        let soft_ext_der = build_test_key_description_der(
+            3,
+            AttestationSecurityLevel::Software,
+            4,
+            AttestationSecurityLevel::Software,
+            b"test-nonce",
+        );
+        let mut leaf_params = CertificateParams::default();
+        leaf_params.distinguished_name.push(DnType::CommonName, node_id);
+        leaf_params.custom_extensions.push(CustomExtension::from_oid_content(
+            &[1, 3, 6, 1, 4, 1, 11129, 2, 1, 17],
+            soft_ext_der,
+        ));
+        let leaf_cert = leaf_params
+            .signed_by(&worker_key, &root_cert, &root_key)
+            .unwrap();
+
+        let chain = vec![leaf_cert.pem(), root_cert.pem()];
+
+        let req = tonic::Request::new(EnrollWorkerRequest {
+            pairing_token: record.token.clone(),
+            node_id: node_id.to_string(),
+            csr_pem: csr_pem.clone(),
+            attestation_certificate_chain_pem: chain,
+        });
+
+        let resp = service.enroll_worker(req).await.expect("RPC call");
+        let body = resp.into_inner();
+        assert!(!body.success, "Software attestation must be rejected");
+        assert!(body.error_message.contains("Insecure attestation security level"));
+    }
+
+    #[tokio::test]
+    async fn test_grpc_enrollment_accepts_valid_hardware_attestation_when_enforced() {
+        use crate::pairing::attestation::build_test_key_description_der;
+        use crate::pairing::attestation::AttestationSecurityLevel;
+        use rcgen::CustomExtension;
+
+        let (base_ctx, _ca_key, _ca_pem) = create_test_context();
+
+        // Generate test attestation root
+        let mut root_params = CertificateParams::default();
+        root_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        root_params.distinguished_name.push(DnType::CommonName, "Test Hardware Root");
+        let root_key = KeyPair::generate().unwrap();
+        let root_cert = root_params.self_signed(&root_key).unwrap();
+        let root_spki = root_key.public_key_der();
+
+        let verifier = Arc::new(HardwareAttestationVerifier::with_custom_roots(&[root_spki]));
+        let enforced_ctx = EnrollmentContext::with_hardware_attestation(
+            Arc::clone(&base_ctx.token_store),
+            Arc::clone(&base_ctx.signer),
+            true,
+            Some(verifier),
+        );
+        let service = EnrollmentServiceImpl::with_context(enforced_ctx);
+
+        let node_id = "worker-hardware-attest";
+        let record = base_ctx
+            .token_store
+            .generate_token(Some(node_id.to_string()), Some(300))
+            .expect("Token generation");
+
+        let (csr_pem, worker_key) = generate_test_csr(node_id);
+
+        // Build leaf certificate containing TrustedEnvironment security level attestation
+        let tee_ext_der = build_test_key_description_der(
+            3,
+            AttestationSecurityLevel::TrustedEnvironment,
+            4,
+            AttestationSecurityLevel::TrustedEnvironment,
+            b"valid-tee-nonce",
+        );
+        let mut leaf_params = CertificateParams::default();
+        leaf_params.distinguished_name.push(DnType::CommonName, node_id);
+        leaf_params.custom_extensions.push(CustomExtension::from_oid_content(
+            &[1, 3, 6, 1, 4, 1, 11129, 2, 1, 17],
+            tee_ext_der,
+        ));
+        let leaf_cert = leaf_params
+            .signed_by(&worker_key, &root_cert, &root_key)
+            .unwrap();
+
+        let chain = vec![leaf_cert.pem(), root_cert.pem()];
+
+        let req = tonic::Request::new(EnrollWorkerRequest {
+            pairing_token: record.token.clone(),
+            node_id: node_id.to_string(),
+            csr_pem: csr_pem.clone(),
+            attestation_certificate_chain_pem: chain,
+        });
+
+        let resp = service.enroll_worker(req).await.expect("RPC call");
+        let body = resp.into_inner();
+        assert!(body.success, "Hardware attestation must succeed: {}", body.error_message);
+        assert!(!body.client_cert_pem.is_empty());
+        assert!(!body.ca_cert_pem.is_empty());
     }
 }

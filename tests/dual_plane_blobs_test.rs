@@ -373,6 +373,7 @@ async fn test_dual_plane_50051_rbac_streaming_range_and_50052_hardening() {
             pairing_token: "bad".to_string(),
             node_id: "w1".to_string(),
             csr_pem: String::new(),
+            attestation_certificate_chain_pem: Vec::new(),
         })
         .await;
     if let Err(s) = enroll_res {

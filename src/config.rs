@@ -89,6 +89,11 @@ pub struct ClusterConfig {
     /// Maximum allowed byte length for uploaded APK artifacts (default: 128 MB).
     /// Traces to: [NFR-PERF-001]
     pub max_apk_bytes: usize,
+
+    /// Whether Android KeyStore hardware attestation verification is strictly enforced during enrollment.
+    /// When true, enrollment requests lacking valid TEE/StrongBox attestation chains are hard rejected.
+    /// Traces to: [INV-001], [INV-002], [NFR-SEC-001]
+    pub enforce_hardware_attestation: bool,
 }
 
 impl Default for ClusterConfig {
@@ -117,6 +122,7 @@ impl Default for ClusterConfig {
             artifact_base_url: None,
             artifact_storage_dir: None,
             max_apk_bytes: 128 * 1024 * 1024,
+            enforce_hardware_attestation: false,
         }
     }
 }
@@ -240,6 +246,10 @@ impl ClusterConfig {
                         var: "ANDROGRID_MAX_APK_BYTES",
                         val,
                     })?;
+        }
+
+        if let Ok(val) = std::env::var("ANDROGRID_ENFORCE_HARDWARE_ATTESTATION") {
+            config.enforce_hardware_attestation = val.eq_ignore_ascii_case("true") || val == "1";
         }
 
         config.validate_renewal_policy()?;

@@ -380,11 +380,14 @@ message GeneratePairingTokenResponse {
 }
 
 // Request to redeem pairing token and sign client CSR.
-// Traces to: [INV-002], [NFR-SEC-001], [REQ-OP-001]
+// Traces to: [INV-001], [INV-002], [NFR-SEC-001], [REQ-OP-001]
 message EnrollWorkerRequest {
   string pairing_token = 1;
   string node_id = 2;
   string csr_pem = 3;
+  // Optional Android KeyStore hardware attestation certificate chain (PEM-encoded X.509, leaf first).
+  // Traces to: [INV-001], [INV-002], [NFR-SEC-001]
+  repeated string attestation_certificate_chain_pem = 4;
 }
 
 // Response returning signed X.509 client certificate and Root CA.
