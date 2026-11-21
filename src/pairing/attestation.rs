@@ -42,6 +42,12 @@ pub const GOOGLE_ROOT_CA_EC_SPKI_B64: &str =
     9FPQywiyw8EQRTkJ9u3qwfnI4DGoSLlBqClTXJfgfCcZvs60FikNMHnu4fkRzObf\
     gDkU2KNXezT9/RQ+XvNslxPHrHCowhGr";
 
+/// Maximum allowed certificates in an attestation chain (leaf + up to 5 intermediates/roots).
+pub const MAX_ATTESTATION_CHAIN_LEN: usize = 6;
+
+/// Maximum allowed total PEM byte size for attestation certificates (32 KiB).
+pub const MAX_ATTESTATION_PEM_BYTES: usize = 32 * 1024;
+
 /// Security tier where the keypair was generated or attestation certificate was signed.
 /// Defined by the Android Keymaster / KeyMint HAL specification.
 /// Traces to: [INV-001], [INV-002], [NFR-SEC-001]
@@ -280,12 +286,26 @@ impl HardwareAttestationVerifier {
         expected_csr_spki: &[u8],
         expected_challenge: Option<&[u8]>,
     ) -> Result<KeyDescription, AttestationError> {
+        let total_bytes: usize = chain_pems.iter().map(|s| s.len()).sum();
+        if total_bytes > MAX_ATTESTATION_PEM_BYTES {
+            return Err(AttestationError::PayloadTooLarge(
+                total_bytes,
+                MAX_ATTESTATION_PEM_BYTES,
+            ));
+        }
+
         let cert_ders = parse_cert_chain_ders(chain_pems)?;
         if cert_ders.is_empty() {
             return Err(AttestationError::EmptyChain);
         }
         if cert_ders.len() < 2 {
             return Err(AttestationError::IncompleteChain(cert_ders.len()));
+        }
+        if cert_ders.len() > MAX_ATTESTATION_CHAIN_LEN {
+            return Err(AttestationError::ChainTooLong(
+                cert_ders.len(),
+                MAX_ATTESTATION_CHAIN_LEN,
+            ));
         }
 
         // Parse all certificates in the chain
@@ -307,9 +327,17 @@ impl HardwareAttestationVerifier {
             }
 
             // Check KeyUsage keyCertSign if KeyUsage extension is present
-            if let Ok(Some(ku_ext)) = cert.key_usage() {
-                if !ku_ext.value.key_cert_sign() {
-                    return Err(AttestationError::MissingKeyCertSign(idx));
+            match cert.key_usage() {
+                Ok(Some(ku_ext)) => {
+                    if !ku_ext.value.key_cert_sign() {
+                        return Err(AttestationError::MissingKeyCertSign(idx));
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    return Err(AttestationError::CertificateParseError(format!(
+                        "Cert at index {idx} has malformed KeyUsage extension: {e}"
+                    )));
                 }
             }
 
@@ -469,6 +497,16 @@ fn verify_cert_signature(
                     parent_key_bytes.len()
                 )));
             }
+            if let Some(params) = &parent_spki.algorithm.parameters {
+                if let Ok(oid) = params.as_oid() {
+                    let oid_str = oid.to_id_string();
+                    if oid_str != "1.2.840.10045.3.1.7" {
+                        return Err(AttestationError::UnsupportedSignatureAlgorithm(format!(
+                            "Expected ECDSA P-256 curve (1.2.840.10045.3.1.7), found {oid_str}"
+                        )));
+                    }
+                }
+            }
             let peer_pub = ring::signature::UnparsedPublicKey::new(
                 &ring::signature::ECDSA_P256_SHA256_ASN1,
                 parent_key_bytes,
@@ -487,6 +525,16 @@ fn verify_cert_signature(
                     "ECDSA P-384 SHA-384 requires 97-byte uncompressed P-384 parent key, found {}",
                     parent_key_bytes.len()
                 )));
+            }
+            if let Some(params) = &parent_spki.algorithm.parameters {
+                if let Ok(oid) = params.as_oid() {
+                    let oid_str = oid.to_id_string();
+                    if oid_str != "1.3.132.0.34" {
+                        return Err(AttestationError::UnsupportedSignatureAlgorithm(format!(
+                            "Expected ECDSA P-384 curve (1.3.132.0.34), found {oid_str}"
+                        )));
+                    }
+                }
             }
             let peer_pub = ring::signature::UnparsedPublicKey::new(
                 &ring::signature::ECDSA_P384_SHA384_ASN1,
@@ -782,7 +830,9 @@ fn der_bytes_to_i64(bytes: &[u8]) -> Result<i64, AttestationError> {
             bytes.len()
         )));
     }
-    let mut val: i64 = 0;
+    // DER INTEGER is signed two's complement.
+    // If the leading bit of the most significant byte is 1, sign-extend with -1 (all 1s).
+    let mut val: i64 = if bytes[0] & 0x80 != 0 { -1 } else { 0 };
     for &b in bytes {
         val = (val << 8) | (b as i64);
     }
@@ -1001,7 +1051,10 @@ pub fn build_test_key_description_der_with_origin(
 #[cfg(test)]
 pub mod tests {
     use super::*;
-    use rcgen::{BasicConstraints, CertificateParams, CustomExtension, DnType, IsCa, KeyPair};
+    use rcgen::{
+        BasicConstraints, CertificateParams, CustomExtension, DnType, IsCa, KeyPair,
+        KeyUsagePurpose,
+    };
 
     #[test]
     fn test_parse_key_description_der_tee_and_strongbox() {
@@ -1510,5 +1563,156 @@ pub mod tests {
 
         let result = verifier.verify_chain(&chain_pems, &leaf_spki, None);
         assert_eq!(result, Err(AttestationError::MissingAttestationExtension));
+    }
+
+    #[test]
+    fn test_intermediate_missing_key_cert_sign_rejected() {
+        let mut root_params = CertificateParams::default();
+        root_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        root_params
+            .distinguished_name
+            .push(DnType::CommonName, "Test Root");
+        let root_key = KeyPair::generate().unwrap();
+        let root_cert = root_params.self_signed(&root_key).unwrap();
+        let root_spki = root_key.public_key_der();
+
+        let mut int_params = CertificateParams::default();
+        int_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        int_params
+            .distinguished_name
+            .push(DnType::CommonName, "Intermediate Without KeyCertSign");
+        // Explicitly set key usages without KeyCertSign
+        int_params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        let int_key = KeyPair::generate().unwrap();
+        let int_cert = int_params
+            .signed_by(&int_key, &root_cert, &root_key)
+            .unwrap();
+
+        let leaf_key = KeyPair::generate().unwrap();
+        let leaf_spki = leaf_key.public_key_der();
+        let ext_der = build_test_key_description_der(
+            3,
+            AttestationSecurityLevel::TrustedEnvironment,
+            4,
+            AttestationSecurityLevel::TrustedEnvironment,
+            b"nonce",
+        );
+        let mut leaf_params = CertificateParams::default();
+        leaf_params
+            .distinguished_name
+            .push(DnType::CommonName, "Leaf");
+        leaf_params
+            .custom_extensions
+            .push(CustomExtension::from_oid_content(
+                &[1, 3, 6, 1, 4, 1, 11129, 2, 1, 17],
+                ext_der,
+            ));
+        let leaf_cert = leaf_params
+            .signed_by(&leaf_key, &int_cert, &int_key)
+            .unwrap();
+
+        let chain_pems = vec![leaf_cert.pem(), int_cert.pem(), root_cert.pem()];
+        let verifier = HardwareAttestationVerifier::with_custom_roots(&[root_spki]);
+
+        let result = verifier.verify_chain(&chain_pems, &leaf_spki, None);
+        assert_eq!(result, Err(AttestationError::MissingKeyCertSign(1)));
+    }
+
+    #[test]
+    fn test_multi_cert_bundle_exceeding_chain_len_rejected() {
+        let mut cert_pems = Vec::new();
+        for i in 0..7 {
+            let mut params = CertificateParams::default();
+            params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+            params
+                .distinguished_name
+                .push(DnType::CommonName, format!("Bundle Cert {i}"));
+            let key = KeyPair::generate().unwrap();
+            let cert = params.self_signed(&key).unwrap();
+            cert_pems.push(cert.pem());
+        }
+
+        // Bundle all 7 certs into a single PEM string
+        let bundle_single_pem = cert_pems.join("\n");
+        let verifier = HardwareAttestationVerifier::new();
+        let dummy_spki = vec![0u8; 32];
+
+        // Must reject because total parsed DER certificates (7) > MAX_ATTESTATION_CHAIN_LEN (6)
+        let result = verifier.verify_chain(&[bundle_single_pem], &dummy_spki, None);
+        assert_eq!(
+            result,
+            Err(AttestationError::ChainTooLong(7, MAX_ATTESTATION_CHAIN_LEN))
+        );
+    }
+
+    #[test]
+    fn test_der_bytes_to_i64_two_complement() {
+        assert_eq!(der_bytes_to_i64(&[0x01]).unwrap(), 1);
+        assert_eq!(der_bytes_to_i64(&[0x00, 0x80]).unwrap(), 128);
+        assert_eq!(der_bytes_to_i64(&[0x00, 0xFF]).unwrap(), 255);
+        assert_eq!(der_bytes_to_i64(&[0xFF]).unwrap(), -1);
+        assert_eq!(der_bytes_to_i64(&[0xFE]).unwrap(), -2);
+        assert_eq!(der_bytes_to_i64(&[0x80]).unwrap(), -128);
+    }
+
+    #[test]
+    fn test_signature_algorithm_mismatch_rejected() {
+        let mut root_params = CertificateParams::default();
+        root_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        root_params
+            .distinguished_name
+            .push(DnType::CommonName, "Test Root");
+        let root_key = KeyPair::generate().unwrap();
+        let root_cert = root_params.self_signed(&root_key).unwrap();
+        let root_spki = root_key.public_key_der();
+
+        let leaf_key = KeyPair::generate().unwrap();
+        let leaf_spki = leaf_key.public_key_der();
+        let ext_der = build_test_key_description_der(
+            3,
+            AttestationSecurityLevel::TrustedEnvironment,
+            4,
+            AttestationSecurityLevel::TrustedEnvironment,
+            b"nonce",
+        );
+        let mut leaf_params = CertificateParams::default();
+        leaf_params
+            .distinguished_name
+            .push(DnType::CommonName, "Leaf");
+        leaf_params
+            .custom_extensions
+            .push(CustomExtension::from_oid_content(
+                &[1, 3, 6, 1, 4, 1, 11129, 2, 1, 17],
+                ext_der,
+            ));
+        let leaf_cert = leaf_params
+            .signed_by(&leaf_key, &root_cert, &root_key)
+            .unwrap();
+
+        // Tamper with the outer signature algorithm OID in the leaf certificate DER
+        let mut leaf_der = leaf_cert.der().to_vec();
+        // ecdsa-with-SHA256 OID bytes: 06 08 2A 86 48 CE 3D 04 03 02
+        let oid_pattern = [0x06, 0x08, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x02];
+        let matches: Vec<usize> = leaf_der
+            .windows(oid_pattern.len())
+            .enumerate()
+            .filter(|(_, window)| *window == oid_pattern)
+            .map(|(idx, _)| idx)
+            .collect();
+        // There are at least two occurrences: inner (TBS) and outer. Tamper with the last (outer) one.
+        assert!(matches.len() >= 2);
+        let outer_oid_pos = *matches.last().unwrap();
+        // Change last byte from 0x02 (SHA-256) to 0x03 (SHA-384)
+        leaf_der[outer_oid_pos + oid_pattern.len() - 1] = 0x03;
+
+        let tampered_leaf_pem = pem::encode(&pem::Pem::new("CERTIFICATE", leaf_der));
+        let chain_pems = vec![tampered_leaf_pem, root_cert.pem()];
+        let verifier = HardwareAttestationVerifier::with_custom_roots(&[root_spki]);
+
+        let result = verifier.verify_chain(&chain_pems, &leaf_spki, None);
+        assert!(matches!(
+            result,
+            Err(AttestationError::SignatureAlgorithmMismatch { .. })
+        ));
     }
 }
