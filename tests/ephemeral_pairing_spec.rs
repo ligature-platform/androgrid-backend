@@ -627,9 +627,10 @@ async fn test_enforce_hardware_attestation_integration_lifecycle() {
     // Generate simulated Google/OEM Hardware Attestation Root CA
     let mut attest_root_params = CertificateParams::default();
     attest_root_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-    attest_root_params
-        .distinguished_name
-        .push(DnType::CommonName, "Google Hardware Attestation Root CA Simulated");
+    attest_root_params.distinguished_name.push(
+        DnType::CommonName,
+        "Google Hardware Attestation Root CA Simulated",
+    );
     let attest_root_key = KeyPair::generate().expect("Attest root key");
     let attest_root_cert = attest_root_params
         .self_signed(&attest_root_key)
@@ -696,12 +697,14 @@ async fn test_enforce_hardware_attestation_integration_lifecycle() {
     let (csr_a, _key_a) = generate_client_csr(node_a);
 
     let reject_no_chain = enroll_client
-        .enroll_worker(tonic::Request::new(androgrid_backend::EnrollWorkerRequest {
-            pairing_token: token_a.token.clone(),
-            node_id: node_a.to_string(),
-            csr_pem: csr_a,
-            attestation_certificate_chain_pem: Vec::new(),
-        }))
+        .enroll_worker(tonic::Request::new(
+            androgrid_backend::EnrollWorkerRequest {
+                pairing_token: token_a.token.clone(),
+                node_id: node_a.to_string(),
+                csr_pem: csr_a,
+                attestation_certificate_chain_pem: Vec::new(),
+            },
+        ))
         .await
         .unwrap()
         .into_inner();
@@ -744,17 +747,25 @@ async fn test_enforce_hardware_attestation_integration_lifecycle() {
         .unwrap();
 
     let reject_soft_level = enroll_client
-        .enroll_worker(tonic::Request::new(androgrid_backend::EnrollWorkerRequest {
-            pairing_token: token_b.token.clone(),
-            node_id: node_b.to_string(),
-            csr_pem: csr_b,
-            attestation_certificate_chain_pem: vec![soft_leaf_cert.pem(), attest_root_cert.pem()],
-        }))
+        .enroll_worker(tonic::Request::new(
+            androgrid_backend::EnrollWorkerRequest {
+                pairing_token: token_b.token.clone(),
+                node_id: node_b.to_string(),
+                csr_pem: csr_b,
+                attestation_certificate_chain_pem: vec![
+                    soft_leaf_cert.pem(),
+                    attest_root_cert.pem(),
+                ],
+            },
+        ))
         .await
         .unwrap()
         .into_inner();
 
-    assert!(!reject_soft_level.success, "Software level must be rejected");
+    assert!(
+        !reject_soft_level.success,
+        "Software level must be rejected"
+    );
     assert!(
         reject_soft_level
             .error_message
@@ -792,12 +803,17 @@ async fn test_enforce_hardware_attestation_integration_lifecycle() {
         .unwrap();
 
     let accept_tee = enroll_client
-        .enroll_worker(tonic::Request::new(androgrid_backend::EnrollWorkerRequest {
-            pairing_token: token_c.token.clone(),
-            node_id: node_c.to_string(),
-            csr_pem: csr_c,
-            attestation_certificate_chain_pem: vec![tee_leaf_cert.pem(), attest_root_cert.pem()],
-        }))
+        .enroll_worker(tonic::Request::new(
+            androgrid_backend::EnrollWorkerRequest {
+                pairing_token: token_c.token.clone(),
+                node_id: node_c.to_string(),
+                csr_pem: csr_c,
+                attestation_certificate_chain_pem: vec![
+                    tee_leaf_cert.pem(),
+                    attest_root_cert.pem(),
+                ],
+            },
+        ))
         .await
         .unwrap()
         .into_inner();

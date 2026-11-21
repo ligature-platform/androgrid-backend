@@ -125,16 +125,18 @@ impl EnrollmentContext {
         // Enforce or validate Android KeyStore hardware attestation chain
         if self.enforce_hardware_attestation {
             if attestation_chain_pem.is_empty() {
-                return Err(EnrollFailure::Attestation(AttestationError::AttestationRequired));
+                return Err(EnrollFailure::Attestation(
+                    AttestationError::AttestationRequired,
+                ));
             }
-            let csr_spki = CaSigner::extract_p256_csr_spki(csr_pem)
-                .map_err(EnrollFailure::Signer)?;
+            let csr_spki =
+                CaSigner::extract_p256_csr_spki(csr_pem).map_err(EnrollFailure::Signer)?;
             self.attestation_verifier
                 .verify_chain(attestation_chain_pem, &csr_spki)
                 .map_err(EnrollFailure::Attestation)?;
         } else if !attestation_chain_pem.is_empty() {
-            let csr_spki = CaSigner::extract_p256_csr_spki(csr_pem)
-                .map_err(EnrollFailure::Signer)?;
+            let csr_spki =
+                CaSigner::extract_p256_csr_spki(csr_pem).map_err(EnrollFailure::Signer)?;
             self.attestation_verifier
                 .verify_chain(attestation_chain_pem, &csr_spki)
                 .map_err(EnrollFailure::Attestation)?;
@@ -212,7 +214,12 @@ impl EnrollmentService for EnrollmentServiceImpl {
 
         info!(node_id = %node_id, "Processing gRPC worker enrollment request [REQ-OP-001]");
 
-        match self.context.redeem_and_sign(token, node_id, csr_pem, &req.attestation_certificate_chain_pem) {
+        match self.context.redeem_and_sign(
+            token,
+            node_id,
+            csr_pem,
+            &req.attestation_certificate_chain_pem,
+        ) {
             Ok(signed) => {
                 info!(node_id = %node_id, "Successfully issued mTLS client certificate [INV-002]");
                 Ok(TonicResponse::new(EnrollWorkerResponse {
@@ -288,7 +295,12 @@ async fn handle_http_enroll(
 
     info!(node_id = %node_id, "Processing HTTP worker enrollment request [REQ-OP-001]");
 
-    match context.redeem_and_sign(token, node_id, csr_pem, &payload.attestation_certificate_chain_pem) {
+    match context.redeem_and_sign(
+        token,
+        node_id,
+        csr_pem,
+        &payload.attestation_certificate_chain_pem,
+    ) {
         Ok(signed) => {
             info!(node_id = %node_id, "Successfully issued mTLS client certificate via HTTP [INV-002]");
             (
@@ -525,12 +537,20 @@ mod tests {
 
         let resp = service.enroll_worker(req).await.expect("RPC call");
         let body = resp.into_inner();
-        assert!(!body.success, "Must reject enrollment without attestation when enforced");
-        assert!(body.error_message.contains("Hardware attestation chain required"));
+        assert!(
+            !body.success,
+            "Must reject enrollment without attestation when enforced"
+        );
+        assert!(body
+            .error_message
+            .contains("Hardware attestation chain required"));
 
         // Single-use token must NOT be burned by a failed attestation check
         let retry_token = base_ctx.token_store.redeem_token(&record.token, node_id);
-        assert!(retry_token.is_ok(), "Token should remain unredeemed on attestation rejection");
+        assert!(
+            retry_token.is_ok(),
+            "Token should remain unredeemed on attestation rejection"
+        );
     }
 
     #[tokio::test]
@@ -544,7 +564,9 @@ mod tests {
         // Generate test attestation root
         let mut root_params = CertificateParams::default();
         root_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-        root_params.distinguished_name.push(DnType::CommonName, "Test Hardware Root");
+        root_params
+            .distinguished_name
+            .push(DnType::CommonName, "Test Hardware Root");
         let root_key = KeyPair::generate().unwrap();
         let root_cert = root_params.self_signed(&root_key).unwrap();
         let root_spki = root_key.public_key_der();
@@ -575,11 +597,15 @@ mod tests {
             b"test-nonce",
         );
         let mut leaf_params = CertificateParams::default();
-        leaf_params.distinguished_name.push(DnType::CommonName, node_id);
-        leaf_params.custom_extensions.push(CustomExtension::from_oid_content(
-            &[1, 3, 6, 1, 4, 1, 11129, 2, 1, 17],
-            soft_ext_der,
-        ));
+        leaf_params
+            .distinguished_name
+            .push(DnType::CommonName, node_id);
+        leaf_params
+            .custom_extensions
+            .push(CustomExtension::from_oid_content(
+                &[1, 3, 6, 1, 4, 1, 11129, 2, 1, 17],
+                soft_ext_der,
+            ));
         let leaf_cert = leaf_params
             .signed_by(&worker_key, &root_cert, &root_key)
             .unwrap();
@@ -596,7 +622,9 @@ mod tests {
         let resp = service.enroll_worker(req).await.expect("RPC call");
         let body = resp.into_inner();
         assert!(!body.success, "Software attestation must be rejected");
-        assert!(body.error_message.contains("Insecure attestation security level"));
+        assert!(body
+            .error_message
+            .contains("Insecure attestation security level"));
     }
 
     #[tokio::test]
@@ -610,7 +638,9 @@ mod tests {
         // Generate test attestation root
         let mut root_params = CertificateParams::default();
         root_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-        root_params.distinguished_name.push(DnType::CommonName, "Test Hardware Root");
+        root_params
+            .distinguished_name
+            .push(DnType::CommonName, "Test Hardware Root");
         let root_key = KeyPair::generate().unwrap();
         let root_cert = root_params.self_signed(&root_key).unwrap();
         let root_spki = root_key.public_key_der();
@@ -641,11 +671,15 @@ mod tests {
             b"valid-tee-nonce",
         );
         let mut leaf_params = CertificateParams::default();
-        leaf_params.distinguished_name.push(DnType::CommonName, node_id);
-        leaf_params.custom_extensions.push(CustomExtension::from_oid_content(
-            &[1, 3, 6, 1, 4, 1, 11129, 2, 1, 17],
-            tee_ext_der,
-        ));
+        leaf_params
+            .distinguished_name
+            .push(DnType::CommonName, node_id);
+        leaf_params
+            .custom_extensions
+            .push(CustomExtension::from_oid_content(
+                &[1, 3, 6, 1, 4, 1, 11129, 2, 1, 17],
+                tee_ext_der,
+            ));
         let leaf_cert = leaf_params
             .signed_by(&worker_key, &root_cert, &root_key)
             .unwrap();
@@ -661,7 +695,11 @@ mod tests {
 
         let resp = service.enroll_worker(req).await.expect("RPC call");
         let body = resp.into_inner();
-        assert!(body.success, "Hardware attestation must succeed: {}", body.error_message);
+        assert!(
+            body.success,
+            "Hardware attestation must succeed: {}",
+            body.error_message
+        );
         assert!(!body.client_cert_pem.is_empty());
         assert!(!body.ca_cert_pem.is_empty());
     }

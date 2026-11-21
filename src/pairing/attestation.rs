@@ -107,7 +107,9 @@ pub enum AttestationError {
     #[error("Attestation certificate chain is empty")]
     EmptyChain,
 
-    #[error("Attestation certificate chain is incomplete (minimum 2 certificates required, found {0})")]
+    #[error(
+        "Attestation certificate chain is incomplete (minimum 2 certificates required, found {0})"
+    )]
     IncompleteChain(usize),
 
     #[error("Failed to parse attestation certificate PEM: {0}")]
@@ -134,7 +136,9 @@ pub enum AttestationError {
     #[error("Attestation leaf certificate public key does not match submitted CSR public key")]
     PublicKeyMismatch,
 
-    #[error("Hardware attestation chain required by cluster security policy [INV-002], [NFR-SEC-001]")]
+    #[error(
+        "Hardware attestation chain required by cluster security policy [INV-002], [NFR-SEC-001]"
+    )]
     AttestationRequired,
 
     #[error("Unsupported signature algorithm in attestation certificate: {0}")]
@@ -445,8 +449,9 @@ fn extract_key_description(leaf: &X509Certificate) -> Result<KeyDescription, Att
 fn parse_key_description_der(raw_bytes: &[u8]) -> Result<KeyDescription, AttestationError> {
     // If encapsulated in an outer OCTET STRING (tag 0x04), unwrap it
     let payload = if !raw_bytes.is_empty() && raw_bytes[0] == 0x04 {
-        let (content, _) = parse_der_tlv(raw_bytes)
-            .map_err(|e| AttestationError::ExtensionParseError(format!("Unwrap OCTET STRING: {e}")))?;
+        let (content, _) = parse_der_tlv(raw_bytes).map_err(|e| {
+            AttestationError::ExtensionParseError(format!("Unwrap OCTET STRING: {e}"))
+        })?;
         content
     } else {
         raw_bytes
@@ -472,15 +477,17 @@ fn parse_key_description_der(raw_bytes: &[u8]) -> Result<KeyDescription, Attesta
     offset += len;
 
     // Item 2: attestationSecurityLevel (ENUMERATED 0x0A or INTEGER 0x02)
-    let (sec_bytes, len) = parse_der_tlv_at_either(seq_content, offset, 0x0A, 0x02).map_err(|e| {
-        AttestationError::ExtensionParseError(format!("attestationSecurityLevel: {e}"))
-    })?;
+    let (sec_bytes, len) =
+        parse_der_tlv_at_either(seq_content, offset, 0x0A, 0x02).map_err(|e| {
+            AttestationError::ExtensionParseError(format!("attestationSecurityLevel: {e}"))
+        })?;
     let sec_num = der_bytes_to_u32(sec_bytes)?;
-    let attestation_security_level = AttestationSecurityLevel::from_u32(sec_num).ok_or_else(|| {
-        AttestationError::ExtensionParseError(format!(
-            "Unknown attestationSecurityLevel value: {sec_num}"
-        ))
-    })?;
+    let attestation_security_level =
+        AttestationSecurityLevel::from_u32(sec_num).ok_or_else(|| {
+            AttestationError::ExtensionParseError(format!(
+                "Unknown attestationSecurityLevel value: {sec_num}"
+            ))
+        })?;
     offset += len;
 
     // Item 3: keyMintVersion / keymasterVersion (INTEGER, tag 0x02)
@@ -490,9 +497,10 @@ fn parse_key_description_der(raw_bytes: &[u8]) -> Result<KeyDescription, Attesta
     offset += len;
 
     // Item 4: keyMintSecurityLevel / keymasterSecurityLevel (ENUMERATED 0x0A or INTEGER 0x02)
-    let (km_sec_bytes, len) = parse_der_tlv_at_either(seq_content, offset, 0x0A, 0x02).map_err(
-        |e| AttestationError::ExtensionParseError(format!("keymasterSecurityLevel: {e}")),
-    )?;
+    let (km_sec_bytes, len) =
+        parse_der_tlv_at_either(seq_content, offset, 0x0A, 0x02).map_err(|e| {
+            AttestationError::ExtensionParseError(format!("keymasterSecurityLevel: {e}"))
+        })?;
     let km_sec_num = der_bytes_to_u32(km_sec_bytes)?;
     let keymaster_security_level =
         AttestationSecurityLevel::from_u32(km_sec_num).ok_or_else(|| {
@@ -533,9 +541,16 @@ fn parse_der_tlv(bytes: &[u8]) -> Result<(&[u8], usize), String> {
 }
 
 /// Helper to parse a single ASN.1 TLV with an expected tag at a specific offset.
-fn parse_der_tlv_at(bytes: &[u8], offset: usize, expected_tag: u8) -> Result<(&[u8], usize), String> {
+fn parse_der_tlv_at(
+    bytes: &[u8],
+    offset: usize,
+    expected_tag: u8,
+) -> Result<(&[u8], usize), String> {
     if offset >= bytes.len() {
-        return Err(format!("Offset {offset} beyond slice length {}", bytes.len()));
+        return Err(format!(
+            "Offset {offset} beyond slice length {}",
+            bytes.len()
+        ));
     }
     let actual_tag = bytes[offset];
     if actual_tag != expected_tag {
@@ -554,7 +569,10 @@ fn parse_der_tlv_at_either(
     tag_b: u8,
 ) -> Result<(&[u8], usize), String> {
     if offset >= bytes.len() {
-        return Err(format!("Offset {offset} beyond slice length {}", bytes.len()));
+        return Err(format!(
+            "Offset {offset} beyond slice length {}",
+            bytes.len()
+        ));
     }
     let actual_tag = bytes[offset];
     if actual_tag != tag_a && actual_tag != tag_b {
@@ -582,7 +600,9 @@ fn parse_der_tlv_internal(bytes: &[u8], offset: usize) -> Result<(&[u8], usize),
     } else {
         let num_len_bytes = (len_byte & 0x7F) as usize;
         if num_len_bytes == 0 || num_len_bytes > 4 {
-            return Err(format!("Unsupported multi-byte length count: {num_len_bytes}"));
+            return Err(format!(
+                "Unsupported multi-byte length count: {num_len_bytes}"
+            ));
         }
         if cursor + num_len_bytes > bytes.len() {
             return Err("Unexpected EOF reading multi-byte length".to_string());
@@ -644,31 +664,27 @@ pub fn build_test_key_description_der(
     keymaster_security_level: AttestationSecurityLevel,
     challenge: &[u8],
 ) -> Vec<u8> {
-    let mut inner = Vec::new();
-
-    // 1. attestationVersion (INTEGER 0x02)
-    inner.push(0x02);
-    inner.push(0x01);
-    inner.push(attestation_version as u8);
-
-    // 2. attestationSecurityLevel (ENUMERATED 0x0A)
-    inner.push(0x0A);
-    inner.push(0x01);
-    inner.push(attestation_security_level as u8);
-
-    // 3. keymasterVersion (INTEGER 0x02)
-    inner.push(0x02);
-    inner.push(0x01);
-    inner.push(keymaster_version as u8);
-
-    // 4. keymasterSecurityLevel (ENUMERATED 0x0A)
-    inner.push(0x0A);
-    inner.push(0x01);
-    inner.push(keymaster_security_level as u8);
-
-    // 5. attestationChallenge (OCTET STRING 0x04)
-    inner.push(0x04);
-    inner.push(challenge.len() as u8);
+    let mut inner = vec![
+        // 1. attestationVersion (INTEGER 0x02)
+        0x02,
+        0x01,
+        attestation_version as u8,
+        // 2. attestationSecurityLevel (ENUMERATED 0x0A)
+        0x0A,
+        0x01,
+        attestation_security_level as u8,
+        // 3. keymasterVersion (INTEGER 0x02)
+        0x02,
+        0x01,
+        keymaster_version as u8,
+        // 4. keymasterSecurityLevel (ENUMERATED 0x0A)
+        0x0A,
+        0x01,
+        keymaster_security_level as u8,
+        // 5. attestationChallenge (OCTET STRING 0x04)
+        0x04,
+        challenge.len() as u8,
+    ];
     inner.extend_from_slice(challenge);
 
     // 6. uniqueId (OCTET STRING 0x04)
@@ -775,9 +791,10 @@ pub mod tests {
         // 1. Root CA (Simulated Google Hardware Root CA)
         let mut root_params = CertificateParams::default();
         root_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-        root_params
-            .distinguished_name
-            .push(DnType::CommonName, "Simulated Google Hardware Attestation Root CA");
+        root_params.distinguished_name.push(
+            DnType::CommonName,
+            "Simulated Google Hardware Attestation Root CA",
+        );
         let root_key = KeyPair::generate().expect("Root key");
         let root_cert = root_params.self_signed(&root_key).expect("Root cert");
         let root_spki = root_key.public_key_der();
@@ -785,9 +802,10 @@ pub mod tests {
         // 2. Intermediate CA (Simulated OEM Batch CA)
         let mut int_params = CertificateParams::default();
         int_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-        int_params
-            .distinguished_name
-            .push(DnType::CommonName, "Simulated OEM Key Attestation Intermediate");
+        int_params.distinguished_name.push(
+            DnType::CommonName,
+            "Simulated OEM Key Attestation Intermediate",
+        );
         let int_key = KeyPair::generate().expect("Intermediate key");
         let int_cert = int_params
             .signed_by(&int_key, &root_cert, &root_key)
@@ -806,11 +824,11 @@ pub mod tests {
         );
 
         let mut leaf_params = CertificateParams::default();
-        leaf_params.distinguished_name.push(DnType::CommonName, "Android Keystore Leaf");
-        let custom_ext = CustomExtension::from_oid_content(
-            &[1, 3, 6, 1, 4, 1, 11129, 2, 1, 17],
-            ext_der,
-        );
+        leaf_params
+            .distinguished_name
+            .push(DnType::CommonName, "Android Keystore Leaf");
+        let custom_ext =
+            CustomExtension::from_oid_content(&[1, 3, 6, 1, 4, 1, 11129, 2, 1, 17], ext_der);
         leaf_params.custom_extensions.push(custom_ext);
 
         let leaf_cert = leaf_params
@@ -860,11 +878,15 @@ pub mod tests {
         );
 
         let mut leaf_params = CertificateParams::default();
-        leaf_params.distinguished_name.push(DnType::CommonName, "Android Keystore Leaf");
-        leaf_params.custom_extensions.push(CustomExtension::from_oid_content(
-            &[1, 3, 6, 1, 4, 1, 11129, 2, 1, 17],
-            ext_der,
-        ));
+        leaf_params
+            .distinguished_name
+            .push(DnType::CommonName, "Android Keystore Leaf");
+        leaf_params
+            .custom_extensions
+            .push(CustomExtension::from_oid_content(
+                &[1, 3, 6, 1, 4, 1, 11129, 2, 1, 17],
+                ext_der,
+            ));
         let leaf_cert = leaf_params
             .signed_by(&leaf_key, &root_cert, &root_key)
             .expect("Sign leaf");
@@ -901,11 +923,15 @@ pub mod tests {
         );
 
         let mut leaf_params = CertificateParams::default();
-        leaf_params.distinguished_name.push(DnType::CommonName, "Software Keystore Leaf");
-        leaf_params.custom_extensions.push(CustomExtension::from_oid_content(
-            &[1, 3, 6, 1, 4, 1, 11129, 2, 1, 17],
-            soft_ext_der,
-        ));
+        leaf_params
+            .distinguished_name
+            .push(DnType::CommonName, "Software Keystore Leaf");
+        leaf_params
+            .custom_extensions
+            .push(CustomExtension::from_oid_content(
+                &[1, 3, 6, 1, 4, 1, 11129, 2, 1, 17],
+                soft_ext_der,
+            ));
         let leaf_cert = leaf_params
             .signed_by(&leaf_key, &root_cert, &root_key)
             .unwrap();
@@ -938,7 +964,9 @@ pub mod tests {
 
         // Leaf certificate WITHOUT attestation extension
         let mut leaf_params = CertificateParams::default();
-        leaf_params.distinguished_name.push(DnType::CommonName, "Normal Leaf");
+        leaf_params
+            .distinguished_name
+            .push(DnType::CommonName, "Normal Leaf");
         let leaf_cert = leaf_params
             .signed_by(&leaf_key, &root_cert, &root_key)
             .unwrap();
