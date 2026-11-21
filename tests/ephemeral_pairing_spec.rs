@@ -19,10 +19,11 @@ use androgrid_backend::enrollment_service_client::EnrollmentServiceClient;
 use androgrid_backend::enrollment_service_server::EnrollmentServiceServer;
 use androgrid_backend::{
     build_client_mtls_config, build_server_bootstrap_tls_config, build_server_mtls_config,
-    require_client_mtls_interceptor, AdminServiceImpl, AndroGridServiceImpl, ArtifactServer,
-    ArtifactStore, CaSigner, ClusterScheduler, EnrollmentContext, EnrollmentServiceImpl,
-    ExecutionEngine, HttpEnrollRequest, HttpEnrollResponse, NetworkTransportType, NodeCapabilities,
-    PairingError, PairingTokenStore, RegisterNodeRequest, SignerError, SyncNodeStateRequest,
+    build_test_key_description_der, require_client_mtls_interceptor, AdminServiceImpl,
+    AndroGridServiceImpl, ArtifactServer, ArtifactStore, CaSigner, ClusterScheduler,
+    EnrollmentContext, EnrollmentServiceImpl, ExecutionEngine, HttpEnrollRequest,
+    HttpEnrollResponse, NetworkTransportType, NodeCapabilities, PairingError, PairingTokenStore,
+    RegisterNodeRequest, SignerError, SyncNodeStateRequest,
 };
 use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair};
 
@@ -617,47 +618,6 @@ async fn test_enforce_hardware_attestation_integration_lifecycle() {
     use androgrid_backend::pairing::attestation::AttestationSecurityLevel;
     use androgrid_backend::HardwareAttestationVerifier;
     use rcgen::CustomExtension;
-
-    fn build_test_key_description_der(
-        attestation_version: i64,
-        attestation_security_level: AttestationSecurityLevel,
-        keymaster_version: i64,
-        keymaster_security_level: AttestationSecurityLevel,
-        challenge: &[u8],
-    ) -> Vec<u8> {
-        let mut inner = Vec::new();
-        inner.extend_from_slice(&[0x02, 0x01, attestation_version as u8]);
-        inner.push(0x0A);
-        inner.push(0x01);
-        inner.push(attestation_security_level as u8);
-        inner.extend_from_slice(&[0x02, 0x01, keymaster_version as u8]);
-        inner.push(0x0A);
-        inner.push(0x01);
-        inner.push(keymaster_security_level as u8);
-        inner.push(0x04);
-        inner.push(challenge.len() as u8);
-        inner.extend_from_slice(challenge);
-        inner.push(0x04);
-        inner.push(0x00);
-        inner.push(0x30);
-        inner.push(0x00);
-        let hw = vec![0xBF, 0x85, 0x3E, 0x03, 0x02, 0x01, 0x00];
-        inner.push(0x30);
-        inner.push(hw.len() as u8);
-        inner.extend_from_slice(&hw);
-
-        let mut seq = Vec::new();
-        seq.push(0x30);
-        if inner.len() < 128 {
-            seq.push(inner.len() as u8);
-        } else {
-            seq.push(0x81);
-            seq.push(inner.len() as u8);
-        }
-        seq.extend_from_slice(&inner);
-
-        seq
-    }
 
     let pki = TestClusterPki::generate();
     let signer = Arc::new(CaSigner::from_pem(&pki.ca_cert_pem, &pki.ca_key_pem).unwrap());
