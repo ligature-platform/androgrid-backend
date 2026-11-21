@@ -70,8 +70,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         lease_secs = config.lease_timeout_seconds,
         max_frame_mb = config.max_frame_size_bytes / (1024 * 1024),
         allow_insecure_root = config.allow_insecure_root_tasks,
+        enforce_hardware_attestation = config.enforce_hardware_attestation,
+        require_attestation_challenge = config.require_attestation_challenge,
         "Cluster configuration loaded"
     );
+
+    if config.is_mtls_configured() && !config.enforce_hardware_attestation {
+        warn!(
+            "Hardware attestation enforcement is DISABLED while mTLS is configured [NFR-SEC-001]"
+        );
+    }
 
     let scheduler = Arc::new(ClusterScheduler::with_options(
         config.allow_insecure_root_tasks,
@@ -136,6 +144,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Arc::clone(&token_store),
             Arc::clone(signer),
             config.enforce_hardware_attestation,
+            config.require_attestation_challenge,
             None,
         )
     });

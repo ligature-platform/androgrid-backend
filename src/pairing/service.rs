@@ -57,12 +57,19 @@ pub struct HttpEnrollResponse {
     pub error_message: String,
 }
 
+/// Maximum number of certificates allowed in an attestation chain PEM submission.
+pub const MAX_ATTESTATION_CHAIN_LEN: usize = 6;
+
+/// Maximum allowed total byte size for attestation certificate chain PEM submissions (32 KiB).
+pub const MAX_ATTESTATION_PEM_BYTES: usize = 32 * 1024;
+
 /// Shared application state for bootstrap enrollment services.
 #[derive(Clone)]
 pub struct EnrollmentContext {
     pub token_store: Arc<PairingTokenStore>,
     pub signer: Arc<CaSigner>,
     pub enforce_hardware_attestation: bool,
+    pub require_attestation_challenge: bool,
     pub attestation_verifier: Arc<HardwareAttestationVerifier>,
 }
 
@@ -90,6 +97,7 @@ impl EnrollmentContext {
             token_store,
             signer,
             enforce_hardware_attestation: false,
+            require_attestation_challenge: false,
             attestation_verifier: Arc::new(HardwareAttestationVerifier::new()),
         }
     }
@@ -99,12 +107,14 @@ impl EnrollmentContext {
         token_store: Arc<PairingTokenStore>,
         signer: Arc<CaSigner>,
         enforce_hardware_attestation: bool,
+        require_attestation_challenge: bool,
         attestation_verifier: Option<Arc<HardwareAttestationVerifier>>,
     ) -> Self {
         Self {
             token_store,
             signer,
             enforce_hardware_attestation,
+            require_attestation_challenge,
             attestation_verifier: attestation_verifier
                 .unwrap_or_else(|| Arc::new(HardwareAttestationVerifier::new())),
         }
@@ -122,33 +132,61 @@ impl EnrollmentContext {
         csr_pem: &str,
         attestation_chain_pem: &[String],
     ) -> Result<SignedWorkerCert, EnrollFailure> {
-        // Enforce or validate Android KeyStore hardware attestation chain
-        if self.enforce_hardware_attestation {
-            if attestation_chain_pem.is_empty() {
-                return Err(EnrollFailure::Attestation(
-                    AttestationError::AttestationRequired,
-                ));
-            }
-            let csr_spki =
-                CaSigner::extract_p256_csr_spki(csr_pem).map_err(EnrollFailure::Signer)?;
-            self.attestation_verifier
-                .verify_chain(attestation_chain_pem, &csr_spki)
-                .map_err(EnrollFailure::Attestation)?;
-        } else if !attestation_chain_pem.is_empty() {
-            let csr_spki =
-                CaSigner::extract_p256_csr_spki(csr_pem).map_err(EnrollFailure::Signer)?;
-            self.attestation_verifier
-                .verify_chain(attestation_chain_pem, &csr_spki)
-                .map_err(EnrollFailure::Attestation)?;
-        }
-
         self.token_store
             .redeem_with(token, node_id, |_| {
-                self.signer.sign_worker_csr(csr_pem, node_id)
+                if self.enforce_hardware_attestation && attestation_chain_pem.is_empty() {
+                    return Err(EnrollFailure::Attestation(
+                        AttestationError::AttestationRequired,
+                    ));
+                }
+
+                if !attestation_chain_pem.is_empty() {
+                    if attestation_chain_pem.len() > MAX_ATTESTATION_CHAIN_LEN {
+                        return Err(EnrollFailure::Attestation(AttestationError::ChainTooLong(
+                            attestation_chain_pem.len(),
+                            MAX_ATTESTATION_CHAIN_LEN,
+                        )));
+                    }
+
+                    let total_bytes: usize = attestation_chain_pem.iter().map(|s| s.len()).sum();
+                    if total_bytes > MAX_ATTESTATION_PEM_BYTES {
+                        return Err(EnrollFailure::Attestation(
+                            AttestationError::PayloadTooLarge(
+                                total_bytes,
+                                MAX_ATTESTATION_PEM_BYTES,
+                            ),
+                        ));
+                    }
+
+                    let csr_spki =
+                        CaSigner::extract_p256_csr_spki(csr_pem).map_err(EnrollFailure::Signer)?;
+
+                    let expected_challenge = if self.require_attestation_challenge {
+                        let digest = ring::digest::digest(
+                            &ring::digest::SHA256,
+                            format!("{token}:{node_id}").as_bytes(),
+                        );
+                        Some(digest)
+                    } else {
+                        None
+                    };
+
+                    self.attestation_verifier
+                        .verify_chain(
+                            attestation_chain_pem,
+                            &csr_spki,
+                            expected_challenge.as_ref().map(|d| d.as_ref()),
+                        )
+                        .map_err(EnrollFailure::Attestation)?;
+                }
+
+                self.signer
+                    .sign_worker_csr(csr_pem, node_id)
+                    .map_err(EnrollFailure::Signer)
             })
             .map_err(|err| match err {
                 RedeemActionError::Pairing(e) => EnrollFailure::Pairing(e),
-                RedeemActionError::Action(e) => EnrollFailure::Signer(e),
+                RedeemActionError::Action(e) => e,
             })
     }
 }
@@ -517,6 +555,7 @@ mod tests {
             Arc::clone(&base_ctx.token_store),
             Arc::clone(&base_ctx.signer),
             true, // enforce hardware attestation
+            false,
             None,
         );
         let service = EnrollmentServiceImpl::with_context(enforced_ctx);
@@ -576,6 +615,7 @@ mod tests {
             Arc::clone(&base_ctx.token_store),
             Arc::clone(&base_ctx.signer),
             true,
+            false,
             Some(verifier),
         );
         let service = EnrollmentServiceImpl::with_context(enforced_ctx);
@@ -650,6 +690,7 @@ mod tests {
             Arc::clone(&base_ctx.token_store),
             Arc::clone(&base_ctx.signer),
             true,
+            false,
             Some(verifier),
         );
         let service = EnrollmentServiceImpl::with_context(enforced_ctx);

@@ -4,9 +4,9 @@
 Accepted
 
 ## Architectural Scope & Requirements
-- **Issue Reference:** `#47` (`feat(security): verify Android KeyStore hardware attestation chain during worker enrollment`)
-- **Traceability:** `[INV-001]`, `[INV-002]`, `[NFR-SEC-001]`, `[REQ-OP-001]`
-- **Standard:** ISO/IEC/IEEE 29148
+- Issue Reference: #47 (feat(security): verify Android KeyStore hardware attestation chain during worker enrollment)
+- Traceability: [INV-001], [INV-002], [NFR-SEC-001], [REQ-OP-001]
+- Standard: ISO/IEC/IEEE 29148
 
 ---
 
@@ -18,7 +18,7 @@ Prior to this decision, the orchestrator evaluated the validity of the pairing t
 ---
 
 ## Decision
-We introduce an Android KeyStore Hardware Attestation verification engine and protocol extension:
+We introduce an Android KeyStore Hardware Attestation verification engine and protocol extension focused strictly on enrollment-time hardware key generation (HardwareKeyOnly scope):
 
 1. **Protobuf Contract Extension (`[INV-001]`, `[INV-002]`):**
    - Extend `EnrollWorkerRequest` in `orchestrator.proto` with an optional backwards-compatible field:
@@ -26,18 +26,32 @@ We introduce an Android KeyStore Hardware Attestation verification engine and pr
    - Workers submit their Android KeyStore certificate chain (ordered leaf first, root last) along with the CSR during bootstrap enrollment.
 
 2. **Google Hardware Attestation Root CA Trust Anchoring (`[INV-002]`, `[NFR-SEC-001]`):**
-   - The orchestrator validates the cryptographic signature path of the attestation certificate chain up to official Google Hardware Attestation Root CAs (including both RSA 4096-bit and ECDSA P-384 root anchors).
-   - In private, staging, or lab environments, custom trust anchors can be configured to facilitate isolated testing.
+   - The orchestrator validates the cryptographic signature path of the attestation certificate chain up to official Google Hardware Attestation Root CAs (including RSA 4096-bit and ECDSA P-384 root anchors).
+   - In private, staging, or lab environments, custom trust anchors can be configured to facilitate hermetic testing via `with_exclusive_custom_roots`.
 
-3. **KeyDescription ASN.1 Inspection (`1.3.6.1.4.1.11129.2.1.17`):**
+3. **RFC 5280 Path Validation & Anti-Forgery Constraints:**
+   - Enforce `BasicConstraints.cA == true` and `KeyUsage::keyCertSign` on all intermediate certificates.
+   - Enforce Google attestation extension ordering: OID `1.3.6.1.4.1.11129.2.1.17` must exist solely on the leaf certificate (index 0) and is prohibited on any intermediate CA.
+   - Verify that outer certificate `signatureAlgorithm` matches inner `tbsCertificate.signature` to prevent algorithm substitution attacks.
+
+4. **KeyDescription ASN.1 Inspection (`1.3.6.1.4.1.11129.2.1.17`):**
    - The leaf attestation certificate must contain the standard Android Keymaster / KeyMint KeyDescription extension.
-   - The orchestrator asserts that `attestationSecurityLevel` is strictly either `TrustedEnvironment` (1) or `StrongBox` (2). Submissions with `Software` (0) are rejected.
+   - The orchestrator asserts that both `attestationSecurityLevel` and `keymasterSecurityLevel` are strictly hardware-backed (`TrustedEnvironment` or `StrongBox`).
+   - Parses `hardwareEnforced` `AuthorizationList` for `KM_TAG_ORIGIN [702] == 0` (`KM_ORIGIN_GENERATED`) to guarantee the keypair was generated within hardware and not imported from software.
+   - Device bootloader lock status (`deviceLocked`) and verified boot state (`verifiedBootState`) are preserved without hard rejection, ensuring drawer smartphones, developer test hardware, and custom ROMs (such as LineageOS) remain compatible with cluster economics.
 
-4. **Cryptographic Public Key Binding:**
+5. **Cryptographic Public Key Binding:**
    - The orchestrator extracts the `SubjectPublicKeyInfo` (SPKI) from the attestation leaf certificate and compares it byte-for-byte against the public key extracted from the submitted CSR.
    - If the public keys do not match, enrollment is immediately rejected to prevent attestation forwarding attacks.
 
-5. **Cluster Security Policy Enforcement (`ANDROGRID_ENFORCE_HARDWARE_ATTESTATION`):**
+6. **Staged Challenge Nonce Support (`ANDROGRID_REQUIRE_ATTESTATION_CHALLENGE`):**
+   - Attestation challenge verification supports staged rollout via `require_attestation_challenge`. When enabled, `attestationChallenge` is verified against `SHA-256(pairing_token || node_id)`. When disabled, challenge verification logs a diagnostic notice for legacy client compatibility.
+
+7. **Pre-Authentication DoS Protection & Input Bounding:**
+   - Attestation parsing and cryptographic verification execute inside `token_store.redeem_with` only after token validation and rate limiting succeed.
+   - Imposes strict bounds on incoming attestation chains: maximum 6 certificates and maximum 32 KiB total PEM bytes.
+
+8. **Cluster Security Policy Enforcement (`ANDROGRID_ENFORCE_HARDWARE_ATTESTATION`):**
    - `ClusterConfig` introduces `enforce_hardware_attestation: bool` (configurable via environment variable `ANDROGRID_ENFORCE_HARDWARE_ATTESTATION`).
    - When enforcement is enabled, enrollment requests lacking a valid, hardware-backed attestation chain are rejected with descriptive diagnostics, while unredeemed pairing tokens remain unburned for legitimate retry attempts.
 
@@ -46,8 +60,10 @@ We introduce an Android KeyStore Hardware Attestation verification engine and pr
 ## Consequences
 
 ### Positive
-- Prevents software emulators and unauthorized non-hardware keys from enrolling in clusters enforcing hardware backing.
-- Cryptographically guarantees that client private keys remain securely anchored in hardware and cannot be extracted or cloned.
+- Prevents software emulators and imported software keys from enrolling in clusters enforcing hardware backing.
+- Cryptographically verifies that client private keys were generated inside hardware modules (TEE/StrongBox).
+- Preserves full support for repurposed drawer smartphones and custom ROMs.
+- Protected against pre-authentication CPU exhaustion and leaf-as-CA certificate forgery.
 - Fully backwards-compatible with existing development workflows and non-enforced clusters.
 
 ### Drawbacks & Blast Radius
@@ -59,3 +75,5 @@ We introduce an Android KeyStore Hardware Attestation verification engine and pr
 ## Alternatives Considered
 - **In-App Attestation Verification Only:** Rejected because local on-device verification on rooted or compromised devices can be spoofed or bypassed.
 - **SafetyNet / Play Integrity API Instead of Key Attestation:** Rejected because Play Integrity requires external Google cloud round-trips and Google Play Services, violating offline, on-premise, and air-gapped cluster operation constraints.
+- **Mandatory Bootloader Lock and Verified Boot State:** Rejected for default policy because it would disqualify developer devices and repurposed drawer hardware running community Android builds.
+- **Attestation Enforcement on Certificate Renewal in PR #64:** Deferred to a dedicated follow-up issue to isolate PR scope and maintain protocol contract boundaries.

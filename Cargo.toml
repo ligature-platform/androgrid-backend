@@ -38,6 +38,10 @@ crossterm = "0.29.0"
 tokio-stream = { version = "0.1", features = ["sync"] }
 
 
+[features]
+default = []
+test-utils = []
+
 [build-dependencies]
 tonic-build = { version = "0.12", features = ["prost"] }
 prost-build = "0.13"

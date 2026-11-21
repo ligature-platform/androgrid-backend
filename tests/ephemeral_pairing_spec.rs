@@ -614,10 +614,50 @@ async fn test_shared_tls_listener_allows_bootstrap_enrollment_and_enforces_opera
 
 #[tokio::test]
 async fn test_enforce_hardware_attestation_integration_lifecycle() {
-    use androgrid_backend::build_test_key_description_der;
     use androgrid_backend::pairing::attestation::AttestationSecurityLevel;
     use androgrid_backend::HardwareAttestationVerifier;
     use rcgen::CustomExtension;
+
+    fn build_test_key_description_der(
+        attestation_version: i64,
+        attestation_security_level: AttestationSecurityLevel,
+        keymaster_version: i64,
+        keymaster_security_level: AttestationSecurityLevel,
+        challenge: &[u8],
+    ) -> Vec<u8> {
+        let mut inner = Vec::new();
+        inner.extend_from_slice(&[0x02, 0x01, attestation_version as u8]);
+        inner.push(0x0A);
+        inner.push(0x01);
+        inner.push(attestation_security_level as u8);
+        inner.extend_from_slice(&[0x02, 0x01, keymaster_version as u8]);
+        inner.push(0x0A);
+        inner.push(0x01);
+        inner.push(keymaster_security_level as u8);
+        inner.push(0x04);
+        inner.push(challenge.len() as u8);
+        inner.extend_from_slice(challenge);
+        inner.push(0x04);
+        inner.push(0x00);
+        inner.push(0x30);
+        inner.push(0x00);
+        let hw = vec![0xBF, 0x85, 0x3E, 0x03, 0x02, 0x01, 0x00];
+        inner.push(0x30);
+        inner.push(hw.len() as u8);
+        inner.extend_from_slice(&hw);
+
+        let mut seq = Vec::new();
+        seq.push(0x30);
+        if inner.len() < 128 {
+            seq.push(inner.len() as u8);
+        } else {
+            seq.push(0x81);
+            seq.push(inner.len() as u8);
+        }
+        seq.extend_from_slice(&inner);
+
+        seq
+    }
 
     let pki = TestClusterPki::generate();
     let signer = Arc::new(CaSigner::from_pem(&pki.ca_cert_pem, &pki.ca_key_pem).unwrap());
@@ -644,7 +684,8 @@ async fn test_enforce_hardware_attestation_integration_lifecycle() {
     let enrollment_ctx = EnrollmentContext::with_hardware_attestation(
         Arc::clone(&token_store),
         Arc::clone(&signer),
-        true, // STRICTLY ENFORCE HARDWARE ATTESTATION
+        true,  // STRICTLY ENFORCE HARDWARE ATTESTATION
+        false, // require_attestation_challenge
         Some(verifier),
     );
 
@@ -866,4 +907,31 @@ async fn test_enforce_hardware_attestation_integration_lifecycle() {
 
     assert!(!reg_res.session_token.is_empty());
     assert_eq!(reg_res.heartbeat_interval_seconds, 2);
+
+    // Scenario E: Rejection of oversized attestation chain (> 6 certificates)
+    let node_e = "worker-oversized-chain";
+    let token_e = token_store
+        .generate_token(Some(node_e.to_string()), Some(300))
+        .unwrap();
+    let (csr_e, _key_e) = generate_client_csr(node_e);
+    let mut oversized_chain = Vec::new();
+    for _ in 0..7 {
+        oversized_chain.push(attest_root_cert.pem());
+    }
+    let reject_oversized = enroll_client
+        .enroll_worker(tonic::Request::new(
+            androgrid_backend::EnrollWorkerRequest {
+                pairing_token: token_e.token.clone(),
+                node_id: node_e.to_string(),
+                csr_pem: csr_e,
+                attestation_certificate_chain_pem: oversized_chain,
+            },
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!reject_oversized.success);
+    assert!(reject_oversized
+        .error_message
+        .contains("exceeds maximum limit"));
 }

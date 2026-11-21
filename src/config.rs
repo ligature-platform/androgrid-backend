@@ -94,6 +94,12 @@ pub struct ClusterConfig {
     /// When true, enrollment requests lacking valid TEE/StrongBox attestation chains are hard rejected.
     /// Traces to: [INV-001], [INV-002], [NFR-SEC-001]
     pub enforce_hardware_attestation: bool,
+
+    /// Whether the attestation challenge nonce is strictly verified during enrollment.
+    /// When true, attestationChallenge must match SHA-256(pairing_token || node_id).
+    /// Default: false (permits staged mobile client rollout without breaking legacy clients).
+    /// Traces to: [INV-002], [NFR-SEC-001]
+    pub require_attestation_challenge: bool,
 }
 
 impl Default for ClusterConfig {
@@ -123,6 +129,7 @@ impl Default for ClusterConfig {
             artifact_storage_dir: None,
             max_apk_bytes: 128 * 1024 * 1024,
             enforce_hardware_attestation: false,
+            require_attestation_challenge: false,
         }
     }
 }
@@ -250,6 +257,10 @@ impl ClusterConfig {
 
         if let Ok(val) = std::env::var("ANDROGRID_ENFORCE_HARDWARE_ATTESTATION") {
             config.enforce_hardware_attestation = val.eq_ignore_ascii_case("true") || val == "1";
+        }
+
+        if let Ok(val) = std::env::var("ANDROGRID_REQUIRE_ATTESTATION_CHALLENGE") {
+            config.require_attestation_challenge = val.eq_ignore_ascii_case("true") || val == "1";
         }
 
         config.validate_renewal_policy()?;

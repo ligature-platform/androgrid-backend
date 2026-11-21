@@ -38,8 +38,9 @@ pub const GOOGLE_ROOT_CA_RSA_SPKI_B64: &str =
 /// Extracted from Google's official Remote Key Provisioning (RKP) root certificate.
 /// Traces to: [INV-002], [NFR-SEC-001]
 pub const GOOGLE_ROOT_CA_EC_SPKI_B64: &str =
-    "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEI9ojcU7fPlsFCjxy6IRqzgeOoK0b\
-    +YsV9FPQywiB4g4eO9+yA0b1Lg2J5XgO8Hk0m+lW1Gk8+b9Q12i9hR8a5w==";
+    "MHYwEAYHKoZIzj0CAQYFK4EEACIDYgAEI9ojcU7fPlsFCjxy6IRqzgeOoK0b+YsV\
+    9FPQywiyw8EQRTkJ9u3qwfnI4DGoSLlBqClTXJfgfCcZvs60FikNMHnu4fkRzObf\
+    gDkU2KNXezT9/RQ+XvNslxPHrHCowhGr";
 
 /// Security tier where the keypair was generated or attestation certificate was signed.
 /// Defined by the Android Keymaster / KeyMint HAL specification.
@@ -99,6 +100,9 @@ pub struct KeyDescription {
     pub attestation_challenge: Vec<u8>,
     /// Privacy-sensitive monthly rotating device identifier hash (if requested).
     pub unique_id: Vec<u8>,
+    /// Key generation origin parsed from hardwareEnforced AuthorizationList (tag 702).
+    /// Value 0 indicates KM_ORIGIN_GENERATED (hardware-generated).
+    pub origin: Option<u32>,
 }
 
 /// Errors arising during Android KeyStore hardware attestation verification.
@@ -143,6 +147,37 @@ pub enum AttestationError {
 
     #[error("Unsupported signature algorithm in attestation certificate: {0}")]
     UnsupportedSignatureAlgorithm(String),
+
+    #[error("Certificate at index {0} is not a CA (BasicConstraints cA:TRUE required for non-leaf certs)")]
+    InvalidCaConstraints(usize),
+
+    #[error("Certificate at index {0} lacks keyCertSign in KeyUsage extension")]
+    MissingKeyCertSign(usize),
+
+    #[error("Attestation extension (OID 1.3.6.1.4.1.11129.2.1.17) found on non-leaf certificate at index {0}")]
+    AttestationExtensionOnIntermediate(usize),
+
+    #[error("Signature algorithm mismatch: outer {outer} != inner TBS {inner}")]
+    SignatureAlgorithmMismatch { outer: String, inner: String },
+
+    #[error(
+        "Attestation challenge mismatch: expected challenge does not match certificate challenge"
+    )]
+    ChallengeMismatch,
+
+    #[error(
+        "Invalid key origin {0}: KM_ORIGIN_GENERATED (0) required, IMPORTED software keys rejected"
+    )]
+    InvalidKeyOrigin(u32),
+
+    #[error("Missing KM_TAG_ORIGIN [702] in hardwareEnforced authorization list")]
+    MissingOriginTag,
+
+    #[error("Attestation certificate chain length {0} exceeds maximum limit of {1}")]
+    ChainTooLong(usize, usize),
+
+    #[error("Attestation certificate chain PEM byte size {0} exceeds maximum limit of {1}")]
+    PayloadTooLarge(usize, usize),
 }
 
 /// Verifies Android KeyStore hardware attestation certificate chains.
@@ -166,37 +201,57 @@ impl HardwareAttestationVerifier {
         let mut trusted = HashSet::new();
 
         // Load Google RSA root SPKI
-        if let Ok(der) = pem::parse(format!(
+        let rsa_der = pem::parse(format!(
             "-----BEGIN PUBLIC KEY-----\n{}\n-----END PUBLIC KEY-----",
             GOOGLE_ROOT_CA_RSA_SPKI_B64
-        )) {
-            trusted.insert(der.contents().to_vec());
-        }
+        ))
+        .expect("Valid hardcoded Google RSA root SPKI");
+        trusted.insert(rsa_der.contents().to_vec());
 
-        // Load Google EC root SPKI if present
-        if let Ok(der) = pem::parse(format!(
+        // Load Google EC root SPKI
+        let ec_der = pem::parse(format!(
             "-----BEGIN PUBLIC KEY-----\n{}\n-----END PUBLIC KEY-----",
             GOOGLE_ROOT_CA_EC_SPKI_B64
-        )) {
-            trusted.insert(der.contents().to_vec());
-        }
+        ))
+        .expect("Valid hardcoded Google EC root SPKI");
+        trusted.insert(ec_der.contents().to_vec());
 
         Self {
             trusted_root_spkis: trusted,
         }
     }
 
-    /// Constructs a verifier with an explicit list of trusted root SubjectPublicKeyInfo (SPKI) DER byte slices.
-    /// Useful for testing, private CA anchors, and air-gapped lab testing environments.
+    /// Constructs a verifier that trusts ONLY the provided custom roots,
+    /// excluding Google's default production roots. Ideal for hermetic lab and integration tests.
     ///
     /// # Arguments
     /// * `custom_root_spkis` - Slice of DER-encoded SubjectPublicKeyInfo byte vectors.
-    pub fn with_custom_roots(custom_root_spkis: &[Vec<u8>]) -> Self {
+    pub fn with_exclusive_custom_roots(custom_root_spkis: &[Vec<u8>]) -> Self {
+        let mut trusted = HashSet::new();
+        for spki in custom_root_spkis {
+            trusted.insert(spki.clone());
+        }
+        Self {
+            trusted_root_spkis: trusted,
+        }
+    }
+
+    /// Constructs a verifier that includes Google's default production roots
+    /// plus additional custom roots.
+    ///
+    /// # Arguments
+    /// * `custom_root_spkis` - Slice of DER-encoded SubjectPublicKeyInfo byte vectors.
+    pub fn with_additional_roots(custom_root_spkis: &[Vec<u8>]) -> Self {
         let mut verifier = Self::new();
         for spki in custom_root_spkis {
             verifier.trusted_root_spkis.insert(spki.clone());
         }
         verifier
+    }
+
+    /// Backwards-compatible alias for `with_additional_roots`.
+    pub fn with_custom_roots(custom_root_spkis: &[Vec<u8>]) -> Self {
+        Self::with_additional_roots(custom_root_spkis)
     }
 
     /// Verifies an incoming Android KeyStore hardware attestation certificate chain against expected CSR SPKI bytes.
@@ -223,6 +278,7 @@ impl HardwareAttestationVerifier {
         &self,
         chain_pems: &[String],
         expected_csr_spki: &[u8],
+        expected_challenge: Option<&[u8]>,
     ) -> Result<KeyDescription, AttestationError> {
         let cert_ders = parse_cert_chain_ders(chain_pems)?;
         if cert_ders.is_empty() {
@@ -241,10 +297,44 @@ impl HardwareAttestationVerifier {
             parsed_certs.push(cert);
         }
 
+        // RFC 5280 & Google Attestation Path Validation:
+        // Ensure that intermediate and root certs are CAs, have keyCertSign,
+        // and that NO non-leaf certificate (index > 0) carries the attestation extension.
+        for (idx, cert) in parsed_certs.iter().enumerate().skip(1) {
+            // Check BasicConstraints CA:TRUE
+            if !cert.is_ca() {
+                return Err(AttestationError::InvalidCaConstraints(idx));
+            }
+
+            // Check KeyUsage keyCertSign if KeyUsage extension is present
+            if let Ok(Some(ku_ext)) = cert.key_usage() {
+                if !ku_ext.value.key_cert_sign() {
+                    return Err(AttestationError::MissingKeyCertSign(idx));
+                }
+            }
+
+            // Reject if attestation extension appears on any non-leaf certificate
+            if cert
+                .extensions()
+                .iter()
+                .any(|ext| ext.oid.to_id_string() == ANDROID_KEY_ATTESTATION_OID)
+            {
+                return Err(AttestationError::AttestationExtensionOnIntermediate(idx));
+            }
+        }
+
         // Step 1: Verify cryptographic signature chain from leaf to root
         for i in 0..parsed_certs.len() - 1 {
             let child = &parsed_certs[i];
             let parent = &parsed_certs[i + 1];
+
+            // RFC 5280 §4.1.1.2: Signature algorithm matching
+            if child.signature_algorithm != child.tbs_certificate.signature {
+                return Err(AttestationError::SignatureAlgorithmMismatch {
+                    outer: child.signature_algorithm.algorithm.to_id_string(),
+                    inner: child.tbs_certificate.signature.algorithm.to_id_string(),
+                });
+            }
 
             // Verify issuer-subject linkage
             if child.issuer() != parent.subject() {
@@ -263,7 +353,6 @@ impl HardwareAttestationVerifier {
         let root_spki_raw = root.tbs_certificate.subject_pki.raw;
 
         if !self.trusted_root_spkis.contains(root_spki_raw) {
-            // Also check if root is self-signed and verifies itself
             warn!(
                 "Root certificate with subject '{}' not found in trusted attestation roots",
                 root.subject()
@@ -273,6 +362,12 @@ impl HardwareAttestationVerifier {
 
         // If root is self-signed, verify its self-signature
         if root.issuer() == root.subject() {
+            if root.signature_algorithm != root.tbs_certificate.signature {
+                return Err(AttestationError::SignatureAlgorithmMismatch {
+                    outer: root.signature_algorithm.algorithm.to_id_string(),
+                    inner: root.tbs_certificate.signature.algorithm.to_id_string(),
+                });
+            }
             verify_cert_signature(root, root, parsed_certs.len() - 1)?;
         }
 
@@ -293,6 +388,27 @@ impl HardwareAttestationVerifier {
             return Err(AttestationError::InsecureSecurityLevel(
                 key_desc.attestation_security_level,
             ));
+        }
+        if !key_desc.keymaster_security_level.is_hardware_backed() {
+            return Err(AttestationError::InsecureSecurityLevel(
+                key_desc.keymaster_security_level,
+            ));
+        }
+
+        // Step 6: Verify key origin in hardwareEnforced list (KM_ORIGIN_GENERATED == 0)
+        match key_desc.origin {
+            Some(0) => {} // KM_ORIGIN_GENERATED
+            Some(other) => return Err(AttestationError::InvalidKeyOrigin(other)),
+            None => return Err(AttestationError::MissingOriginTag),
+        }
+
+        // Step 7: Staged challenge verification
+        if let Some(expected) = expected_challenge {
+            if key_desc.attestation_challenge != expected {
+                return Err(AttestationError::ChallengeMismatch);
+            }
+        } else {
+            warn!("Attestation challenge verification bypassed for legacy client compatibility");
         }
 
         info!(
@@ -347,6 +463,12 @@ fn verify_cert_signature(
     match sig_alg_oid.as_str() {
         // ecdsa-with-SHA256 (1.2.840.10045.4.3.2)
         "1.2.840.10045.4.3.2" => {
+            if parent_key_bytes.len() != 65 {
+                return Err(AttestationError::UnsupportedSignatureAlgorithm(format!(
+                    "ECDSA P-256 SHA-256 requires 65-byte uncompressed P-256 parent key, found {}",
+                    parent_key_bytes.len()
+                )));
+            }
             let peer_pub = ring::signature::UnparsedPublicKey::new(
                 &ring::signature::ECDSA_P256_SHA256_ASN1,
                 parent_key_bytes,
@@ -360,6 +482,12 @@ fn verify_cert_signature(
         }
         // ecdsa-with-SHA384 (1.2.840.10045.4.3.3)
         "1.2.840.10045.4.3.3" => {
+            if parent_key_bytes.len() != 97 {
+                return Err(AttestationError::UnsupportedSignatureAlgorithm(format!(
+                    "ECDSA P-384 SHA-384 requires 97-byte uncompressed P-384 parent key, found {}",
+                    parent_key_bytes.len()
+                )));
+            }
             let peer_pub = ring::signature::UnparsedPublicKey::new(
                 &ring::signature::ECDSA_P384_SHA384_ASN1,
                 parent_key_bytes,
@@ -517,9 +645,29 @@ fn parse_key_description_der(raw_bytes: &[u8]) -> Result<KeyDescription, Attesta
     offset += len;
 
     // Item 6: uniqueId (OCTET STRING, tag 0x04)
-    let (uid_bytes, _len) = parse_der_tlv_at(seq_content, offset, 0x04)
+    let (uid_bytes, uid_len) = parse_der_tlv_at(seq_content, offset, 0x04)
         .map_err(|e| AttestationError::ExtensionParseError(format!("uniqueId: {e}")))?;
     let unique_id = uid_bytes.to_vec();
+    offset += uid_len;
+
+    // Item 7: softwareEnforced (SEQUENCE, tag 0x30)
+    let origin = if offset < seq_content.len() {
+        let (_sw_bytes, sw_len) = parse_der_tlv_at(seq_content, offset, 0x30)
+            .map_err(|e| AttestationError::ExtensionParseError(format!("softwareEnforced: {e}")))?;
+        offset += sw_len;
+
+        // Item 8: hardwareEnforced (SEQUENCE, tag 0x30)
+        if offset < seq_content.len() {
+            let (hw_bytes, _hw_len) = parse_der_tlv_at(seq_content, offset, 0x30).map_err(|e| {
+                AttestationError::ExtensionParseError(format!("hardwareEnforced: {e}"))
+            })?;
+            parse_origin_from_authorization_list(hw_bytes)?
+        } else {
+            None
+        }
+    } else {
+        None
+    };
 
     Ok(KeyDescription {
         attestation_version,
@@ -528,6 +676,7 @@ fn parse_key_description_der(raw_bytes: &[u8]) -> Result<KeyDescription, Attesta
         keymaster_security_level,
         attestation_challenge,
         unique_id,
+        origin,
     })
 }
 
@@ -654,9 +803,123 @@ fn der_bytes_to_u32(bytes: &[u8]) -> Result<u32, AttestationError> {
     Ok(val)
 }
 
+fn parse_der_length_and_value(bytes: &[u8]) -> Result<(&[u8], usize), String> {
+    if bytes.is_empty() {
+        return Err("Empty length bytes".to_string());
+    }
+    let len_byte = bytes[0];
+    let (content_len, len_bytes_count) = if len_byte < 128 {
+        (len_byte as usize, 1)
+    } else {
+        let num_len_bytes = (len_byte & 0x7F) as usize;
+        if num_len_bytes == 0 || num_len_bytes > 4 {
+            return Err(format!("Unsupported multi-byte length: {num_len_bytes}"));
+        }
+        if 1 + num_len_bytes > bytes.len() {
+            return Err("Unexpected EOF reading length".to_string());
+        }
+        let mut len = 0;
+        for i in 0..num_len_bytes {
+            len = (len << 8) | (bytes[1 + i] as usize);
+        }
+        (len, 1 + num_len_bytes)
+    };
+    if len_bytes_count + content_len > bytes.len() {
+        return Err(format!(
+            "Content length {content_len} exceeds remaining bytes {}",
+            bytes.len() - len_bytes_count
+        ));
+    }
+    Ok((
+        &bytes[len_bytes_count..len_bytes_count + content_len],
+        len_bytes_count + content_len,
+    ))
+}
+
+fn parse_origin_from_authorization_list(
+    auth_list_content: &[u8],
+) -> Result<Option<u32>, AttestationError> {
+    let mut cursor = 0;
+    while cursor < auth_list_content.len() {
+        if cursor + 3 <= auth_list_content.len()
+            && (auth_list_content[cursor] == 0xBF || auth_list_content[cursor] == 0x9F)
+            && auth_list_content[cursor + 1] == 0x85
+            && auth_list_content[cursor + 2] == 0x3E
+        {
+            let is_explicit = auth_list_content[cursor] == 0xBF;
+            cursor += 3;
+            let (content, _total_len) = parse_der_length_and_value(&auth_list_content[cursor..])
+                .map_err(|e| AttestationError::ExtensionParseError(format!("Origin tag: {e}")))?;
+            if is_explicit {
+                let (int_bytes, _) = parse_der_tlv_at(content, 0, 0x02).map_err(|e| {
+                    AttestationError::ExtensionParseError(format!("Origin INTEGER: {e}"))
+                })?;
+                let origin_val = der_bytes_to_u32(int_bytes)?;
+                return Ok(Some(origin_val));
+            } else {
+                let origin_val = der_bytes_to_u32(content)?;
+                return Ok(Some(origin_val));
+            }
+        } else {
+            let first = auth_list_content[cursor];
+            let tag_len = if (first & 0x1F) == 0x1F {
+                let mut t = 1;
+                while cursor + t < auth_list_content.len()
+                    && (auth_list_content[cursor + t] & 0x80) != 0
+                {
+                    t += 1;
+                }
+                t + 1
+            } else {
+                1
+            };
+            cursor += tag_len;
+            if cursor >= auth_list_content.len() {
+                break;
+            }
+            let (_, total_len) = parse_der_length_and_value(&auth_list_content[cursor..])
+                .map_err(|e| AttestationError::ExtensionParseError(format!("Skip tag: {e}")))?;
+            cursor += total_len;
+        }
+    }
+    Ok(None)
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+fn encode_der_integer(val: i64) -> Vec<u8> {
+    if (0..128).contains(&val) {
+        vec![0x02, 0x01, val as u8]
+    } else if (128..=32767).contains(&val) {
+        let b1 = ((val >> 8) & 0xFF) as u8;
+        let b2 = (val & 0xFF) as u8;
+        if (b1 & 0x80) != 0 {
+            vec![0x02, 0x03, 0x00, b1, b2]
+        } else {
+            vec![0x02, 0x02, b1, b2]
+        }
+    } else {
+        let mut bytes = Vec::new();
+        let mut n = val;
+        while n > 0 {
+            bytes.push((n & 0xFF) as u8);
+            n >>= 8;
+        }
+        bytes.reverse();
+        if bytes.is_empty() {
+            bytes.push(0x00);
+        } else if (bytes[0] & 0x80) != 0 {
+            bytes.insert(0, 0x00);
+        }
+        let mut res = vec![0x02, bytes.len() as u8];
+        res.extend_from_slice(&bytes);
+        res
+    }
+}
+
 /// Encodes a minimal ASN.1 KeyDescription SEQUENCE for testing and synthetic validation.
 ///
 /// Traces to: [INV-002], [NFR-SEC-001]
+#[cfg(any(test, feature = "test-utils"))]
 pub fn build_test_key_description_der(
     attestation_version: i64,
     attestation_security_level: AttestationSecurityLevel,
@@ -664,34 +927,64 @@ pub fn build_test_key_description_der(
     keymaster_security_level: AttestationSecurityLevel,
     challenge: &[u8],
 ) -> Vec<u8> {
-    let mut inner = vec![
-        // 1. attestationVersion (INTEGER 0x02)
-        0x02,
-        0x01,
-        attestation_version as u8,
-        // 2. attestationSecurityLevel (ENUMERATED 0x0A)
-        0x0A,
-        0x01,
-        attestation_security_level as u8,
-        // 3. keymasterVersion (INTEGER 0x02)
-        0x02,
-        0x01,
-        keymaster_version as u8,
-        // 4. keymasterSecurityLevel (ENUMERATED 0x0A)
-        0x0A,
-        0x01,
-        keymaster_security_level as u8,
-        // 5. attestationChallenge (OCTET STRING 0x04)
-        0x04,
-        challenge.len() as u8,
-    ];
+    build_test_key_description_der_with_origin(
+        attestation_version,
+        attestation_security_level,
+        keymaster_version,
+        keymaster_security_level,
+        challenge,
+        0, // KM_ORIGIN_GENERATED
+    )
+}
+
+/// Encodes a KeyDescription SEQUENCE with a custom key generation origin value.
+#[cfg(any(test, feature = "test-utils"))]
+pub fn build_test_key_description_der_with_origin(
+    attestation_version: i64,
+    attestation_security_level: AttestationSecurityLevel,
+    keymaster_version: i64,
+    keymaster_security_level: AttestationSecurityLevel,
+    challenge: &[u8],
+    origin: u32,
+) -> Vec<u8> {
+    let mut inner = Vec::new();
+
+    // 1. attestationVersion (INTEGER 0x02)
+    inner.extend_from_slice(&encode_der_integer(attestation_version));
+
+    // 2. attestationSecurityLevel (ENUMERATED 0x0A)
+    inner.push(0x0A);
+    inner.push(0x01);
+    inner.push(attestation_security_level as u8);
+
+    // 3. keymasterVersion (INTEGER 0x02)
+    inner.extend_from_slice(&encode_der_integer(keymaster_version));
+
+    // 4. keymasterSecurityLevel (ENUMERATED 0x0A)
+    inner.push(0x0A);
+    inner.push(0x01);
+    inner.push(keymaster_security_level as u8);
+
+    // 5. attestationChallenge (OCTET STRING 0x04)
+    inner.push(0x04);
+    inner.push(challenge.len() as u8);
     inner.extend_from_slice(challenge);
 
     // 6. uniqueId (OCTET STRING 0x04)
     inner.push(0x04);
-    inner.push(0x00); // empty unique ID
+    inner.push(0x00);
 
-    // Wrap into SEQUENCE (0x30)
+    // 7. softwareEnforced (SEQUENCE 0x30)
+    inner.push(0x30);
+    inner.push(0x00);
+
+    // 8. hardwareEnforced (SEQUENCE 0x30) containing tag [702] EXPLICIT INTEGER (origin)
+    let hw_inner = vec![0xBF, 0x85, 0x3E, 0x03, 0x02, 0x01, origin as u8];
+    inner.push(0x30);
+    inner.push(hw_inner.len() as u8);
+    inner.extend_from_slice(&hw_inner);
+
+    // Wrap into outer SEQUENCE (0x30)
     let mut seq = Vec::new();
     seq.push(0x30);
     if inner.len() < 128 {
@@ -702,18 +995,7 @@ pub fn build_test_key_description_der(
     }
     seq.extend_from_slice(&inner);
 
-    // Wrap into OCTET STRING (0x04) as an X.509 extension payload
-    let mut ext = Vec::new();
-    ext.push(0x04);
-    if seq.len() < 128 {
-        ext.push(seq.len() as u8);
-    } else {
-        ext.push(0x81);
-        ext.push(seq.len() as u8);
-    }
-    ext.extend_from_slice(&seq);
-
-    ext
+    seq
 }
 
 #[cfg(test)]
@@ -781,8 +1063,32 @@ pub mod tests {
 
     #[test]
     fn test_google_root_constants_spki_parseable() {
+        use x509_parser::x509::SubjectPublicKeyInfo;
+
+        let rsa_pem = format!(
+            "-----BEGIN PUBLIC KEY-----\n{}\n-----END PUBLIC KEY-----",
+            GOOGLE_ROOT_CA_RSA_SPKI_B64
+        );
+        let rsa_der = pem::parse(rsa_pem).expect("Valid RSA PEM").into_contents();
+        let (_, rsa_spki) = SubjectPublicKeyInfo::from_der(&rsa_der).expect("Parseable RSA SPKI");
+        assert_eq!(
+            rsa_spki.algorithm.algorithm.to_id_string(),
+            "1.2.840.113549.1.1.1"
+        ); // rsaEncryption
+
+        let ec_pem = format!(
+            "-----BEGIN PUBLIC KEY-----\n{}\n-----END PUBLIC KEY-----",
+            GOOGLE_ROOT_CA_EC_SPKI_B64
+        );
+        let ec_der = pem::parse(ec_pem).expect("Valid EC PEM").into_contents();
+        let (_, ec_spki) = SubjectPublicKeyInfo::from_der(&ec_der).expect("Parseable EC SPKI");
+        assert_eq!(
+            ec_spki.algorithm.algorithm.to_id_string(),
+            "1.2.840.10045.2.1"
+        ); // id-ecPublicKey
+        assert_eq!(ec_der.len(), 120);
+
         let verifier = HardwareAttestationVerifier::new();
-        // Verifier should contain both Google RSA and Google EC roots
         assert_eq!(verifier.trusted_root_spkis.len(), 2);
     }
 
@@ -841,23 +1147,128 @@ pub mod tests {
         let verifier = HardwareAttestationVerifier::with_custom_roots(&[root_spki]);
 
         // A. Verification succeeds when leaf public key matches expected CSR SPKI
-        let result = verifier.verify_chain(&chain_pems, &leaf_spki);
+        let result = verifier.verify_chain(&chain_pems, &leaf_spki, None);
         assert!(result.is_ok(), "Verification failed: {result:?}");
         let key_desc = result.unwrap();
         assert_eq!(
             key_desc.attestation_security_level,
             AttestationSecurityLevel::TrustedEnvironment
         );
+        assert_eq!(key_desc.origin, Some(0));
 
         // B. Rejection when expected CSR SPKI does not match leaf public key
         let other_key = KeyPair::generate().unwrap();
-        let mismatch_result = verifier.verify_chain(&chain_pems, &other_key.public_key_der());
+        let mismatch_result = verifier.verify_chain(&chain_pems, &other_key.public_key_der(), None);
         assert_eq!(mismatch_result, Err(AttestationError::PublicKeyMismatch));
     }
 
     #[test]
+    fn test_leaf_as_ca_chain_extension_forgery_rejected() {
+        let mut root_params = CertificateParams::default();
+        root_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        root_params
+            .distinguished_name
+            .push(DnType::CommonName, "Test Root");
+        let root_key = KeyPair::generate().unwrap();
+        let root_cert = root_params.self_signed(&root_key).unwrap();
+        let root_spki = root_key.public_key_der();
+
+        // Intermediate cert that is NOT a CA (cA:FALSE / NoCa)
+        let mut int_params = CertificateParams::default();
+        int_params.is_ca = IsCa::NoCa;
+        int_params
+            .distinguished_name
+            .push(DnType::CommonName, "Attacker Phone Leaf Key Claiming CA");
+        let int_key = KeyPair::generate().unwrap();
+        let int_cert = int_params
+            .signed_by(&int_key, &root_cert, &root_key)
+            .unwrap();
+
+        // Forged leaf cert signed by the non-CA cert
+        let leaf_key = KeyPair::generate().unwrap();
+        let leaf_spki = leaf_key.public_key_der();
+        let ext_der = build_test_key_description_der(
+            3,
+            AttestationSecurityLevel::StrongBox,
+            3,
+            AttestationSecurityLevel::StrongBox,
+            b"fake-challenge",
+        );
+        let mut leaf_params = CertificateParams::default();
+        leaf_params
+            .custom_extensions
+            .push(CustomExtension::from_oid_content(
+                &[1, 3, 6, 1, 4, 1, 11129, 2, 1, 17],
+                ext_der,
+            ));
+        let leaf_cert = leaf_params
+            .signed_by(&leaf_key, &int_cert, &int_key)
+            .unwrap();
+
+        let chain_pems = vec![leaf_cert.pem(), int_cert.pem(), root_cert.pem()];
+        let verifier = HardwareAttestationVerifier::with_custom_roots(&[root_spki]);
+
+        let result = verifier.verify_chain(&chain_pems, &leaf_spki, None);
+        assert_eq!(result, Err(AttestationError::InvalidCaConstraints(1)));
+    }
+
+    #[test]
+    fn test_intermediate_with_attestation_extension_rejected() {
+        let mut root_params = CertificateParams::default();
+        root_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        root_params
+            .distinguished_name
+            .push(DnType::CommonName, "Test Root");
+        let root_key = KeyPair::generate().unwrap();
+        let root_cert = root_params.self_signed(&root_key).unwrap();
+        let root_spki = root_key.public_key_der();
+
+        // Intermediate CA that carries the attestation extension (forbidden on non-leaf)
+        let ext_der = build_test_key_description_der(
+            3,
+            AttestationSecurityLevel::TrustedEnvironment,
+            4,
+            AttestationSecurityLevel::TrustedEnvironment,
+            b"nonce",
+        );
+        let mut int_params = CertificateParams::default();
+        int_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        int_params
+            .custom_extensions
+            .push(CustomExtension::from_oid_content(
+                &[1, 3, 6, 1, 4, 1, 11129, 2, 1, 17],
+                ext_der.clone(),
+            ));
+        let int_key = KeyPair::generate().unwrap();
+        let int_cert = int_params
+            .signed_by(&int_key, &root_cert, &root_key)
+            .unwrap();
+
+        let leaf_key = KeyPair::generate().unwrap();
+        let leaf_spki = leaf_key.public_key_der();
+        let mut leaf_params = CertificateParams::default();
+        leaf_params
+            .custom_extensions
+            .push(CustomExtension::from_oid_content(
+                &[1, 3, 6, 1, 4, 1, 11129, 2, 1, 17],
+                ext_der,
+            ));
+        let leaf_cert = leaf_params
+            .signed_by(&leaf_key, &int_cert, &int_key)
+            .unwrap();
+
+        let chain_pems = vec![leaf_cert.pem(), int_cert.pem(), root_cert.pem()];
+        let verifier = HardwareAttestationVerifier::with_custom_roots(&[root_spki]);
+
+        let result = verifier.verify_chain(&chain_pems, &leaf_spki, None);
+        assert_eq!(
+            result,
+            Err(AttestationError::AttestationExtensionOnIntermediate(1))
+        );
+    }
+
+    #[test]
     fn test_hardware_attestation_chain_rejects_untrusted_root() {
-        // Root CA not in verifier trust store
         let mut root_params = CertificateParams::default();
         root_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
         root_params
@@ -893,9 +1304,8 @@ pub mod tests {
 
         let chain_pems = vec![leaf_cert.pem(), root_cert.pem()];
 
-        // Default verifier only trusts Google roots
         let verifier = HardwareAttestationVerifier::new();
-        let result = verifier.verify_chain(&chain_pems, &leaf_spki);
+        let result = verifier.verify_chain(&chain_pems, &leaf_spki, None);
         assert_eq!(result, Err(AttestationError::UntrustedRootCertificate));
     }
 
@@ -913,7 +1323,7 @@ pub mod tests {
         let leaf_key = KeyPair::generate().unwrap();
         let leaf_spki = leaf_key.public_key_der();
 
-        // KeyDescription with Software security level
+        // KeyDescription with Software attestation security level
         let soft_ext_der = build_test_key_description_der(
             3,
             AttestationSecurityLevel::Software,
@@ -939,13 +1349,138 @@ pub mod tests {
         let chain_pems = vec![leaf_cert.pem(), root_cert.pem()];
         let verifier = HardwareAttestationVerifier::with_custom_roots(&[root_spki]);
 
-        let result = verifier.verify_chain(&chain_pems, &leaf_spki);
+        let result = verifier.verify_chain(&chain_pems, &leaf_spki, None);
         assert_eq!(
             result,
             Err(AttestationError::InsecureSecurityLevel(
                 AttestationSecurityLevel::Software
             ))
         );
+
+        // KeyDescription with TEE attestation but Software keymaster level
+        let soft_km_der = build_test_key_description_der(
+            3,
+            AttestationSecurityLevel::TrustedEnvironment,
+            4,
+            AttestationSecurityLevel::Software,
+            b"soft-km-nonce",
+        );
+        let mut leaf_params_km = CertificateParams::default();
+        leaf_params_km
+            .custom_extensions
+            .push(CustomExtension::from_oid_content(
+                &[1, 3, 6, 1, 4, 1, 11129, 2, 1, 17],
+                soft_km_der,
+            ));
+        let leaf_cert_km = leaf_params_km
+            .signed_by(&leaf_key, &root_cert, &root_key)
+            .unwrap();
+
+        let chain_pems_km = vec![leaf_cert_km.pem(), root_cert.pem()];
+        let result_km = verifier.verify_chain(&chain_pems_km, &leaf_spki, None);
+        assert_eq!(
+            result_km,
+            Err(AttestationError::InsecureSecurityLevel(
+                AttestationSecurityLevel::Software
+            ))
+        );
+    }
+
+    #[test]
+    fn test_hardware_attestation_chain_rejects_imported_key_origin() {
+        let mut root_params = CertificateParams::default();
+        root_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        root_params
+            .distinguished_name
+            .push(DnType::CommonName, "Test Root");
+        let root_key = KeyPair::generate().unwrap();
+        let root_cert = root_params.self_signed(&root_key).unwrap();
+        let root_spki = root_key.public_key_der();
+
+        let leaf_key = KeyPair::generate().unwrap();
+        let leaf_spki = leaf_key.public_key_der();
+
+        // Origin 2 = KM_ORIGIN_IMPORTED
+        let imported_der = build_test_key_description_der_with_origin(
+            3,
+            AttestationSecurityLevel::TrustedEnvironment,
+            4,
+            AttestationSecurityLevel::TrustedEnvironment,
+            b"imported-nonce",
+            2,
+        );
+
+        let mut leaf_params = CertificateParams::default();
+        leaf_params
+            .custom_extensions
+            .push(CustomExtension::from_oid_content(
+                &[1, 3, 6, 1, 4, 1, 11129, 2, 1, 17],
+                imported_der,
+            ));
+        let leaf_cert = leaf_params
+            .signed_by(&leaf_key, &root_cert, &root_key)
+            .unwrap();
+
+        let chain_pems = vec![leaf_cert.pem(), root_cert.pem()];
+        let verifier = HardwareAttestationVerifier::with_custom_roots(&[root_spki]);
+
+        let result = verifier.verify_chain(&chain_pems, &leaf_spki, None);
+        assert_eq!(result, Err(AttestationError::InvalidKeyOrigin(2)));
+    }
+
+    #[test]
+    fn test_challenge_verification_match_and_mismatch() {
+        let mut root_params = CertificateParams::default();
+        root_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        root_params
+            .distinguished_name
+            .push(DnType::CommonName, "Test Root");
+        let root_key = KeyPair::generate().unwrap();
+        let root_cert = root_params.self_signed(&root_key).unwrap();
+        let root_spki = root_key.public_key_der();
+
+        let leaf_key = KeyPair::generate().unwrap();
+        let leaf_spki = leaf_key.public_key_der();
+
+        let ext_der = build_test_key_description_der(
+            3,
+            AttestationSecurityLevel::TrustedEnvironment,
+            4,
+            AttestationSecurityLevel::TrustedEnvironment,
+            b"expected-challenge-nonce",
+        );
+
+        let mut leaf_params = CertificateParams::default();
+        leaf_params
+            .custom_extensions
+            .push(CustomExtension::from_oid_content(
+                &[1, 3, 6, 1, 4, 1, 11129, 2, 1, 17],
+                ext_der,
+            ));
+        let leaf_cert = leaf_params
+            .signed_by(&leaf_key, &root_cert, &root_key)
+            .unwrap();
+
+        let chain_pems = vec![leaf_cert.pem(), root_cert.pem()];
+        let verifier = HardwareAttestationVerifier::with_custom_roots(&[root_spki]);
+
+        // Matches expected challenge
+        let match_result =
+            verifier.verify_chain(&chain_pems, &leaf_spki, Some(b"expected-challenge-nonce"));
+        assert!(match_result.is_ok());
+
+        // Mismatches expected challenge
+        let mismatch_result =
+            verifier.verify_chain(&chain_pems, &leaf_spki, Some(b"wrong-challenge"));
+        assert_eq!(mismatch_result, Err(AttestationError::ChallengeMismatch));
+    }
+
+    #[test]
+    fn test_exclusive_custom_roots_rejects_google_root() {
+        let dummy_spki = vec![1, 2, 3, 4, 5];
+        let verifier = HardwareAttestationVerifier::with_exclusive_custom_roots(&[dummy_spki]);
+        // Must contain only the 1 custom root, zero Google roots
+        assert_eq!(verifier.trusted_root_spkis.len(), 1);
     }
 
     #[test]
@@ -962,7 +1497,6 @@ pub mod tests {
         let leaf_key = KeyPair::generate().unwrap();
         let leaf_spki = leaf_key.public_key_der();
 
-        // Leaf certificate WITHOUT attestation extension
         let mut leaf_params = CertificateParams::default();
         leaf_params
             .distinguished_name
@@ -974,7 +1508,7 @@ pub mod tests {
         let chain_pems = vec![leaf_cert.pem(), root_cert.pem()];
         let verifier = HardwareAttestationVerifier::with_custom_roots(&[root_spki]);
 
-        let result = verifier.verify_chain(&chain_pems, &leaf_spki);
+        let result = verifier.verify_chain(&chain_pems, &leaf_spki, None);
         assert_eq!(result, Err(AttestationError::MissingAttestationExtension));
     }
 }
