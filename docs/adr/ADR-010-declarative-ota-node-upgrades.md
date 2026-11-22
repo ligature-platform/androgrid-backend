@@ -38,7 +38,8 @@ We extend `androgrid/v1/orchestrator.proto` with explicit declarative upgrade di
 - `LastUpgradeOutcome`: reports `target_version`, `apk_sha256`, `status`, `error_code`, `error_message`, and `attempt_count`.
 - Bidirectional integration:
   - `NodeUpgradeDirective upgrade_directive` is attached to `SyncNodeStateResponse` (field 6) and `ClaimCellularTaskResponse` (field 4).
-  - `LastUpgradeOutcome last_upgrade_outcome` is attached to `RegisterNodeRequest` (field 5) and `SyncNodeStateRequest` (field 5).
+  - `LastUpgradeOutcome last_upgrade_outcome` is attached to `RegisterNodeRequest` (field 5), `SyncNodeStateRequest` (field 5), and `ClaimCellularTaskRequest` (field 8).
+  - Dynamic client version reporting: `ClaimCellularTaskRequest` includes `client_version` (field 7) in parity with `RegisterNodeRequest` and `SyncNodeStateRequest`.
   - `UpgradeNodesRequest` carries `apk_url`, `apk_sha256`, `network_policy`, `rollout_strategy`, `rollout_percentage`, `lease_timeout_seconds`, and `drain_before_upgrade`.
 
 ### 2. Declarative Pull-Based Delivery ([INV-001])
@@ -51,44 +52,64 @@ We extend `androgrid/v1/orchestrator.proto` with explicit declarative upgrade di
 - Deterministic process survival is guaranteed via the Android platform contract:
   - `PackageReplacedReceiver` is statically declared in `AndroidManifest.xml` listening for the system broadcast `android.intent.action.MY_PACKAGE_REPLACED`.
   - Android `ActivityManagerService` delivers this broadcast immediately after package replacement completes.
-  - Upon receiving `MY_PACKAGE_REPLACED`, the receiver checks `ClusterSettingsRepository`. If cluster participation is active, it invokes `ContextCompat.startForegroundService(...)` to restart `WorkerForegroundService`.
+  - Upon receiving `MY_PACKAGE_REPLACED`, the receiver inspects `UpgradeLedger` to reconcile pending upgrades, checks `ClusterSettingsRepository`, and invokes `ContextCompat.startForegroundService(...)` when cluster participation is active.
   - OEM ROM Fallback: If `startForegroundService` throws `ForegroundServiceStartNotAllowedException` on Android 12-16 due to background start restrictions, the receiver immediately catches the exception and enqueues an expedited `PackageReplacedRecoveryWorker` via Jetpack WorkManager (`OutOfQuotaPolicy.RUN_AS_NON_EXPEDITED_WORK_REQUEST`) to reliably bootstrap service recovery.
+  - API 28-30 Compatibility: `PackageReplacedRecoveryWorker` implements `getForegroundInfo()` to support foreground service execution across older API levels.
   - Battery Optimization Exemption: `AndroidManifest.xml` declares `REQUEST_IGNORE_BATTERY_OPTIMIZATIONS`, and `UpgradeManager` verifies battery optimization exemption to prevent OEM sleep killing.
   - Jetpack WorkManager background spot workers resume automatically via their built-in SQLite job store.
 
 ### 4. Terminal Failure Reporting, Loop Prevention & Canary Promotion Halt
-- The Android client maintains an encrypted on-device `UpgradeLedger` keyed by `(target_version, apk_sha256)`.
+- The Android client maintains an on-device `UpgradeLedger` backed by `SharedPreferences` in `MODE_PRIVATE` with in-memory mutex synchronization (`synchronized` / `Mutex`), keyed by `(target_version, apk_sha256)`.
 - Rejection classification:
   - Non-retryable errors (`INSTALL_FAILED_VERSION_DOWNGRADE`, `INSTALL_FAILED_UPDATE_INCOMPATIBLE`, `SIGNATURE_MISMATCH`, `CORRUPT_ARCHIVE`, `ABI_MISMATCH`) are marked `TERMINALLY_REJECTED`.
   - Once marked `TERMINALLY_REJECTED`, the client aborts immediately on subsequent directives for that digest without re-downloading bytes.
   - Transient failures (e.g., download timeout, temporary storage lock) are capped at a maximum of 3 attempts with exponential backoff (30s, 60s, 120s) before escalating to `TERMINALLY_REJECTED`.
-- Control Plane Canary Promotion Halt:
-  - When the control plane receives `TERMINALLY_REJECTED` or `FAILED_TRANSIENT` in `last_upgrade_outcome`, `record_node_upgrade_failure` immediately clears the directive for that node and marks the active rollout as `is_halted = true`.
-  - Canary promotion in `promote_next_canary_if_ready` is immediately suspended, preventing faulty APK builds from advancing to subsequent canary cohorts.
+- Control Plane Authentication & Canary Promotion Halt:
+  - Outcome reports in `SyncNodeStateRequest` are authenticated against `session_token` prior to processing to prevent unauthenticated outcome spoofing.
+  - When the control plane receives `TERMINALLY_REJECTED` in `last_upgrade_outcome`, `record_node_upgrade_failure` immediately clears the directive for that node, suppresses further directives, and marks the active rollout as `is_halted = true`.
+  - Transient failures increment failure tracking without halting rollout progression, preserving cluster stability during temporary network drops.
+  - Canary promotion in `promote_next_canary_if_ready` is suspended when `is_halted = true`, preventing faulty APK builds from advancing to subsequent cohorts.
 
 ### 5. Durable Rollout State & Control Plane Restart Reconciliation
 - Active rollout descriptors (`target_version`, `apk_url`, `apk_sha256`, `network_policy`, `rollout_strategy`, `rollout_percentage`, `eligible_node_ids`, `in_flight_node_ids`, `completed_node_ids`, `failed_node_ids`, `is_halted`) are persisted to durable storage via `RolloutStore` prior to directive dispatch.
+- Atomic File Persistence: `RolloutStore` writes state using a staging temporary file (`.tmp`), invokes `sync_all()` to ensure physical disk commit, and atomically replaces the primary file using `fs::rename`, preventing corruption across power failures or crashes.
 - Upon orchestrator startup, `reconcile_rollouts_from_store` reloads persisted rollouts from disk and reconciles them against connecting worker registrations.
+- Reconnect Reconciliation: Connecting workers (in `RegisterNode`) are reconciled against active rollouts even before insertion into the memory map, and their desired versions are aligned without clobbering updated state.
+- Lease Sweeper: `sweep_timed_out_leases` checks `upgrade_lease_deadline_ms` to detect and clear stalled worker upgrade leases, halting the rollout on timeout.
 - Ground-truth evaluation prevents split-brain canary promotion:
   - In-flight nodes that have not yet reported `client_version == target_version` retain their in-flight status and do not trigger promotion of remaining staged nodes.
-  - If any node in the active cohort failed, the rollout remains halted across restarts until explicitly cleared or overridden by an operator.
+  - If any node in the active cohort failed terminally, the rollout remains halted across restarts until explicitly cleared or overridden by an operator.
 
-### 6. Null-Safe Pre-Install Signing Certificate Lineage Verification ([NFR-SEC-001])
+### 6. Null-Safe Pre-Install Signing Certificate Lineage Verification & Security Hardening ([NFR-SEC-001])
 - Relying solely on SHA-256 digest validation verifies download integrity but not cryptographic authenticity or signing compatibility.
-- Before invoking installation commands or prompting the user via `PackageInstaller`, `UpgradeManager` inspects the downloaded APK:
+- Format Validation: SHA-256 strings are validated against a strict 64-character hexadecimal pattern before processing.
+- Secure Staging: Downloaded APKs are stored in an isolated directory (`context.cacheDir/ota/`), rejecting any path traversal attempts.
+- FileProvider Scoping: File sharing is restricted strictly to `<cache-path name="ota_apks" path="ota/" />` in `file_paths.xml`.
+- Pre-Install Checks: Before invoking installation commands or prompting the user via `PackageInstaller`, `UpgradeManager` inspects the downloaded APK:
   - Reads package archive info using Android `PackageManager.GET_SIGNING_CERTIFICATES`.
   - Null check guard: If `getPackageArchiveInfo` returns `null` (indicating a truncated, corrupt, or unparseable archive), the download is treated as corrupt, the file is immediately purged from disk, and a `CORRUPT_ARCHIVE` terminal failure is recorded.
-  - Signing lineage check: `UpgradeManager` inspects both `apkContentsSigners` and `signingCertificateHistory` on API 28+, comparing SHA-256 digests against currently installed certificates (`PackageManager.hasSigningCertificate` / digest comparison).
+  - Package Name Matching: Verifies that the archive package name exactly matches `context.packageName`.
+  - Monotonic Version Code: Verifies that the archive version code is greater than or equal to the installed version code, preventing silent downgrade failures.
+  - Signing Lineage Check: `UpgradeManager` inspects both `apkContentsSigners` and `signingCertificateHistory` on API 28+, comparing SHA-256 digests against currently installed certificates. If either installed or archive certificates are null or empty, verification fails closed.
   - If signing certificates do not match or are missing, the APK is purged, preventing broken UID/KeyStore continuity ([INV-002]) and avoiding root execution of unauthorized binaries.
+- Cluster mTLS Downloads: APK downloads are routed over cluster mTLS using `OkHttpClient` configured with the cluster TLS 1.3 socket factory, disabled HTTP redirects, and an enforced 100 MB payload ceiling.
 
-### 7. Root Installation & SELinux Stdin Streaming (`pm install -r -S`)
+### 7. Drain-Before-Upgrade Guard & Worker Synchronization
+- When `drain_before_upgrade` is set in the directive:
+  - The control plane gates directive dispatch until the node reports zero `active_task_ids`.
+  - On the client side, `WorkerForegroundService` and `WifiSyncTaskProcessor` activate an `isDrainingForUpgrade` barrier that rejects new task submissions and drains in-flight coroutines before executing the upgrade directive.
+- Unique Work Scheduling: `UpgradeDownloadWorker` uses `enqueueUniqueWork` with `ExistingWorkPolicy.KEEP` to prevent duplicate parallel downloads.
+
+### 8. Root Installation & SELinux Stdin Streaming (`pm install -r -S`)
 - Empirical hardware verification on physical Pixel hardware proved that path-based root execution (`su -c pm install -r <apkPath>`) fails when the APK resides in internal application storage (`/data/user/0/com.androgrid.worker/...`) because Android SELinux policy enforces `neverallow system_server app_data_file:file read` (`avc: denied` / `Error: Unable to open file`).
 - To avoid copying binaries to insecure world-readable storage (`/sdcard/`), `UpgradeManager` streams the APK binary via standard input using exact byte length:
   `su -c "pm install -r -S <byteSize>"`
   piping bytes directly from internal storage through standard input.
+- Monotonic Anti-Rollback: Production root execution strictly omits the `-d` downgrade flag, preserving platform anti-rollback enforcement.
+- Process Deadlock Prevention: Child process execution utilizes `redirectErrorStream(true)` and asynchronous stream draining via `Dispatchers.IO` to prevent OS pipe deadlocks. A 120-second timeout with `destroyForcibly()` ensures runaway processes are cleaned up.
 - Empirical hardware testing confirmed that stdin `-S` streaming succeeds with `Success` and zero SELinux denials.
 
-### 8. Cellular Radio Protection & Asynchronous Download Decoupling ([ANTI-003], [NFR-POW-001], [INV-003])
+### 9. Cellular Radio Protection & Asynchronous Download Decoupling ([ANTI-003], [NFR-POW-001], [INV-003])
 - Default network policy is strictly `UPGRADE_NETWORK_POLICY_WIFI_ONLY`.
 - Over metered cellular WAN, Wi-Fi-only directives are suppressed by the control plane.
 - Spot-claim socket decoupling:
@@ -96,7 +117,7 @@ We extend `androgrid/v1/orchestrator.proto` with explicit declarative upgrade di
   - The spot-claim mTLS gRPC channel is always torn down within the strict `< 200 ms` budget mandated by `[NFR-POW-001]`.
   - The cellular directive is handed off to `UpgradeDownloadWorker` via Jetpack WorkManager with constraints (`NetworkType.CONNECTED`, `BatteryNotLow`, `StorageNotLow`), decoupling binary transfer from short-lived spot task leases.
 
-### 9. Operator CLI Surface (`androgrid-cli upgrade-nodes`)
+### 10. Operator CLI Surface (`androgrid-cli upgrade-nodes`)
 - Flags: `--target-version`, `--apk-url`, `--apk-sha256`, `--network` (`wifi-only` or `allow-cellular`), `--strategy` (`immediate` or `rolling`), `--rollout-percentage`, `--lease-timeout-seconds`, `--drain`.
 - Targets either an explicit `--node-group` or repeatable `--node-id` arguments.
 
@@ -110,9 +131,10 @@ We extend `androgrid/v1/orchestrator.proto` with explicit declarative upgrade di
 - SELinux compliant: Stdin `-S` streaming eliminates `app_data_file` denials without compromising storage isolation.
 - Zero infinite loops: `UpgradeLedger` classifies terminal installation failures and suppresses repeated downloads.
 - Automated canary blast-radius control: Broken builds halt canary promotion immediately on the control plane.
-- Resilient control plane: Rollout descriptors survive orchestrator crashes and restarts without split-brain promotions.
-- Cryptographic safety: Signing lineage validation guarantees KeyStore continuity and blocks foreign APK execution.
+- Resilient control plane: Rollout descriptors survive orchestrator crashes and restarts without split-brain promotions via atomic disk persistence.
+- Cryptographic safety: Signing lineage validation guarantees KeyStore continuity, fail-closed certificate extraction blocks foreign APK execution, and downloads enforce cluster TLS 1.3.
 - Baseband radio protection: Ephemeral cellular spot sockets tear down within 200 ms; binary transfers are deferred to Wi-Fi or constrained background workers.
+- Graceful drain: In-flight compute tasks complete without interruption prior to package replacement.
 
 ### Neutral / Constraints
 - Unrooted consumer devices require user interaction to confirm package updates via system `PackageInstaller`.
