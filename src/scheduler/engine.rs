@@ -334,8 +334,10 @@ impl ClusterScheduler {
         };
 
         if let Some(ref outcome) = last_upgrade_outcome {
-            if outcome.status == crate::proto::androgrid::v1::UpgradeInstallStatus::TerminallyRejected as i32
-                || outcome.status == crate::proto::androgrid::v1::UpgradeInstallStatus::FailedTransient as i32
+            if outcome.status
+                == crate::proto::androgrid::v1::UpgradeInstallStatus::TerminallyRejected as i32
+                || outcome.status
+                    == crate::proto::androgrid::v1::UpgradeInstallStatus::FailedTransient as i32
             {
                 record_node_upgrade_failure(
                     &mut inner,
@@ -634,8 +636,10 @@ impl ClusterScheduler {
         let mut inner = self.inner.write().expect("RwLock write lock poisoned");
 
         if let Some(ref outcome) = last_upgrade_outcome {
-            if outcome.status == crate::proto::androgrid::v1::UpgradeInstallStatus::TerminallyRejected as i32
-                || outcome.status == crate::proto::androgrid::v1::UpgradeInstallStatus::FailedTransient as i32
+            if outcome.status
+                == crate::proto::androgrid::v1::UpgradeInstallStatus::TerminallyRejected as i32
+                || outcome.status
+                    == crate::proto::androgrid::v1::UpgradeInstallStatus::FailedTransient as i32
             {
                 record_node_upgrade_failure(
                     &mut inner,
@@ -690,7 +694,10 @@ impl ClusterScheduler {
             let upgrade_eligible = unmetered || allows_cellular_upgrade;
 
             let (desired_version, upgrade_directive) = if upgrade_eligible {
-                (pending_desired_version(worker), worker.upgrade_directive.clone())
+                (
+                    pending_desired_version(worker),
+                    worker.upgrade_directive.clone(),
+                )
             } else {
                 (String::new(), None)
             };
@@ -2031,12 +2038,12 @@ impl ClusterScheduler {
         }
 
         let apk_sha256 = req.apk_sha256.trim().to_lowercase();
-        if !apk_sha256.is_empty() {
-            if apk_sha256.len() != 64 || !apk_sha256.chars().all(|c| c.is_ascii_hexdigit()) {
-                return Err(SchedulingError::InvalidNodeGroupRequest(
-                    "apk_sha256 must be a 64-character hexadecimal SHA-256 digest".to_string(),
-                ));
-            }
+        if !apk_sha256.is_empty()
+            && (apk_sha256.len() != 64 || !apk_sha256.chars().all(|c| c.is_ascii_hexdigit()))
+        {
+            return Err(SchedulingError::InvalidNodeGroupRequest(
+                "apk_sha256 must be a 64-character hexadecimal SHA-256 digest".to_string(),
+            ));
         }
 
         let network_policy = if req.network_policy == 0 {
@@ -2094,17 +2101,19 @@ impl ClusterScheduler {
         }
 
         let total_eligible = eligible_ids.len();
-        let (active_cohort, staged_cohort): (Vec<String>, Vec<String>) =
-            if rollout_strategy == UpgradeRolloutStrategy::Rolling as i32
-                && total_eligible > 0
-                && rollout_pct < 100
-            {
-                let batch_size = ((total_eligible * (rollout_pct as usize) + 99) / 100).max(1);
-                let (active, staged) = eligible_ids.split_at(batch_size.min(total_eligible));
-                (active.to_vec(), staged.to_vec())
-            } else {
-                (eligible_ids.clone(), Vec::new())
-            };
+        let (active_cohort, staged_cohort): (Vec<String>, Vec<String>) = if rollout_strategy
+            == UpgradeRolloutStrategy::Rolling as i32
+            && total_eligible > 0
+            && rollout_pct < 100
+        {
+            let batch_size = (total_eligible * (rollout_pct as usize))
+                .div_ceil(100)
+                .max(1);
+            let (active, staged) = eligible_ids.split_at(batch_size.min(total_eligible));
+            (active.to_vec(), staged.to_vec())
+        } else {
+            (eligible_ids.clone(), Vec::new())
+        };
 
         let now_epoch_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2116,8 +2125,7 @@ impl ClusterScheduler {
             if let Some(w) = inner.workers.get_mut(nid) {
                 w.desired_client_version = Some(target_version.clone());
                 w.upgrade_directive = Some(directive_template.clone());
-                w.upgrade_lease_deadline_ms =
-                    now_epoch_ms + (lease_timeout_seconds as u64) * 1000;
+                w.upgrade_lease_deadline_ms = now_epoch_ms + (lease_timeout_seconds as u64) * 1000;
                 if req.drain_before_upgrade && !w.draining {
                     w.draining = true;
                     w.drained_for_upgrade = true;
@@ -2280,7 +2288,9 @@ fn promote_next_canary_if_ready(
             continue;
         }
         if rollout.in_flight_node_ids.remove(completed_node_id) {
-            rollout.completed_node_ids.insert(completed_node_id.to_string());
+            rollout
+                .completed_node_ids
+                .insert(completed_node_id.to_string());
             touched_rollouts.push(rollout_id.clone());
         }
     }
@@ -4783,7 +4793,7 @@ mod tests {
                 1100,
             )
             .unwrap();
-        assert_eq!(r1.session_token.is_empty(), false);
+        assert!(!r1.session_token.is_empty());
 
         // c1 is now auto-undrained, and c2 was automatically promoted!
         let nodes_after = scheduler.list_worker_nodes();
@@ -4955,7 +4965,8 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&temp_dir);
 
-        let store1 = Arc::new(crate::scheduler::rollout_store::RolloutStore::with_directory(&temp_dir));
+        let store1 =
+            Arc::new(crate::scheduler::rollout_store::RolloutStore::with_directory(&temp_dir));
         let scheduler1 = ClusterScheduler::with_rollout_store(store1);
 
         for id in ["c1", "c2", "c3", "c4"] {
@@ -4991,7 +5002,8 @@ mod tests {
             .unwrap();
 
         // Simulate Orchestrator restart: new scheduler instance with the same storage directory
-        let store2 = Arc::new(crate::scheduler::rollout_store::RolloutStore::with_directory(&temp_dir));
+        let store2 =
+            Arc::new(crate::scheduler::rollout_store::RolloutStore::with_directory(&temp_dir));
         let scheduler2 = ClusterScheduler::with_rollout_store(store2);
 
         // Nodes reconnect to new orchestrator instance on version 0.1.0

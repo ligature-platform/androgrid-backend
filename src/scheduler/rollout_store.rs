@@ -139,8 +139,7 @@ impl RolloutStore {
         if let Some(ref dir) = self.storage_dir {
             fs::create_dir_all(dir)?;
             let file_path = dir.join(format!("rollout_{}.json", sanitize_filename(&key)));
-            let json = serde_json::to_string_pretty(&descriptor)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            let json = serde_json::to_string_pretty(&descriptor).map_err(std::io::Error::other)?;
             fs::write(file_path, json)?;
         }
 
@@ -156,7 +155,9 @@ impl RolloutStore {
                     let path = entry.path();
                     if path.extension().and_then(|s| s.to_str()) == Some("json") {
                         if let Ok(content) = fs::read_to_string(&path) {
-                            if let Ok(desc) = serde_json::from_str::<PersistedRolloutDescriptor>(&content) {
+                            if let Ok(desc) =
+                                serde_json::from_str::<PersistedRolloutDescriptor>(&content)
+                            {
                                 let mut mem = self.in_memory.write().unwrap();
                                 mem.insert(desc.target_version.clone(), desc);
                             }
@@ -179,7 +180,10 @@ impl RolloutStore {
         }
 
         if let Some(ref dir) = self.storage_dir {
-            let file_path = dir.join(format!("rollout_{}.json", sanitize_filename(target_version)));
+            let file_path = dir.join(format!(
+                "rollout_{}.json",
+                sanitize_filename(target_version)
+            ));
             if file_path.exists() {
                 fs::remove_file(file_path)?;
             }
@@ -191,6 +195,12 @@ impl RolloutStore {
 
 fn sanitize_filename(name: &str) -> String {
     name.chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
 }
