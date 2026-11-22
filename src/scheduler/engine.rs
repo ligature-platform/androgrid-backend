@@ -17,13 +17,13 @@ use crate::scheduler::thermal::{ThermalAction, ThermalPolicy};
 use crate::{
     AssignNodesToGroupRequest, AssignNodesToGroupResponse, CancelTaskGroupResponse,
     ClaimCellularTaskResponse, CreateNodeGroupRequest, CreateNodeGroupResponse, DrainNodesRequest,
-    DrainNodesResponse, ExecutionEngine, GetTaskGroupStatusResponse, NetworkTransportType,
-    NodeCapabilities, NodeGroup, NodeUpgradeDirective, RegisterNodeResponse, ReplaceStrategy,
-    ReplaceTaskGroupRequest, ReplaceTaskGroupResponse, SubmitCellularResultResponse,
-    SubmitTaskGroupResponse, SyncNodeStateResponse, TaskExecutionReport, TaskGroupSpec,
-    TaskGroupState, TaskGroupSummary, TaskPartitionSpec, TaskSpec, TaskState, TaskTemplate,
-    UpdateNodeGroupRequest, UpdateNodeGroupResponse, UpgradeNetworkPolicy, UpgradeNodesRequest,
-    UpgradeNodesResponse, UpgradeRolloutStrategy,
+    DrainNodesResponse, ExecutionEngine, GetTaskGroupStatusResponse, NetworkEgressPolicy,
+    NetworkTransportType, NodeCapabilities, NodeGroup, NodeUpgradeDirective, RegisterNodeResponse,
+    ReplaceStrategy, ReplaceTaskGroupRequest, ReplaceTaskGroupResponse,
+    SubmitCellularResultResponse, SubmitTaskGroupResponse, SyncNodeStateResponse,
+    TaskExecutionReport, TaskGroupSpec, TaskGroupState, TaskGroupSummary, TaskPartitionSpec,
+    TaskSpec, TaskState, TaskTemplate, UpdateNodeGroupRequest, UpdateNodeGroupResponse,
+    UpgradeNetworkPolicy, UpgradeNodesRequest, UpgradeNodesResponse, UpgradeRolloutStrategy,
 };
 
 /// Maximum number of partitions allowed in a single TaskGroup submission or replacement.
@@ -430,6 +430,7 @@ impl ClusterScheduler {
 
     /// Submits a new compute task specification to the pending queue.
     pub fn submit_task(&self, spec: TaskSpec) -> Result<(), SchedulingError> {
+        validate_network_egress_policy(&spec)?;
         let mut inner = self.inner.write().expect("RwLock write lock poisoned");
         let task_id = spec.task_id.clone();
         if is_reserved_group_task_id(&task_id) {
@@ -648,6 +649,11 @@ impl ClusterScheduler {
 
             // [ANTI-003], [INV-005]: Tasks exceeding 180s must NOT be scheduled to cellular
             if record.spec.timeout_seconds > MAX_CELLULAR_DURATION_SECONDS {
+                continue;
+            }
+
+            // [ANTI-003], [INV-003], [NFR-POW-001]: Tasks with network egress must NOT be scheduled to cellular spot workers
+            if record.spec.egress_policy == NetworkEgressPolicy::Allowlist as i32 {
                 continue;
             }
 
@@ -2627,6 +2633,9 @@ fn build_partition_task_record(
         group_id: group_id.to_string(),
         group_epoch: epoch,
         node_group_affinity: template.node_group_affinity.clone(),
+        egress_policy: 0,
+        allowed_hostnames: Vec::new(),
+        max_egress_bytes: 0,
     })
 }
 
@@ -2808,6 +2817,59 @@ fn pending_desired_version(worker: &WorkerRecord) -> String {
     match worker.desired_client_version.as_deref() {
         Some(target) if target != worker.client_version => target.to_string(),
         _ => String::new(),
+    }
+}
+
+/// Validates network egress policy fields in a TaskSpec.
+///
+/// Traces to: [INV-006], [ANTI-003], [NFR-SEC-001], ADR-011
+pub fn validate_network_egress_policy(spec: &TaskSpec) -> Result<(), SchedulingError> {
+    match spec.egress_policy {
+        0 | 1 => {
+            // Unspecified or Blocked
+            Ok(())
+        }
+        2 => {
+            // NetworkEgressPolicyAllowlist
+            if spec.allowed_hostnames.is_empty() {
+                return Err(SchedulingError::InvalidNetworkEgress(
+                    "allowed_hostnames must not be empty when egress_policy is NETWORK_EGRESS_POLICY_ALLOWLIST".to_string(),
+                ));
+            }
+            for host in &spec.allowed_hostnames {
+                let trimmed = host.trim();
+                if trimmed.is_empty() {
+                    return Err(SchedulingError::InvalidNetworkEgress(
+                        "allowed_hostnames cannot contain empty hostnames".to_string(),
+                    ));
+                }
+                if trimmed.contains("://")
+                    || trimmed.contains('/')
+                    || trimmed.contains(':')
+                    || trimmed.contains(' ')
+                {
+                    return Err(SchedulingError::InvalidNetworkEgress(format!(
+                        "Invalid hostname in allowed_hostnames: '{trimmed}'. Must be a FQDN or wildcard without scheme, port, or path."
+                    )));
+                }
+                let lower = trimmed.to_ascii_lowercase();
+                if lower == "localhost"
+                    || lower == "127.0.0.1"
+                    || lower == "::1"
+                    || lower.starts_with("10.")
+                    || lower.starts_with("192.168.")
+                    || lower.starts_with("169.254.")
+                {
+                    return Err(SchedulingError::InvalidNetworkEgress(format!(
+                        "Host '{trimmed}' in allowed_hostnames targets a forbidden private, loopback, or link-local address"
+                    )));
+                }
+            }
+            Ok(())
+        }
+        other => Err(SchedulingError::InvalidNetworkEgress(format!(
+            "Unknown egress_policy value: {other}"
+        ))),
     }
 }
 
@@ -3039,7 +3101,82 @@ mod tests {
             group_id: String::new(),
             group_epoch: 0,
             node_group_affinity: String::new(),
+            egress_policy: 0,
+            allowed_hostnames: Vec::new(),
+            max_egress_bytes: 0,
         }
+    }
+
+    #[test]
+    fn test_network_egress_policy_validation() {
+        let scheduler = ClusterScheduler::new();
+
+        // 1. ALLOWLIST with empty allowed_hostnames is rejected
+        let mut task_empty_allowlist =
+            make_test_task("task-egress-01", 30, false, ExecutionEngine::WasmWasi);
+        task_empty_allowlist.egress_policy = NetworkEgressPolicy::Allowlist as i32;
+        task_empty_allowlist.allowed_hostnames = vec![];
+        let err = scheduler.submit_task(task_empty_allowlist).unwrap_err();
+        assert!(matches!(err, SchedulingError::InvalidNetworkEgress(_)));
+
+        // 2. ALLOWLIST with scheme or path in hostname is rejected
+        let mut task_scheme =
+            make_test_task("task-egress-02", 30, false, ExecutionEngine::WasmWasi);
+        task_scheme.egress_policy = NetworkEgressPolicy::Allowlist as i32;
+        task_scheme.allowed_hostnames = vec!["https://api.example.com".to_string()];
+        let err2 = scheduler.submit_task(task_scheme).unwrap_err();
+        assert!(matches!(err2, SchedulingError::InvalidNetworkEgress(_)));
+
+        // 3. ALLOWLIST with private/loopback address is rejected
+        let mut task_private =
+            make_test_task("task-egress-03", 30, false, ExecutionEngine::WasmWasi);
+        task_private.egress_policy = NetworkEgressPolicy::Allowlist as i32;
+        task_private.allowed_hostnames = vec!["127.0.0.1".to_string()];
+        let err3 = scheduler.submit_task(task_private).unwrap_err();
+        assert!(matches!(err3, SchedulingError::InvalidNetworkEgress(_)));
+
+        // 4. Valid FQDN and wildcard succeeds
+        let mut task_valid = make_test_task("task-egress-04", 30, false, ExecutionEngine::WasmWasi);
+        task_valid.egress_policy = NetworkEgressPolicy::Allowlist as i32;
+        task_valid.allowed_hostnames =
+            vec!["api.example.com".to_string(), "*.trusted.org".to_string()];
+        assert!(scheduler.submit_task(task_valid).is_ok());
+
+        // 5. BLOCKED policy succeeds
+        let mut task_blocked =
+            make_test_task("task-egress-05", 30, false, ExecutionEngine::WasmWasi);
+        task_blocked.egress_policy = NetworkEgressPolicy::Blocked as i32;
+        assert!(scheduler.submit_task(task_blocked).is_ok());
+    }
+
+    #[test]
+    fn test_cellular_worker_skips_task_with_network_egress() {
+        let scheduler = ClusterScheduler::new();
+        let caps = make_test_capabilities(false, false);
+        scheduler
+            .register_node(
+                "cell-egress-node".to_string(),
+                caps,
+                "1.0.0".to_string(),
+                1000,
+            )
+            .unwrap();
+
+        // Task has egress policy set to ALLOWLIST
+        let mut task_egress =
+            make_test_task("task-egress-cell", 60, false, ExecutionEngine::WasmWasi);
+        task_egress.egress_policy = NetworkEgressPolicy::Allowlist as i32;
+        task_egress.allowed_hostnames = vec!["api.example.com".to_string()];
+        scheduler.submit_task(task_egress).unwrap();
+
+        // Cellular worker attempts to claim task -> must be skipped per [ANTI-003], [INV-003], [NFR-POW-001]
+        let claim = scheduler
+            .claim_cellular_task("cell-egress-node", 90, true, 25, 0, 1000)
+            .unwrap();
+        assert!(
+            !claim.task_available,
+            "Cellular worker must not be leased tasks with network egress"
+        );
     }
 
     #[test]

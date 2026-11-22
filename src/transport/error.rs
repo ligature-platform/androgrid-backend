@@ -177,6 +177,11 @@ impl From<SchedulingError> for Status {
             SchedulingError::StorageError(msg) => {
                 Status::internal(format!("STORAGE_ERROR: {}", msg))
             }
+
+            // Traces to: [INV-006], [ANTI-003], [NFR-SEC-001], ADR-011
+            SchedulingError::InvalidNetworkEgress(msg) => {
+                Status::invalid_argument(format!("INVALID_NETWORK_EGRESS: {}", msg))
+            }
         }
     }
 }

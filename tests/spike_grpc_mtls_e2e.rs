@@ -221,6 +221,9 @@ async fn spike_live_grpc_mtls_full_lifecycle_and_monotonic_fencing() {
         group_id: String::new(),
         group_epoch: 0,
         node_group_affinity: String::new(),
+        allowed_hostnames: vec![],
+        egress_policy: 0,
+        max_egress_bytes: 0,
     };
     scheduler.submit_task(task_spec).unwrap();
 

@@ -61,6 +61,9 @@ async fn spike_concurrent_result_submissions_zero_double_commit() {
         group_id: String::new(),
         group_epoch: 0,
         node_group_affinity: String::new(),
+        allowed_hostnames: vec![],
+        egress_policy: 0,
+        max_egress_bytes: 0,
     };
     scheduler.submit_task(spec).unwrap();
 
@@ -173,6 +176,9 @@ async fn spike_speculative_preemption_concurrent_race() {
         group_id: String::new(),
         group_epoch: 0,
         node_group_affinity: String::new(),
+        allowed_hostnames: vec![],
+        egress_policy: 0,
+        max_egress_bytes: 0,
     };
     scheduler.submit_task(spec).unwrap();
 

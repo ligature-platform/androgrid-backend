@@ -35,6 +35,9 @@ prop_compose! {
             group_id: String::new(),
             group_epoch: 0,
             node_group_affinity: String::new(),
+            allowed_hostnames: vec![],
+            egress_policy: 0,
+            max_egress_bytes: 0,
         }
     }
 }
@@ -78,6 +81,9 @@ proptest! {
             group_id: String::new(),
             group_epoch: 0,
             node_group_affinity: String::new(),
+            allowed_hostnames: vec![],
+            egress_policy: 0,
+            max_egress_bytes: 0,
         };
 
         scheduler.submit_task(spec).unwrap();
@@ -364,6 +370,9 @@ proptest! {
             } else {
                 "grp-b".to_string()
             },
+            allowed_hostnames: vec![],
+            egress_policy: 0,
+            max_egress_bytes: 0,
         };
         scheduler.submit_task(spec).unwrap();
 

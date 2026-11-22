@@ -178,6 +178,7 @@ impl AdminService for AdminServiceImpl {
                 message: "Task accepted and enqueued".to_string(),
             })),
             Err(e @ crate::SchedulingError::NodeGroupNotFound(_)) => Err(Status::from(e)),
+            Err(e @ crate::SchedulingError::InvalidNetworkEgress(_)) => Err(Status::from(e)),
             Err(e) => Err(Status::invalid_argument(format!(
                 "Failed to enqueue task: {e}"
             ))),
@@ -621,6 +622,9 @@ mod tests {
             group_id: String::new(),
             group_epoch: 0,
             node_group_affinity: String::new(),
+            egress_policy: 0,
+            allowed_hostnames: Vec::new(),
+            max_egress_bytes: 0,
         }
     }
 

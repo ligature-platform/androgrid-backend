@@ -1287,6 +1287,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 group_id: String::new(),
                 group_epoch: 0,
                 node_group_affinity: node_group.unwrap_or_default(),
+                egress_policy: 0,
+                allowed_hostnames: Vec::new(),
+                max_egress_bytes: 0,
             };
 
             let response = client
