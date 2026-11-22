@@ -210,10 +210,7 @@ impl RolloutStore {
         }
 
         if let Some(ref dir) = self.storage_dir {
-            let file_path = dir.join(format!(
-                "rollout_{}.json",
-                sanitize_filename(rollout_id)
-            ));
+            let file_path = dir.join(format!("rollout_{}.json", sanitize_filename(rollout_id)));
             if file_path.exists() {
                 fs::remove_file(file_path)?;
             }

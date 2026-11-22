@@ -334,8 +334,7 @@ impl ClusterScheduler {
                     matched_desired = Some(rollout.target_version.clone());
                     matched_directive = Some(rollout.directive_template.clone());
                     matched_draining = rollout.drain_before_upgrade;
-                    matched_deadline =
-                        now_epoch_ms + (rollout.lease_timeout_seconds as u64 * 1000);
+                    matched_deadline = now_epoch_ms + (rollout.lease_timeout_seconds as u64 * 1000);
                     break;
                 }
             }
@@ -509,8 +508,10 @@ impl ClusterScheduler {
 
         // Process cellular upgrade outcome telemetry if present
         if let Some(outcome) = last_upgrade_outcome {
-            let is_terminal = outcome.status == crate::UpgradeInstallStatus::TerminallyRejected as i32;
-            let is_failure = is_terminal || outcome.status == crate::UpgradeInstallStatus::FailedTransient as i32;
+            let is_terminal =
+                outcome.status == crate::UpgradeInstallStatus::TerminallyRejected as i32;
+            let is_failure = is_terminal
+                || outcome.status == crate::UpgradeInstallStatus::FailedTransient as i32;
             if is_failure {
                 record_node_upgrade_failure(
                     &mut inner,
@@ -2209,9 +2210,9 @@ impl ClusterScheduler {
             if apk_url.starts_with("/v1/blobs/") {
                 let expected_path = format!("/v1/blobs/{apk_sha256}");
                 if apk_url != expected_path {
-                    return Err(SchedulingError::InvalidNodeGroupRequest(
-                        format!("apk_url '{apk_url}' does not match digest '{apk_sha256}'"),
-                    ));
+                    return Err(SchedulingError::InvalidNodeGroupRequest(format!(
+                        "apk_url '{apk_url}' does not match digest '{apk_sha256}'"
+                    )));
                 }
             }
         }
