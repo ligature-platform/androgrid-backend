@@ -310,7 +310,41 @@ impl ClusterScheduler {
                 .iter()
                 .find(|(_, grp)| grp.member_node_ids.contains(&node_id))
                 .map(|(gid, _)| gid.clone());
-            (pre_pinned, false, false, Vec::new(), None, None, 0, false)
+
+            let mut matched_desired = None;
+            let mut matched_directive = None;
+            let mut matched_completed = false;
+            let mut matched_draining = false;
+            let mut matched_deadline = 0;
+
+            for rollout in inner.active_rollouts.values() {
+                if rollout.eligible_node_ids.contains(&node_id)
+                    || rollout.in_flight_node_ids.contains(&node_id)
+                    || rollout.staged_node_ids.contains(&node_id)
+                {
+                    if rollout.target_version == client_version {
+                        matched_completed = true;
+                    } else if !rollout.is_halted {
+                        matched_desired = Some(rollout.target_version.clone());
+                        matched_directive = Some(rollout.directive_template.clone());
+                        matched_draining = rollout.drain_before_upgrade;
+                        matched_deadline =
+                            now_epoch_ms + (rollout.lease_timeout_seconds as u64 * 1000);
+                    }
+                    break;
+                }
+            }
+
+            (
+                pre_pinned,
+                matched_draining,
+                false,
+                Vec::new(),
+                matched_desired,
+                matched_directive,
+                matched_deadline,
+                matched_completed,
+            )
         };
 
         let worker = WorkerRecord {
@@ -333,27 +367,6 @@ impl ClusterScheduler {
             upgrade_lease_deadline_ms,
         };
 
-        if let Some(ref outcome) = last_upgrade_outcome {
-            if outcome.status
-                == crate::proto::androgrid::v1::UpgradeInstallStatus::TerminallyRejected as i32
-                || outcome.status
-                    == crate::proto::androgrid::v1::UpgradeInstallStatus::FailedTransient as i32
-            {
-                record_node_upgrade_failure(
-                    &mut inner,
-                    &node_id,
-                    &outcome.target_version,
-                    &outcome.error_code,
-                    &outcome.error_message,
-                    &self.rollout_store,
-                );
-            }
-        }
-
-        if upgrade_completed {
-            promote_next_canary_if_ready(&mut inner, &node_id, now_epoch_ms, &self.rollout_store);
-        }
-
         let transport_str = if worker.capabilities.current_transport
             == NetworkTransportType::NetworkTransportWifiLan as i32
         {
@@ -374,7 +387,32 @@ impl ClusterScheduler {
             os_version: worker.capabilities.os_version.clone(),
         };
 
-        inner.workers.insert(node_id, worker);
+        // Insert worker BEFORE outcome and promotion processing so mutations are not clobbered
+        inner.workers.insert(node_id.clone(), worker);
+
+        if let Some(ref outcome) = last_upgrade_outcome {
+            let is_terminal = outcome.status
+                == crate::proto::androgrid::v1::UpgradeInstallStatus::TerminallyRejected as i32;
+            let is_failed = is_terminal
+                || outcome.status
+                    == crate::proto::androgrid::v1::UpgradeInstallStatus::FailedTransient as i32;
+            if is_failed {
+                record_node_upgrade_failure(
+                    &mut inner,
+                    &node_id,
+                    &outcome.target_version,
+                    &outcome.error_code,
+                    &outcome.error_message,
+                    is_terminal,
+                    &self.rollout_store,
+                );
+            }
+        }
+
+        if upgrade_completed {
+            promote_next_canary_if_ready(&mut inner, &node_id, now_epoch_ms, &self.rollout_store);
+        }
+
         drop(inner);
 
         self.emit_event(reg_event);
@@ -462,7 +500,11 @@ impl ClusterScheduler {
 
             let cellular_directive = if let Some(ref dir) = worker.upgrade_directive {
                 if dir.network_policy == UpgradeNetworkPolicy::AllowCellular as i32 {
-                    Some(dir.clone())
+                    if dir.drain_before_upgrade && !worker.active_task_ids.is_empty() {
+                        None
+                    } else {
+                        Some(dir.clone())
+                    }
                 } else {
                     None
                 }
@@ -635,23 +677,6 @@ impl ClusterScheduler {
     ) -> Result<SyncNodeStateResponse, SchedulingError> {
         let mut inner = self.inner.write().expect("RwLock write lock poisoned");
 
-        if let Some(ref outcome) = last_upgrade_outcome {
-            if outcome.status
-                == crate::proto::androgrid::v1::UpgradeInstallStatus::TerminallyRejected as i32
-                || outcome.status
-                    == crate::proto::androgrid::v1::UpgradeInstallStatus::FailedTransient as i32
-            {
-                record_node_upgrade_failure(
-                    &mut inner,
-                    node_id,
-                    &outcome.target_version,
-                    &outcome.error_code,
-                    &outcome.error_message,
-                    &self.rollout_store,
-                );
-            }
-        }
-
         let (
             is_rooted,
             is_unmetered,
@@ -662,21 +687,45 @@ impl ClusterScheduler {
             upgrade_directive,
             worker_snapshot,
         ) = {
+            if let Some(worker) = inner.workers.get_mut(node_id) {
+                if worker.session_token != session_token {
+                    return Err(SchedulingError::InvalidSessionToken {
+                        node_id: node_id.to_string(),
+                        provided: session_token.to_string(),
+                    });
+                }
+                worker.last_seen_epoch_ms = now_epoch_ms;
+            } else {
+                return Err(SchedulingError::NodeNotFound(node_id.to_string()));
+            }
+
+            if let Some(ref outcome) = last_upgrade_outcome {
+                let is_terminal = outcome.status
+                    == crate::proto::androgrid::v1::UpgradeInstallStatus::TerminallyRejected as i32;
+                let is_failed = is_terminal
+                    || outcome.status
+                        == crate::proto::androgrid::v1::UpgradeInstallStatus::FailedTransient
+                            as i32;
+                if is_failed {
+                    record_node_upgrade_failure(
+                        &mut inner,
+                        node_id,
+                        &outcome.target_version,
+                        &outcome.error_code,
+                        &outcome.error_message,
+                        is_terminal,
+                        &self.rollout_store,
+                    );
+                }
+            }
+
             let policy = inner.thermal_policy;
             let allow_root = inner.allow_insecure_root_tasks;
             let worker = inner
                 .workers
-                .get_mut(node_id)
+                .get(node_id)
                 .ok_or_else(|| SchedulingError::NodeNotFound(node_id.to_string()))?;
 
-            if worker.session_token != session_token {
-                return Err(SchedulingError::InvalidSessionToken {
-                    node_id: node_id.to_string(),
-                    provided: session_token.to_string(),
-                });
-            }
-
-            worker.last_seen_epoch_ms = now_epoch_ms;
             let throttled = policy.is_throttled(
                 worker.capabilities.battery_temperature_celsius,
                 worker.capabilities.thermal_status,
@@ -694,10 +743,16 @@ impl ClusterScheduler {
             let upgrade_eligible = unmetered || allows_cellular_upgrade;
 
             let (desired_version, upgrade_directive) = if upgrade_eligible {
-                (
-                    pending_desired_version(worker),
-                    worker.upgrade_directive.clone(),
-                )
+                let directive = if let Some(ref dir) = worker.upgrade_directive {
+                    if dir.drain_before_upgrade && !worker.active_task_ids.is_empty() {
+                        None
+                    } else {
+                        Some(dir.clone())
+                    }
+                } else {
+                    None
+                };
+                (pending_desired_version(worker), directive)
             } else {
                 (String::new(), None)
             };
@@ -1023,6 +1078,37 @@ impl ClusterScheduler {
         }
         for gid in touched_groups {
             reconcile_group_state(&mut inner, &gid, now_epoch_s * 1000);
+        }
+
+        // Sweep stalled OTA upgrade leases
+        let now_epoch_ms = now_epoch_s * 1000;
+        let mut timed_out_upgrades = Vec::new();
+        for (node_id, worker) in inner.workers.iter_mut() {
+            if worker.upgrade_lease_deadline_ms > 0
+                && now_epoch_ms > worker.upgrade_lease_deadline_ms
+            {
+                if let Some(target_ver) = worker.desired_client_version.take() {
+                    worker.upgrade_directive = None;
+                    worker.upgrade_lease_deadline_ms = 0;
+                    if worker.drained_for_upgrade {
+                        worker.draining = false;
+                        worker.drained_for_upgrade = false;
+                    }
+                    timed_out_upgrades.push((node_id.clone(), target_ver));
+                }
+            }
+        }
+
+        for (node_id, target_ver) in timed_out_upgrades {
+            record_node_upgrade_failure(
+                &mut inner,
+                &node_id,
+                &target_ver,
+                "UPGRADE_LEASE_TIMEOUT",
+                "Node failed to complete upgrade within designated lease timeout",
+                true,
+                &self.rollout_store,
+            );
         }
 
         drop(inner);
@@ -2248,6 +2334,7 @@ fn record_node_upgrade_failure(
     target_version: &str,
     error_code: &str,
     error_message: &str,
+    is_terminal: bool,
     rollout_store: &crate::scheduler::rollout_store::RolloutStore,
 ) {
     if let Some(w) = inner.workers.get_mut(node_id) {
@@ -2263,14 +2350,20 @@ fn record_node_upgrade_failure(
     }
 
     for rollout in inner.active_rollouts.values_mut() {
-        if rollout.target_version == target_version {
+        if rollout.target_version == target_version
+            && (rollout.in_flight_node_ids.contains(node_id)
+                || rollout.staged_node_ids.contains(&node_id.to_string())
+                || rollout.eligible_node_ids.contains(&node_id.to_string()))
+        {
             rollout.in_flight_node_ids.remove(node_id);
             rollout.failed_node_ids.insert(node_id.to_string());
-            rollout.is_halted = true;
-            rollout.halt_reason = Some(format!(
-                "Node '{}' failed upgrade with {}: {}",
-                node_id, error_code, error_message
-            ));
+            if is_terminal {
+                rollout.is_halted = true;
+                rollout.halt_reason = Some(format!(
+                    "Node '{}' failed upgrade with {}: {}",
+                    node_id, error_code, error_message
+                ));
+            }
             rollout_store.save_rollout(rollout).ok();
         }
     }
