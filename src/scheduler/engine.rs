@@ -477,7 +477,78 @@ impl ClusterScheduler {
         thermal_status: u32,
         now_epoch_s: u64,
     ) -> Result<ClaimCellularTaskResponse, SchedulingError> {
+        self.claim_cellular_task_with_outcome(
+            node_id,
+            battery_level_pct,
+            is_charging,
+            battery_temperature_celsius,
+            thermal_status,
+            now_epoch_s,
+            "",
+            None,
+        )
+    }
+
+    /// Claims a cellular task while processing dynamic version reporting and last upgrade outcome telemetry.
+    ///
+    /// Traces to: [REQ-OP-003], [INV-001], [INV-002], [INV-003], [ANTI-003], [NFR-POW-001]
+    #[allow(clippy::too_many_arguments)]
+    pub fn claim_cellular_task_with_outcome(
+        &self,
+        node_id: &str,
+        battery_level_pct: u32,
+        is_charging: bool,
+        battery_temperature_celsius: i32,
+        thermal_status: u32,
+        now_epoch_s: u64,
+        client_version: &str,
+        last_upgrade_outcome: Option<crate::LastUpgradeOutcome>,
+    ) -> Result<ClaimCellularTaskResponse, SchedulingError> {
         let mut inner = self.inner.write().expect("RwLock write lock poisoned");
+        let now_epoch_ms = now_epoch_s * 1000;
+
+        // Process cellular upgrade outcome telemetry if present
+        if let Some(outcome) = last_upgrade_outcome {
+            let is_terminal = outcome.status == crate::UpgradeInstallStatus::TerminallyRejected as i32;
+            let is_failure = is_terminal || outcome.status == crate::UpgradeInstallStatus::FailedTransient as i32;
+            if is_failure {
+                record_node_upgrade_failure(
+                    &mut inner,
+                    node_id,
+                    &outcome.target_version,
+                    &outcome.error_code,
+                    &outcome.error_message,
+                    is_terminal,
+                    &self.rollout_store,
+                );
+            }
+        }
+
+        // Reconcile dynamic client_version and upgrade completion on cellular
+        let mut completed_upgrade = false;
+        if let Some(worker) = inner.workers.get_mut(node_id) {
+            if !client_version.is_empty() {
+                worker.client_version = client_version.to_string();
+                if let Some(ref desired) = worker.desired_client_version {
+                    if desired == client_version {
+                        completed_upgrade = true;
+                    }
+                }
+                if completed_upgrade {
+                    worker.desired_client_version = None;
+                    worker.upgrade_directive = None;
+                    worker.upgrade_lease_deadline_ms = 0;
+                    if worker.drained_for_upgrade {
+                        worker.draining = false;
+                        worker.drained_for_upgrade = false;
+                    }
+                }
+            }
+        }
+
+        if completed_upgrade {
+            promote_next_canary_if_ready(&mut inner, node_id, now_epoch_ms, &self.rollout_store);
+        }
 
         let (is_rooted, policy, allow_root, worker_snapshot, cellular_upgrade_directive) = {
             let worker = inner

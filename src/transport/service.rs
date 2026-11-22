@@ -163,13 +163,15 @@ impl AndroGridService for AndroGridServiceImpl {
         let req = request.into_inner();
         let now_s = Self::now_epoch_s();
 
-        let response = self.scheduler.claim_cellular_task(
+        let response = self.scheduler.claim_cellular_task_with_outcome(
             &req.node_id,
             req.battery_level_pct,
             req.is_charging,
             req.battery_temperature_celsius,
             req.thermal_status,
             now_s,
+            &req.client_version,
+            req.last_upgrade_outcome,
         )?;
 
         Ok(Response::new(response))
