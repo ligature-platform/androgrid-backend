@@ -6,6 +6,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, RwLock};
+use tracing::debug;
 
 use crate::scheduler::errors::SchedulingError;
 use crate::scheduler::state::{
@@ -318,19 +319,23 @@ impl ClusterScheduler {
             let mut matched_deadline = 0;
 
             for rollout in inner.active_rollouts.values() {
-                if rollout.eligible_node_ids.contains(&node_id)
-                    || rollout.in_flight_node_ids.contains(&node_id)
+                let is_member = rollout.in_flight_node_ids.contains(&node_id)
                     || rollout.staged_node_ids.contains(&node_id)
-                {
-                    if rollout.target_version == client_version {
-                        matched_completed = true;
-                    } else if !rollout.is_halted {
-                        matched_desired = Some(rollout.target_version.clone());
-                        matched_directive = Some(rollout.directive_template.clone());
-                        matched_draining = rollout.drain_before_upgrade;
-                        matched_deadline =
-                            now_epoch_ms + (rollout.lease_timeout_seconds as u64 * 1000);
-                    }
+                    || rollout.eligible_node_ids.contains(&node_id);
+
+                if is_member && rollout.target_version == client_version {
+                    matched_completed = true;
+                    break;
+                }
+
+                // Hydrate upgrade directive ONLY for actively in-flight nodes to prevent
+                // staged nodes from bypassing canary percentage on control-plane restart.
+                if rollout.in_flight_node_ids.contains(&node_id) && !rollout.is_halted {
+                    matched_desired = Some(rollout.target_version.clone());
+                    matched_directive = Some(rollout.directive_template.clone());
+                    matched_draining = rollout.drain_before_upgrade;
+                    matched_deadline =
+                        now_epoch_ms + (rollout.lease_timeout_seconds as u64 * 1000);
                     break;
                 }
             }
@@ -338,7 +343,7 @@ impl ClusterScheduler {
             (
                 pre_pinned,
                 matched_draining,
-                false,
+                matched_draining,
                 Vec::new(),
                 matched_desired,
                 matched_directive,
@@ -730,9 +735,7 @@ impl ClusterScheduler {
                 worker.capabilities.battery_temperature_celsius,
                 worker.capabilities.thermal_status,
             );
-            let unmetered = !worker.capabilities.is_metered
-                || worker.capabilities.current_transport
-                    == NetworkTransportType::NetworkTransportWifiLan as i32;
+            let unmetered = !worker.capabilities.is_metered;
 
             let allows_cellular_upgrade = worker
                 .upgrade_directive
@@ -2113,23 +2116,33 @@ impl ClusterScheduler {
                     "apk_url exceeds 1024 characters maximum bound".to_string(),
                 ));
             }
-            if !apk_url.starts_with("http://")
-                && !apk_url.starts_with("https://")
-                && !apk_url.starts_with("/v1/blobs/")
-            {
+            if !apk_url.starts_with("https://") && !apk_url.starts_with("/v1/blobs/") {
                 return Err(SchedulingError::InvalidNodeGroupRequest(
-                    "apk_url must be a valid http, https, or /v1/blobs/ endpoint".to_string(),
+                    "apk_url must be an https:// URL or a /v1/blobs/<sha256> endpoint (plaintext http:// is prohibited under mTLS)".to_string(),
                 ));
             }
         }
 
         let apk_sha256 = req.apk_sha256.trim().to_lowercase();
-        if !apk_sha256.is_empty()
-            && (apk_sha256.len() != 64 || !apk_sha256.chars().all(|c| c.is_ascii_hexdigit()))
-        {
+        if !apk_url.is_empty() && apk_sha256.is_empty() {
             return Err(SchedulingError::InvalidNodeGroupRequest(
-                "apk_sha256 must be a 64-character hexadecimal SHA-256 digest".to_string(),
+                "apk_sha256 is required when apk_url is provided".to_string(),
             ));
+        }
+        if !apk_sha256.is_empty() {
+            if apk_sha256.len() != 64 || !apk_sha256.chars().all(|c| c.is_ascii_hexdigit()) {
+                return Err(SchedulingError::InvalidNodeGroupRequest(
+                    "apk_sha256 must be a 64-character hexadecimal SHA-256 digest".to_string(),
+                ));
+            }
+            if apk_url.starts_with("/v1/blobs/") {
+                let expected_path = format!("/v1/blobs/{apk_sha256}");
+                if apk_url != expected_path {
+                    return Err(SchedulingError::InvalidNodeGroupRequest(
+                        format!("apk_url '{apk_url}' does not match digest '{apk_sha256}'"),
+                    ));
+                }
+            }
         }
 
         let network_policy = if req.network_policy == 0 {
@@ -2337,35 +2350,45 @@ fn record_node_upgrade_failure(
     is_terminal: bool,
     rollout_store: &crate::scheduler::rollout_store::RolloutStore,
 ) {
-    if let Some(w) = inner.workers.get_mut(node_id) {
-        if w.desired_client_version.as_deref() == Some(target_version) {
-            w.desired_client_version = None;
-            w.upgrade_directive = None;
-            w.upgrade_lease_deadline_ms = 0;
-            if w.drained_for_upgrade {
-                w.draining = false;
-                w.drained_for_upgrade = false;
+    if is_terminal {
+        if let Some(w) = inner.workers.get_mut(node_id) {
+            if w.desired_client_version.as_deref() == Some(target_version) {
+                w.desired_client_version = None;
+                w.upgrade_directive = None;
+                w.upgrade_lease_deadline_ms = 0;
+                if w.drained_for_upgrade {
+                    w.draining = false;
+                    w.drained_for_upgrade = false;
+                }
             }
         }
-    }
 
-    for rollout in inner.active_rollouts.values_mut() {
-        if rollout.target_version == target_version
-            && (rollout.in_flight_node_ids.contains(node_id)
-                || rollout.staged_node_ids.contains(&node_id.to_string())
-                || rollout.eligible_node_ids.contains(&node_id.to_string()))
-        {
-            rollout.in_flight_node_ids.remove(node_id);
-            rollout.failed_node_ids.insert(node_id.to_string());
-            if is_terminal {
+        for rollout in inner.active_rollouts.values_mut() {
+            if rollout.target_version == target_version
+                && (rollout.in_flight_node_ids.contains(node_id)
+                    || rollout.staged_node_ids.contains(&node_id.to_string())
+                    || rollout.eligible_node_ids.contains(&node_id.to_string()))
+            {
+                rollout.in_flight_node_ids.remove(node_id);
+                rollout.failed_node_ids.insert(node_id.to_string());
                 rollout.is_halted = true;
                 rollout.halt_reason = Some(format!(
                     "Node '{}' failed upgrade with {}: {}",
                     node_id, error_code, error_message
                 ));
+                rollout_store.save_rollout(rollout).ok();
             }
-            rollout_store.save_rollout(rollout).ok();
         }
+    } else {
+        // Transient failure: retain in_flight_node_ids and worker directive to allow
+        // the client to retry with exponential backoff or the lease sweeper to govern timeout.
+        debug!(
+            node_id = %node_id,
+            target_version = %target_version,
+            error_code = %error_code,
+            error_message = %error_message,
+            "Transient upgrade failure reported; retaining in-flight canary state for retry"
+        );
     }
 }
 
@@ -5142,6 +5165,156 @@ mod tests {
         assert_eq!(n1_after.desired_client_version, "");
         assert!(n2_after.draining);
         assert_eq!(n2_after.desired_client_version, "0.2.0");
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_upgrade_nodes_reconnect_empty_scheduler_preserves_canary_pacing_and_undrains() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "androgrid_empty_restart_test_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+
+        let store1 =
+            Arc::new(crate::scheduler::rollout_store::RolloutStore::with_directory(&temp_dir));
+        let scheduler1 = ClusterScheduler::with_rollout_store(store1);
+
+        for id in ["node-1", "node-2", "node-3", "node-4"] {
+            scheduler1
+                .register_node(
+                    id.to_string(),
+                    make_test_capabilities(false, false),
+                    "0.1.0".to_string(),
+                    1000,
+                )
+                .unwrap();
+        }
+
+        scheduler1
+            .upgrade_nodes(UpgradeNodesRequest {
+                node_group: String::new(),
+                node_ids: vec![
+                    "node-1".to_string(),
+                    "node-2".to_string(),
+                    "node-3".to_string(),
+                    "node-4".to_string(),
+                ],
+                target_version: "0.2.0".to_string(),
+                apk_url: "https://dl.androgrid.net/apk/v0.2.0.apk".to_string(),
+                apk_sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                    .to_string(),
+                rollout_strategy: UpgradeRolloutStrategy::Rolling as i32,
+                rollout_percentage: 25,
+                drain_before_upgrade: true,
+                ..Default::default()
+            })
+            .unwrap();
+
+        // Simulate real startup: orchestrator starts with NO connected workers, loads rollouts
+        let store2 =
+            Arc::new(crate::scheduler::rollout_store::RolloutStore::with_directory(&temp_dir));
+        let scheduler2 = ClusterScheduler::with_rollout_store(store2);
+        let reconciled = scheduler2.reconcile_rollouts_from_store().unwrap();
+        assert_eq!(reconciled, 1);
+
+        // Staged node-2 reconnects BEFORE in-flight node-1
+        let reg2 = scheduler2
+            .register_node(
+                "node-2".to_string(),
+                make_test_capabilities(false, false),
+                "0.1.0".to_string(),
+                2000,
+            )
+            .unwrap();
+        // Regression check: node-2 MUST NOT receive upgrade directive or be drained
+        let sync2 = scheduler2
+            .sync_node_state("node-2", &reg2.session_token, &[], 2001)
+            .unwrap();
+        assert!(sync2.upgrade_directive.is_none());
+        let node2_rec = scheduler2
+            .list_worker_nodes()
+            .into_iter()
+            .find(|n| n.node_id == "node-2")
+            .unwrap();
+        assert!(!node2_rec.draining);
+        assert_eq!(node2_rec.desired_client_version, "");
+
+        // In-flight node-1 reconnects
+        let reg1 = scheduler2
+            .register_node(
+                "node-1".to_string(),
+                make_test_capabilities(false, false),
+                "0.1.0".to_string(),
+                2001,
+            )
+            .unwrap();
+        let sync1 = scheduler2
+            .sync_node_state("node-1", &reg1.session_token, &[], 2002)
+            .unwrap();
+        assert!(sync1.upgrade_directive.is_some());
+        let node1_rec = scheduler2
+            .list_worker_nodes()
+            .into_iter()
+            .find(|n| n.node_id == "node-1")
+            .unwrap();
+        assert!(node1_rec.draining);
+        assert_eq!(node1_rec.desired_client_version, "0.2.0");
+
+        // node-1 reports FAILED_TRANSIENT: rollout MUST NOT halt and node-1 MUST NOT be evicted
+        let sync_resp = scheduler2
+            .sync_node_state_with_outcome(
+                "node-1",
+                &reg1.session_token,
+                &[],
+                Some(crate::LastUpgradeOutcome {
+                    target_version: "0.2.0".to_string(),
+                    apk_sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                        .to_string(),
+                    status: crate::UpgradeInstallStatus::FailedTransient as i32,
+                    error_code: "DOWNLOAD_TIMEOUT".to_string(),
+                    error_message: "Network dropped".to_string(),
+                    attempt_count: 1,
+                }),
+                2003,
+            )
+            .unwrap();
+        // Directive remains assigned for retry
+        assert!(sync_resp.upgrade_directive.is_some());
+
+        // node-1 successfully completes upgrade and re-registers on 0.2.0
+        let reg1_upgraded = scheduler2
+            .register_node(
+                "node-1".to_string(),
+                make_test_capabilities(false, false),
+                "0.2.0".to_string(),
+                2100,
+            )
+            .unwrap();
+        let sync1_upgraded = scheduler2
+            .sync_node_state("node-1", &reg1_upgraded.session_token, &[], 2101)
+            .unwrap();
+        assert!(sync1_upgraded.upgrade_directive.is_none());
+
+        // node-1 must be auto-undrained, and node-2 must now be promoted
+        let node1_done = scheduler2
+            .list_worker_nodes()
+            .into_iter()
+            .find(|n| n.node_id == "node-1")
+            .unwrap();
+        let node2_promoted = scheduler2
+            .list_worker_nodes()
+            .into_iter()
+            .find(|n| n.node_id == "node-2")
+            .unwrap();
+        assert!(!node1_done.draining);
+        assert_eq!(node1_done.desired_client_version, "");
+        assert!(node2_promoted.draining);
+        assert_eq!(node2_promoted.desired_client_version, "0.2.0");
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
