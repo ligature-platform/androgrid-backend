@@ -23,7 +23,8 @@ use androgrid_backend::{
     PkiIssueCsrConfig, PkiIssueServerConfig, PkiOperationSummary, ReplaceStrategy,
     ReplaceTaskGroupRequest, SubmitTaskGroupRequest, SubmitTaskRequest, TaskGroupSpec,
     TaskGroupState, TaskPartitionSpec, TaskSpec, TaskState, TaskTemplate, TerminalGuard, TuiAction,
-    TuiApp, UpdateNodeGroupRequest, UpgradeNodesRequest, UploadArtifactRequest, WasiValidator,
+    TuiApp, UpdateNodeGroupRequest, UpgradeNetworkPolicy, UpgradeNodesRequest,
+    UpgradeRolloutStrategy, UploadArtifactRequest, WasiValidator,
 };
 
 #[derive(Parser, Debug)]
@@ -256,7 +257,7 @@ enum Commands {
     },
 
     /// Signal a target client version upgrade to a NodeGroup or explicit worker nodes
-    /// Traces to: ADR-007, [REQ-OP-002], [INV-003], [NFR-POW-001]
+    /// Traces to: ADR-007, ADR-010, [REQ-OP-001], [REQ-OP-002], [INV-001], [INV-002], [INV-003], [ANTI-003], [NFR-POW-001], [NFR-SEC-001]
     UpgradeNodes {
         /// Target NodeGroup identifier
         #[arg(long, conflicts_with = "node_id", required_unless_present = "node_id")]
@@ -273,6 +274,30 @@ enum Commands {
         /// Target client version string (e.g. 0.2.0)
         #[arg(long)]
         target_version: String,
+
+        /// APK binary download URL (HTTP, HTTPS, or /v1/blobs/<sha256>)
+        #[arg(long)]
+        apk_url: Option<String>,
+
+        /// SHA-256 integrity hash of the target APK binary (64 hex characters)
+        #[arg(long)]
+        apk_sha256: Option<String>,
+
+        /// Network transport policy: wifi-only (default) or allow-cellular
+        #[arg(long, default_value = "wifi-only")]
+        network: String,
+
+        /// Rollout strategy: immediate (default) or rolling
+        #[arg(long, default_value = "immediate")]
+        strategy: String,
+
+        /// Canary rollout percentage for rolling strategy (1..=100, default 20)
+        #[arg(long, default_value_t = 20)]
+        rollout_percentage: u32,
+
+        /// Upgrade lease timeout in seconds (default 600)
+        #[arg(long, default_value_t = 600)]
+        lease_timeout_seconds: u32,
 
         /// Drain targeted nodes before signaling upgrade
         #[arg(long)]
@@ -1095,14 +1120,49 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             node_group,
             node_id,
             target_version,
+            apk_url,
+            apk_sha256,
+            network,
+            strategy,
+            rollout_percentage,
+            lease_timeout_seconds,
             drain,
         } => {
+            let network_policy = match network.to_lowercase().as_str() {
+                "wifi-only" | "wifi" => UpgradeNetworkPolicy::WifiOnly as i32,
+                "allow-cellular" | "cellular" => UpgradeNetworkPolicy::AllowCellular as i32,
+                other => {
+                    eprintln!(
+                        "Error: invalid --network '{}'. Expected 'wifi-only' or 'allow-cellular'",
+                        other
+                    );
+                    std::process::exit(1);
+                }
+            };
+            let rollout_strategy = match strategy.to_lowercase().as_str() {
+                "immediate" => UpgradeRolloutStrategy::Immediate as i32,
+                "rolling" => UpgradeRolloutStrategy::Rolling as i32,
+                other => {
+                    eprintln!(
+                        "Error: invalid --strategy '{}'. Expected 'immediate' or 'rolling'",
+                        other
+                    );
+                    std::process::exit(1);
+                }
+            };
+
             let res = client
                 .upgrade_nodes(UpgradeNodesRequest {
                     node_group: node_group.unwrap_or_default(),
                     node_ids: node_id,
                     target_version,
                     drain_before_upgrade: drain,
+                    apk_url: apk_url.unwrap_or_default(),
+                    apk_sha256: apk_sha256.unwrap_or_default(),
+                    network_policy,
+                    rollout_strategy,
+                    rollout_percentage,
+                    lease_timeout_seconds,
                 })
                 .await?
                 .into_inner();
@@ -1114,6 +1174,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         "targeted_nodes": res.targeted_nodes,
                         "targeted_node_ids": res.targeted_node_ids,
                         "target_version": res.target_version,
+                        "eligible_nodes": res.eligible_nodes,
+                        "in_flight_upgrades": res.in_flight_upgrades,
                         "message": res.message,
                     })
                 );
@@ -2886,6 +2948,58 @@ mod tests {
             upg.command,
             Commands::UpgradeNodes { drain: true, .. }
         ));
+
+        let upg_ota = Cli::try_parse_from([
+            "androgrid-cli",
+            "upgrade-nodes",
+            "--node-id",
+            "node-1",
+            "--target-version",
+            "0.2.0",
+            "--apk-url",
+            "https://dl.androgrid.net/apk/v0.2.0.apk",
+            "--apk-sha256",
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "--network",
+            "allow-cellular",
+            "--strategy",
+            "rolling",
+            "--rollout-percentage",
+            "50",
+            "--lease-timeout-seconds",
+            "1200",
+            "--drain",
+        ])
+        .unwrap();
+        if let Commands::UpgradeNodes {
+            target_version,
+            apk_url,
+            apk_sha256,
+            network,
+            strategy,
+            rollout_percentage,
+            lease_timeout_seconds,
+            drain,
+            ..
+        } = upg_ota.command
+        {
+            assert_eq!(target_version, "0.2.0");
+            assert_eq!(
+                apk_url.as_deref(),
+                Some("https://dl.androgrid.net/apk/v0.2.0.apk")
+            );
+            assert_eq!(
+                apk_sha256.as_deref(),
+                Some("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+            );
+            assert_eq!(network, "allow-cellular");
+            assert_eq!(strategy, "rolling");
+            assert_eq!(rollout_percentage, 50);
+            assert_eq!(lease_timeout_seconds, 1200);
+            assert!(drain);
+        } else {
+            panic!("Expected UpgradeNodes command");
+        }
 
         let sub = Cli::try_parse_from([
             "androgrid-cli",

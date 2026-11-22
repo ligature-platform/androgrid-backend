@@ -118,11 +118,12 @@ impl AndroGridService for AndroGridServiceImpl {
             .ok_or_else(|| Status::invalid_argument("NodeCapabilities must be provided"))?;
 
         let now_ms = Self::now_epoch_ms();
-        let response = self.scheduler.register_node_with_labels(
+        let response = self.scheduler.register_node_full(
             req.node_id,
             capabilities,
             req.client_version,
             req.labels,
+            req.last_upgrade_outcome,
             now_ms,
         )?;
 
@@ -140,10 +141,11 @@ impl AndroGridService for AndroGridServiceImpl {
         let req = request.into_inner();
         let now_ms = Self::now_epoch_ms();
 
-        let response = self.scheduler.sync_node_state(
+        let response = self.scheduler.sync_node_state_with_outcome(
             &req.node_id,
             &req.session_token,
             &req.completed_tasks,
+            req.last_upgrade_outcome,
             now_ms,
         )?;
 
@@ -161,13 +163,15 @@ impl AndroGridService for AndroGridServiceImpl {
         let req = request.into_inner();
         let now_s = Self::now_epoch_s();
 
-        let response = self.scheduler.claim_cellular_task(
+        let response = self.scheduler.claim_cellular_task_with_outcome(
             &req.node_id,
             req.battery_level_pct,
             req.is_charging,
             req.battery_temperature_celsius,
             req.thermal_status,
             now_s,
+            &req.client_version,
+            req.last_upgrade_outcome,
         )?;
 
         Ok(Response::new(response))

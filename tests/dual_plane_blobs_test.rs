@@ -386,6 +386,7 @@ async fn test_dual_plane_50051_rbac_streaming_range_and_50052_hardening() {
             capabilities: Some(NodeCapabilities::default()),
             client_version: "0.1.0".to_string(),
             labels: HashMap::new(),
+            last_upgrade_outcome: None,
         })
         .await
         .unwrap_err();
@@ -409,6 +410,7 @@ async fn test_dual_plane_50051_rbac_streaming_range_and_50052_hardening() {
             capabilities: Some(NodeCapabilities::default()),
             client_version: "0.1.0".to_string(),
             labels: HashMap::new(),
+            last_upgrade_outcome: None,
         })
         .await
         .unwrap()

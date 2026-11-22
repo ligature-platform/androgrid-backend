@@ -6,6 +6,7 @@
 
 pub mod engine;
 pub mod errors;
+pub mod rollout_store;
 pub mod state;
 pub mod thermal;
 
@@ -14,5 +15,6 @@ pub use engine::{
     MAX_CELLULAR_DURATION_SECONDS, MIN_CELLULAR_BATTERY_PCT,
 };
 pub use errors::SchedulingError;
+pub use rollout_store::RolloutStore;
 pub use state::{TaskExecutionResult, TaskGroupRecord, TaskRecord, WorkerRecord};
 pub use thermal::{ThermalAction, ThermalPolicy};

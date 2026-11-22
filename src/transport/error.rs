@@ -173,6 +173,10 @@ impl From<SchedulingError> for Status {
             SchedulingError::InvalidNodeGroupRequest(msg) => {
                 Status::invalid_argument(format!("INVALID_NODE_GROUP_REQUEST: {}", msg))
             }
+
+            SchedulingError::StorageError(msg) => {
+                Status::internal(format!("STORAGE_ERROR: {}", msg))
+            }
         }
     }
 }

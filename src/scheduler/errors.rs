@@ -127,4 +127,8 @@ pub enum SchedulingError {
     /// Traces to: [REQ-OP-001], [REQ-OP-002]
     #[error("Invalid node group operation request: {0}")]
     InvalidNodeGroupRequest(String),
+
+    /// Traces to: ADR-010, [REQ-OP-001]
+    #[error("Durable storage error: {0}")]
+    StorageError(String),
 }

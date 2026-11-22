@@ -216,6 +216,7 @@ async fn test_operator_end_to_end_lifecycle_and_observability() {
             capabilities: Some(worker_caps.clone()),
             client_version: "0.1.0".to_string(),
             labels: Default::default(),
+            last_upgrade_outcome: None,
         })
         .await
         .expect("Worker registration should succeed")
@@ -245,6 +246,8 @@ async fn test_operator_end_to_end_lifecycle_and_observability() {
             is_charging: false,
             battery_temperature_celsius: 29,
             thermal_status: 0,
+            client_version: "0.1.0".to_string(),
+            last_upgrade_outcome: None,
         })
         .await
         .expect("Claim cellular task should succeed")
@@ -397,6 +400,7 @@ async fn test_operator_submits_canonical_wasm_workload_fixtures_and_verifies_sha
         capabilities: Some(worker_caps.clone()),
         client_version: "0.1.0".to_string(),
         labels: Default::default(),
+        last_upgrade_outcome: None,
     };
     worker_client.register_node(reg_req).await.unwrap();
 
@@ -495,6 +499,8 @@ async fn test_operator_submits_canonical_wasm_workload_fixtures_and_verifies_sha
                 is_charging: true,
                 battery_temperature_celsius: 0,
                 thermal_status: 0,
+                client_version: "0.1.0".to_string(),
+                last_upgrade_outcome: None,
             })
             .await
             .expect("Worker should successfully claim task")

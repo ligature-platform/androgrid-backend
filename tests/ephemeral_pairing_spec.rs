@@ -384,6 +384,7 @@ async fn test_live_grpc_enrollment_and_subsequent_mtls_registration() {
         }),
         client_version: "0.1.0".to_string(),
         labels: Default::default(),
+        last_upgrade_outcome: None,
     };
 
     let reg_res = andro_client
@@ -400,6 +401,7 @@ async fn test_live_grpc_enrollment_and_subsequent_mtls_registration() {
         session_token: reg_res.session_token,
         active_tasks: Vec::new(),
         completed_tasks: Vec::new(),
+        last_upgrade_outcome: None,
     };
 
     let sync_res = andro_client
@@ -482,6 +484,7 @@ async fn test_shared_tls_listener_allows_bootstrap_enrollment_and_enforces_opera
             capabilities: None,
             client_version: "0.1.0".to_string(),
             labels: Default::default(),
+            last_upgrade_outcome: None,
         })
         .await
         .expect_err("Unauthenticated operational RPC must be rejected");
@@ -534,6 +537,7 @@ async fn test_shared_tls_listener_allows_bootstrap_enrollment_and_enforces_opera
             }),
             client_version: "0.1.0".to_string(),
             labels: Default::default(),
+            last_upgrade_outcome: None,
         })
         .await
         .expect("Authenticated mTLS operational RPC must succeed")
@@ -559,6 +563,7 @@ async fn test_shared_tls_listener_allows_bootstrap_enrollment_and_enforces_opera
             }),
             client_version: "0.1.0".to_string(),
             labels: Default::default(),
+            last_upgrade_outcome: None,
         })
         .await
         .expect_err("Worker cert must not impersonate another node_id");
@@ -860,6 +865,7 @@ async fn test_enforce_hardware_attestation_integration_lifecycle() {
             }),
             client_version: "0.1.0".to_string(),
             labels: Default::default(),
+            last_upgrade_outcome: None,
         })
         .await
         .expect("Hardware-attested worker must succeed in registering over mTLS")

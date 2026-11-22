@@ -161,6 +161,51 @@ enum ReplaceStrategy {
   REPLACE_STRATEGY_DRAIN = 2;
 }
 
+// Network policy specifying allowed transport interfaces for OTA upgrade downloads.
+enum UpgradeNetworkPolicy {
+  UPGRADE_NETWORK_POLICY_UNSPECIFIED = 0;
+  UPGRADE_NETWORK_POLICY_WIFI_ONLY = 1;
+  UPGRADE_NETWORK_POLICY_ALLOW_CELLULAR = 2;
+}
+
+// Installation rollout strategy for node upgrades.
+enum UpgradeRolloutStrategy {
+  UPGRADE_ROLLOUT_STRATEGY_UNSPECIFIED = 0;
+  UPGRADE_ROLLOUT_STRATEGY_IMMEDIATE = 1;
+  UPGRADE_ROLLOUT_STRATEGY_ROLLING = 2;
+}
+
+// Declarative upgrade directive instructing a worker node to fetch and install an updated client.
+// Traces to: [REQ-OP-001], [REQ-OP-002], [INV-001], [INV-002], [INV-003], [ANTI-003], [NFR-POW-001], [NFR-SEC-001]
+message NodeUpgradeDirective {
+  string target_version = 1;
+  string apk_url = 2;
+  string apk_sha256 = 3;
+  UpgradeNetworkPolicy network_policy = 4;
+  UpgradeRolloutStrategy rollout_strategy = 5;
+  uint32 upgrade_lease_timeout_seconds = 6;
+  bool drain_before_upgrade = 7;
+}
+
+// Terminal or transient outcome status of an applied upgrade directive.
+enum UpgradeInstallStatus {
+  UPGRADE_INSTALL_STATUS_UNSPECIFIED = 0;
+  UPGRADE_INSTALL_STATUS_SUCCEEDED = 1;
+  UPGRADE_INSTALL_STATUS_FAILED_TRANSIENT = 2;
+  UPGRADE_INSTALL_STATUS_TERMINALLY_REJECTED = 3;
+}
+
+// Structured outcome report from a worker node on its last attempted upgrade.
+// Traces to: [REQ-OP-001], [REQ-OP-002], [NFR-SEC-001], [NFR-POW-001]
+message LastUpgradeOutcome {
+  string target_version = 1;
+  string apk_sha256 = 2;
+  UpgradeInstallStatus status = 3;
+  string error_code = 4;
+  string error_message = 5;
+  uint32 attempt_count = 6;
+}
+
 // Hardware and platform capabilities reported by worker node.
 // Traces to: [REQ-VER-002], [INV-006], [REQ-OP-003]
 message NodeCapabilities {
@@ -206,6 +251,8 @@ message ClaimCellularTaskRequest {
   bool is_charging = 4;
   int32 battery_temperature_celsius = 5;
   uint32 thermal_status = 6; // Maps to Android PowerManager.THERMAL_STATUS_*
+  string client_version = 7;
+  LastUpgradeOutcome last_upgrade_outcome = 8;
 }
 
 // Response granting a cellular spot lease.
@@ -214,6 +261,7 @@ message ClaimCellularTaskResponse {
   bool task_available = 1;
   TaskSpec task = 2;
   uint32 deadline_epoch_seconds = 3;
+  NodeUpgradeDirective upgrade_directive = 4;
 }
 
 // Atomic result submission with monotonic run_attempt.
@@ -243,6 +291,7 @@ message RegisterNodeRequest {
   NodeCapabilities capabilities = 2;
   string client_version = 3;
   map<string, string> labels = 4;
+  LastUpgradeOutcome last_upgrade_outcome = 5;
 }
 
 // Registration lease response.
@@ -271,6 +320,7 @@ message SyncNodeStateRequest {
   string session_token = 2;
   repeated TaskExecutionReport active_tasks = 3;
   repeated TaskExecutionReport completed_tasks = 4;
+  LastUpgradeOutcome last_upgrade_outcome = 5;
 }
 
 // Orchestrator response with desired tasks and acknowledgments.
@@ -280,6 +330,7 @@ message SyncNodeStateResponse {
   repeated string cancel_task_ids = 3;
   repeated string acknowledged_task_ids = 4;
   string desired_client_version = 5;
+  NodeUpgradeDirective upgrade_directive = 6;
 }
 
 
@@ -672,6 +723,12 @@ message UpgradeNodesRequest {
   repeated string node_ids = 2;
   string target_version = 3;
   bool drain_before_upgrade = 4;
+  string apk_url = 5;
+  string apk_sha256 = 6;
+  UpgradeNetworkPolicy network_policy = 7;
+  UpgradeRolloutStrategy rollout_strategy = 8;
+  uint32 rollout_percentage = 9;
+  uint32 lease_timeout_seconds = 10;
 }
 
 // Response acknowledging node upgrade signaling.
@@ -681,6 +738,8 @@ message UpgradeNodesResponse {
   repeated string targeted_node_ids = 3;
   string target_version = 4;
   string message = 5;
+  uint32 eligible_nodes = 6;
+  uint32 in_flight_upgrades = 7;
 }
 
 
