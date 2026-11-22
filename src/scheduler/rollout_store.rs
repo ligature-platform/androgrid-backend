@@ -126,10 +126,10 @@ impl RolloutStore {
         }
     }
 
-    /// Saves a rollout record to memory and durable disk storage.
+    /// Saves a rollout record to memory and durable disk storage keyed by rollout_id.
     pub fn save_rollout(&self, record: &UpgradeRolloutRecord) -> Result<(), std::io::Error> {
         let descriptor = PersistedRolloutDescriptor::from(record);
-        let key = record.target_version.clone();
+        let key = record.rollout_id.clone();
 
         {
             let mut mem = self.in_memory.write().unwrap();
@@ -161,13 +161,35 @@ impl RolloutStore {
                 for entry in fs::read_dir(dir)? {
                     let entry = entry?;
                     let path = entry.path();
-                    if path.extension().and_then(|s| s.to_str()) == Some("json") {
-                        if let Ok(content) = fs::read_to_string(&path) {
-                            if let Ok(desc) =
-                                serde_json::from_str::<PersistedRolloutDescriptor>(&content)
-                            {
-                                let mut mem = self.in_memory.write().unwrap();
-                                mem.insert(desc.target_version.clone(), desc);
+                    if path.extension().and_then(|s| s.to_str()) == Some("json")
+                        && !path
+                            .file_name()
+                            .and_then(|s| s.to_str())
+                            .map(|s| s.starts_with('.'))
+                            .unwrap_or(false)
+                    {
+                        match fs::read_to_string(&path) {
+                            Ok(content) => {
+                                match serde_json::from_str::<PersistedRolloutDescriptor>(&content) {
+                                    Ok(desc) => {
+                                        let mut mem = self.in_memory.write().unwrap();
+                                        mem.insert(desc.rollout_id.clone(), desc);
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            path = %path.display(),
+                                            error = %e,
+                                            "Failed to deserialize rollout descriptor JSON"
+                                        );
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    path = %path.display(),
+                                    error = %e,
+                                    "Failed to read rollout descriptor file from disk"
+                                );
                             }
                         }
                     }
@@ -180,17 +202,17 @@ impl RolloutStore {
         Ok(records)
     }
 
-    /// Deletes a persisted rollout descriptor by target version.
-    pub fn delete_rollout(&self, target_version: &str) -> Result<(), std::io::Error> {
+    /// Deletes a persisted rollout descriptor by rollout_id.
+    pub fn delete_rollout(&self, rollout_id: &str) -> Result<(), std::io::Error> {
         {
             let mut mem = self.in_memory.write().unwrap();
-            mem.remove(target_version);
+            mem.remove(rollout_id);
         }
 
         if let Some(ref dir) = self.storage_dir {
             let file_path = dir.join(format!(
                 "rollout_{}.json",
-                sanitize_filename(target_version)
+                sanitize_filename(rollout_id)
             ));
             if file_path.exists() {
                 fs::remove_file(file_path)?;
@@ -255,8 +277,8 @@ mod tests {
             .expect("Atomic save should succeed");
 
         // Verify tmp file was cleaned up and final json exists
-        let tmp_file = temp_dir.join(".rollout_0.2.0.json.tmp");
-        let json_file = temp_dir.join("rollout_0.2.0.json");
+        let tmp_file = temp_dir.join(".rollout_rollout-test-1.json.tmp");
+        let json_file = temp_dir.join("rollout_rollout-test-1.json");
         assert!(!tmp_file.exists());
         assert!(json_file.exists());
 
@@ -268,7 +290,7 @@ mod tests {
 
         // Delete rollout
         store2
-            .delete_rollout("0.2.0")
+            .delete_rollout("rollout-test-1")
             .expect("Delete should succeed");
         assert!(!json_file.exists());
         let reloaded = store2.load_rollouts().expect("Reload should succeed");

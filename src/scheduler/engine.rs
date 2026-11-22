@@ -2371,7 +2371,7 @@ impl ClusterScheduler {
 
         let mut reconciled_count = 0;
         for mut rollout in loaded {
-            let key = format!("nodes-{}", rollout.target_version);
+            let key = rollout.rollout_id.clone();
 
             // Reconcile against current registered workers
             for nid in &rollout.eligible_node_ids {
