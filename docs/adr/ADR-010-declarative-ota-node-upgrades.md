@@ -14,10 +14,10 @@ Proposed
 Worker nodes run as distributed Android background services across heterogeneous mobile hardware (drawer phones, testbed rigs, field devices). In production deployments:
 1. Devices do not expose listening server sockets or SSH endpoints ([INV-001]), preventing traditional push-based orchestrators (Ansible, SSH, push hooks).
 2. Android APK binaries typically measure between 15 MB and 40 MB. Downloading payloads of this magnitude over metered cellular links saturates mobile data caps, incurs unexpected data charges, and drains battery by keeping cellular baseband radios active for extended periods, directly violating [ANTI-003] and [NFR-POW-001].
-3. Unrooted consumer hardware requires explicit user confirmation via the Android `PackageInstaller` API, whereas rooted developer nodes or dedicated rack rigs can execute silent unattended updates via package manager shell commands (`pm install -r`).
+3. Unrooted consumer hardware requires explicit user confirmation via the Android `PackageInstaller` API, whereas rooted developer nodes or dedicated rack rigs can execute silent unattended updates via package manager shell commands.
 4. Hardware-backed cryptographic keys generated during bootstrap enrollment inside the Android KeyStore ([INV-002], [NFR-SEC-001], ADR-009) must persist across application upgrades without triggering key invalidation or requiring re-pairing.
 5. In unattended remote environments, failure modes must be strictly contained:
-   - Process termination during `pm install -r` must not orphan the node.
+   - Process termination during package replacement must not orphan the node.
    - Non-retryable installation rejections (signature mismatch, downgrade rejection, corrupt archive) must not cause infinite download-and-fail loops that exhaust bandwidth and battery.
    - Control-plane restarts mid-canary rollout must not lose rollout state or blast the remaining fleet in a split-brain promotion.
    - Downloading an APK matching an operator-supplied SHA-256 hash does not prove signature compatibility with the installed package; executing an invalid APK could fail or break KeyStore continuity.
@@ -47,11 +47,13 @@ We extend `androgrid/v1/orchestrator.proto` with explicit declarative upgrade di
 - If an active upgrade directive targets the worker and meets transport policy constraints, the directive is attached to the synchronization response.
 
 ### 3. Deterministic Post-Install Process Survival & Lifecycle Revival
-- When a rooted node executes `su -c pm install -r <apkPath>`, Android's `PackageManagerService` immediately kills the existing worker process mid-execution. Spawning detached background subshells (e.g., `nohup sh -c ...`) is strictly rejected because Linux kernel cgroups bound to the app are SIGKILLed by `killProcessGroup` during package replacement.
-- Deterministic process survival is guaranteed exclusively via the Android platform contract:
+- When a node installs a package upgrade, Android's `PackageManagerService` terminates the existing worker process mid-execution. Spawning detached background subshells (e.g., `nohup sh -c ...`) is strictly rejected because Linux kernel cgroups bound to the app are SIGKILLed by `killProcessGroup` during package replacement.
+- Deterministic process survival is guaranteed via the Android platform contract:
   - `PackageReplacedReceiver` is statically declared in `AndroidManifest.xml` listening for the system broadcast `android.intent.action.MY_PACKAGE_REPLACED`.
   - Android `ActivityManagerService` delivers this broadcast immediately after package replacement completes.
-  - Upon receiving `MY_PACKAGE_REPLACED`, the receiver checks `ClusterSettingsRepository`. If cluster participation is active, it immediately invokes `ContextCompat.startForegroundService(...)` to restart `WorkerForegroundService`.
+  - Upon receiving `MY_PACKAGE_REPLACED`, the receiver checks `ClusterSettingsRepository`. If cluster participation is active, it invokes `ContextCompat.startForegroundService(...)` to restart `WorkerForegroundService`.
+  - OEM ROM Fallback: If `startForegroundService` throws `ForegroundServiceStartNotAllowedException` on Android 12-16 due to background start restrictions, the receiver immediately catches the exception and enqueues an expedited `PackageReplacedRecoveryWorker` via Jetpack WorkManager (`OutOfQuotaPolicy.RUN_AS_NON_EXPEDITED_WORK_REQUEST`) to reliably bootstrap service recovery.
+  - Battery Optimization Exemption: `AndroidManifest.xml` declares `REQUEST_IGNORE_BATTERY_OPTIMIZATIONS`, and `UpgradeManager` verifies battery optimization exemption to prevent OEM sleep killing.
   - Jetpack WorkManager background spot workers resume automatically via their built-in SQLite job store.
 
 ### 4. Terminal Failure Reporting, Loop Prevention & Canary Promotion Halt
@@ -73,13 +75,20 @@ We extend `androgrid/v1/orchestrator.proto` with explicit declarative upgrade di
 
 ### 6. Null-Safe Pre-Install Signing Certificate Lineage Verification ([NFR-SEC-001])
 - Relying solely on SHA-256 digest validation verifies download integrity but not cryptographic authenticity or signing compatibility.
-- Before invoking `su -c pm install -r` or prompting the user via `PackageInstaller`, `UpgradeManager` inspects the downloaded APK:
+- Before invoking installation commands or prompting the user via `PackageInstaller`, `UpgradeManager` inspects the downloaded APK:
   - Reads package archive info using Android `PackageManager.GET_SIGNING_CERTIFICATES`.
   - Null check guard: If `getPackageArchiveInfo` returns `null` (indicating a truncated, corrupt, or unparseable archive), the download is treated as corrupt, the file is immediately purged from disk, and a `CORRUPT_ARCHIVE` terminal failure is recorded.
-  - Signing lineage check: `UpgradeManager` verifies that the signing certificate of the downloaded archive matches or is a valid ancestor of the currently installed application certificate (`PackageManager.hasSigningCertificate` / null-safe signing digest comparison).
-  - If signing certificates do not match, the APK is purged, preventing broken UID/KeyStore continuity ([INV-002]) and avoiding root execution of unauthorized binaries.
+  - Signing lineage check: `UpgradeManager` inspects both `apkContentsSigners` and `signingCertificateHistory` on API 28+, comparing SHA-256 digests against currently installed certificates (`PackageManager.hasSigningCertificate` / digest comparison).
+  - If signing certificates do not match or are missing, the APK is purged, preventing broken UID/KeyStore continuity ([INV-002]) and avoiding root execution of unauthorized binaries.
 
-### 7. Cellular Radio Protection & Asynchronous Download Decoupling ([ANTI-003], [NFR-POW-001], [INV-003])
+### 7. Root Installation & SELinux Stdin Streaming (`pm install -r -S`)
+- Empirical hardware verification on physical Pixel hardware proved that path-based root execution (`su -c pm install -r <apkPath>`) fails when the APK resides in internal application storage (`/data/user/0/com.androgrid.worker/...`) because Android SELinux policy enforces `neverallow system_server app_data_file:file read` (`avc: denied` / `Error: Unable to open file`).
+- To avoid copying binaries to insecure world-readable storage (`/sdcard/`), `UpgradeManager` streams the APK binary via standard input using exact byte length:
+  `su -c "pm install -r -S <byteSize>"`
+  piping bytes directly from internal storage through standard input.
+- Empirical hardware testing confirmed that stdin `-S` streaming succeeds with `Success` and zero SELinux denials.
+
+### 8. Cellular Radio Protection & Asynchronous Download Decoupling ([ANTI-003], [NFR-POW-001], [INV-003])
 - Default network policy is strictly `UPGRADE_NETWORK_POLICY_WIFI_ONLY`.
 - Over metered cellular WAN, Wi-Fi-only directives are suppressed by the control plane.
 - Spot-claim socket decoupling:
@@ -87,7 +96,7 @@ We extend `androgrid/v1/orchestrator.proto` with explicit declarative upgrade di
   - The spot-claim mTLS gRPC channel is always torn down within the strict `< 200 ms` budget mandated by `[NFR-POW-001]`.
   - The cellular directive is handed off to `UpgradeDownloadWorker` via Jetpack WorkManager with constraints (`NetworkType.CONNECTED`, `BatteryNotLow`, `StorageNotLow`), decoupling binary transfer from short-lived spot task leases.
 
-### 8. Operator CLI Surface (`androgrid-cli upgrade-nodes`)
+### 9. Operator CLI Surface (`androgrid-cli upgrade-nodes`)
 - Flags: `--target-version`, `--apk-url`, `--apk-sha256`, `--network` (`wifi-only` or `allow-cellular`), `--strategy` (`immediate` or `rolling`), `--rollout-percentage`, `--lease-timeout-seconds`, `--drain`.
 - Targets either an explicit `--node-group` or repeatable `--node-id` arguments.
 
@@ -97,7 +106,8 @@ We extend `androgrid/v1/orchestrator.proto` with explicit declarative upgrade di
 
 ### Positive
 - Zero physical touch: Operators can declaratively roll out cluster-wide or group-specific APK upgrades without physical device access or manual ADB side-loading.
-- Robust survival: Nodes automatically revive `WorkerForegroundService` after package manager kills via `MY_PACKAGE_REPLACED`.
+- Robust survival: Nodes automatically revive `WorkerForegroundService` after package manager kills via `MY_PACKAGE_REPLACED`, with WorkManager expedited fallback against OEM restrictions.
+- SELinux compliant: Stdin `-S` streaming eliminates `app_data_file` denials without compromising storage isolation.
 - Zero infinite loops: `UpgradeLedger` classifies terminal installation failures and suppresses repeated downloads.
 - Automated canary blast-radius control: Broken builds halt canary promotion immediately on the control plane.
 - Resilient control plane: Rollout descriptors survive orchestrator crashes and restarts without split-brain promotions.
@@ -115,6 +125,7 @@ We extend `androgrid/v1/orchestrator.proto` with explicit declarative upgrade di
 
 ## Alternatives Considered
 - **Subshell `nohup sh -c 'pm install ...'`:** Rejected because Android's `killProcessGroup` SIGKILLs all processes inside the app's Linux cgroup during package removal.
+- **Path-Based Root Installation (`pm install -r <path>`):** Rejected because Android SELinux strictly forbids `system_server` from reading `app_data_file` paths under `/data/user/0/`, triggering `avc: denied` errors. Stdin `-S` streaming bypasses filesystem path traversal completely.
 - **In-Memory Canary Tracking:** Rejected because control plane restarts caused split-brain rollout stalls or unexpected fleet-wide promotions.
 - **Inline Binary Download in `ClaimCellularTask`:** Rejected because multi-megabyte transfers over the spot RPC channel violate the `< 200 ms` socket closure invariant `[NFR-POW-001]`.
 - **Operator SHA-256 Digest Alone:** Rejected because SHA-256 alone does not verify APK signing certificate compatibility with installed KeyStore credentials.
