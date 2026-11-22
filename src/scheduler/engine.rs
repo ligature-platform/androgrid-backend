@@ -59,6 +59,7 @@ pub const DEFAULT_HEARTBEAT_INTERVAL_SECONDS: u32 = 2;
 pub struct ClusterScheduler {
     inner: Arc<RwLock<SchedulerInner>>,
     event_sender: tokio::sync::broadcast::Sender<crate::observability::ClusterEvent>,
+    rollout_store: Arc<crate::scheduler::rollout_store::RolloutStore>,
 }
 
 impl Default for ClusterScheduler {
@@ -89,6 +90,30 @@ impl ClusterScheduler {
     ///
     /// Traces to: [INV-006], [NFR-POW-001]
     pub fn with_options(allow_insecure_root_tasks: bool, thermal_policy: ThermalPolicy) -> Self {
+        Self::with_options_and_store(
+            allow_insecure_root_tasks,
+            thermal_policy,
+            Arc::new(crate::scheduler::rollout_store::RolloutStore::new()),
+        )
+    }
+
+    /// Creates a cluster scheduler with a dedicated durable rollout store.
+    ///
+    /// Traces to: ADR-010, [REQ-OP-001], [REQ-OP-002]
+    pub fn with_rollout_store(
+        rollout_store: Arc<crate::scheduler::rollout_store::RolloutStore>,
+    ) -> Self {
+        Self::with_options_and_store(false, ThermalPolicy::default(), rollout_store)
+    }
+
+    /// Creates a cluster scheduler with explicit options and a dedicated durable rollout store.
+    ///
+    /// Traces to: ADR-010, [INV-006], [REQ-OP-001], [REQ-OP-002]
+    pub fn with_options_and_store(
+        allow_insecure_root_tasks: bool,
+        thermal_policy: ThermalPolicy,
+        rollout_store: Arc<crate::scheduler::rollout_store::RolloutStore>,
+    ) -> Self {
         let (event_sender, _) = tokio::sync::broadcast::channel(1024);
         Self {
             inner: Arc::new(RwLock::new(SchedulerInner {
@@ -102,6 +127,7 @@ impl ClusterScheduler {
                 thermal_policy,
             })),
             event_sender,
+            rollout_store,
         }
     }
 
@@ -171,9 +197,32 @@ impl ClusterScheduler {
     pub fn register_node_with_labels(
         &self,
         node_id: String,
+        capabilities: NodeCapabilities,
+        client_version: String,
+        labels: HashMap<String, String>,
+        now_epoch_ms: u64,
+    ) -> Result<RegisterNodeResponse, SchedulingError> {
+        self.register_node_full(
+            node_id,
+            capabilities,
+            client_version,
+            labels,
+            None,
+            now_epoch_ms,
+        )
+    }
+
+    /// Registers an Android worker node with full upgrade outcome feedback, enforcing root capabilities
+    /// and preserving control-plane group/drain/upgrade state across reconnections.
+    ///
+    /// Traces to: ADR-010, [REQ-OP-001], [INV-006], [REQ-VER-002]
+    pub fn register_node_full(
+        &self,
+        node_id: String,
         mut capabilities: NodeCapabilities,
         client_version: String,
         labels: HashMap<String, String>,
+        last_upgrade_outcome: Option<crate::proto::androgrid::v1::LastUpgradeOutcome>,
         now_epoch_ms: u64,
     ) -> Result<RegisterNodeResponse, SchedulingError> {
         if node_id.is_empty()
@@ -284,8 +333,23 @@ impl ClusterScheduler {
             upgrade_lease_deadline_ms,
         };
 
+        if let Some(ref outcome) = last_upgrade_outcome {
+            if outcome.status == crate::proto::androgrid::v1::UpgradeInstallStatus::TerminallyRejected as i32
+                || outcome.status == crate::proto::androgrid::v1::UpgradeInstallStatus::FailedTransient as i32
+            {
+                record_node_upgrade_failure(
+                    &mut inner,
+                    &node_id,
+                    &outcome.target_version,
+                    &outcome.error_code,
+                    &outcome.error_message,
+                    &self.rollout_store,
+                );
+            }
+        }
+
         if upgrade_completed {
-            promote_next_canary_if_ready(&mut inner, &node_id, now_epoch_ms);
+            promote_next_canary_if_ready(&mut inner, &node_id, now_epoch_ms, &self.rollout_store);
         }
 
         let transport_str = if worker.capabilities.current_transport
@@ -547,7 +611,42 @@ impl ClusterScheduler {
         completed_reports: &[TaskExecutionReport],
         now_epoch_ms: u64,
     ) -> Result<SyncNodeStateResponse, SchedulingError> {
+        self.sync_node_state_with_outcome(
+            node_id,
+            session_token,
+            completed_reports,
+            None,
+            now_epoch_ms,
+        )
+    }
+
+    /// Declarative Wi-Fi state synchronization with upgrade outcome reporting.
+    ///
+    /// Traces to: ADR-010, [REQ-OP-002], [INV-005], [INV-006], [NFR-POW-001]
+    pub fn sync_node_state_with_outcome(
+        &self,
+        node_id: &str,
+        session_token: &str,
+        completed_reports: &[TaskExecutionReport],
+        last_upgrade_outcome: Option<crate::proto::androgrid::v1::LastUpgradeOutcome>,
+        now_epoch_ms: u64,
+    ) -> Result<SyncNodeStateResponse, SchedulingError> {
         let mut inner = self.inner.write().expect("RwLock write lock poisoned");
+
+        if let Some(ref outcome) = last_upgrade_outcome {
+            if outcome.status == crate::proto::androgrid::v1::UpgradeInstallStatus::TerminallyRejected as i32
+                || outcome.status == crate::proto::androgrid::v1::UpgradeInstallStatus::FailedTransient as i32
+            {
+                record_node_upgrade_failure(
+                    &mut inner,
+                    node_id,
+                    &outcome.target_version,
+                    &outcome.error_code,
+                    &outcome.error_message,
+                    &self.rollout_store,
+                );
+            }
+        }
 
         let (
             is_rooted,
@@ -2033,28 +2132,30 @@ impl ClusterScheduler {
             format!("nodes-{}", target_version)
         };
 
-        inner.active_rollouts.insert(
-            rollout_key,
-            UpgradeRolloutRecord {
-                rollout_id: format!("rollout-{}-{}", target_version, now_epoch_ms),
-                target_version: target_version.clone(),
-                directive_template,
-                rollout_strategy: if rollout_strategy
-                    == UpgradeRolloutStrategy::Rolling as i32
-                {
-                    UpgradeRolloutStrategy::Rolling
-                } else {
-                    UpgradeRolloutStrategy::Immediate
-                },
-                rollout_percentage: rollout_pct,
-                eligible_node_ids: eligible_ids.clone(),
-                in_flight_node_ids: targeted.iter().cloned().collect(),
-                completed_node_ids: HashSet::new(),
-                staged_node_ids: staged_cohort.into_iter().collect(),
-                lease_timeout_seconds,
-                drain_before_upgrade: req.drain_before_upgrade,
+        let record = UpgradeRolloutRecord {
+            rollout_id: format!("rollout-{}-{}", target_version, now_epoch_ms),
+            target_version: target_version.clone(),
+            directive_template,
+            rollout_strategy: if rollout_strategy == UpgradeRolloutStrategy::Rolling as i32 {
+                UpgradeRolloutStrategy::Rolling
+            } else {
+                UpgradeRolloutStrategy::Immediate
             },
-        );
+            rollout_percentage: rollout_pct,
+            eligible_node_ids: eligible_ids.clone(),
+            in_flight_node_ids: targeted.iter().cloned().collect(),
+            completed_node_ids: HashSet::new(),
+            failed_node_ids: HashSet::new(),
+            staged_node_ids: staged_cohort.into_iter().collect(),
+            lease_timeout_seconds,
+            drain_before_upgrade: req.drain_before_upgrade,
+            is_halted: false,
+            halt_reason: None,
+            created_at_epoch_ms: now_epoch_ms,
+        };
+
+        self.rollout_store.save_rollout(&record).ok();
+        inner.active_rollouts.insert(rollout_key, record);
 
         let count = targeted.len() as u32;
         let eligible_count = total_eligible as u32;
@@ -2071,15 +2172,113 @@ impl ClusterScheduler {
             in_flight_upgrades: count,
         })
     }
+
+    /// Reconciles active rollout state from durable storage and registered nodes upon orchestrator startup.
+    /// Recomputes ground-truth canary cohort sizes, in-flight upgrades, and completed nodes.
+    /// Prevents split-brain by pausing/halting rollouts if any canary failed, and holding promotion
+    /// until the active canary cohort has completed re-registration.
+    ///
+    /// Traces to: ADR-010, [REQ-OP-001], [REQ-OP-002], [NFR-REL-001]
+    pub fn reconcile_rollouts_from_store(&self) -> Result<usize, SchedulingError> {
+        let loaded = self
+            .rollout_store
+            .load_rollouts()
+            .map_err(|e| SchedulingError::StorageError(e.to_string()))?;
+
+        let mut inner = self.inner.write().expect("RwLock write lock poisoned");
+        let now_epoch_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+
+        let mut reconciled_count = 0;
+        for mut rollout in loaded {
+            let key = format!("nodes-{}", rollout.target_version);
+
+            // Reconcile against current registered workers
+            for nid in &rollout.eligible_node_ids {
+                if let Some(w) = inner.workers.get_mut(nid) {
+                    if w.client_version == rollout.target_version {
+                        rollout.completed_node_ids.insert(nid.clone());
+                        rollout.in_flight_node_ids.remove(nid);
+                        w.desired_client_version = None;
+                        w.upgrade_directive = None;
+                        w.upgrade_lease_deadline_ms = 0;
+                        if w.drained_for_upgrade {
+                            w.draining = false;
+                            w.drained_for_upgrade = false;
+                        }
+                    } else if rollout.in_flight_node_ids.contains(nid) {
+                        w.desired_client_version = Some(rollout.target_version.clone());
+                        w.upgrade_directive = Some(rollout.directive_template.clone());
+                        w.upgrade_lease_deadline_ms =
+                            now_epoch_ms + (rollout.lease_timeout_seconds as u64) * 1000;
+                        if rollout.drain_before_upgrade && !w.draining {
+                            w.draining = true;
+                            w.drained_for_upgrade = true;
+                        }
+                    }
+                }
+            }
+
+            if !rollout.failed_node_ids.is_empty() {
+                rollout.is_halted = true;
+            }
+
+            self.rollout_store.save_rollout(&rollout).ok();
+            inner.active_rollouts.insert(key, rollout);
+            reconciled_count += 1;
+        }
+
+        Ok(reconciled_count)
+    }
+}
+
+fn record_node_upgrade_failure(
+    inner: &mut SchedulerInner,
+    node_id: &str,
+    target_version: &str,
+    error_code: &str,
+    error_message: &str,
+    rollout_store: &crate::scheduler::rollout_store::RolloutStore,
+) {
+    if let Some(w) = inner.workers.get_mut(node_id) {
+        if w.desired_client_version.as_deref() == Some(target_version) {
+            w.desired_client_version = None;
+            w.upgrade_directive = None;
+            w.upgrade_lease_deadline_ms = 0;
+            if w.drained_for_upgrade {
+                w.draining = false;
+                w.drained_for_upgrade = false;
+            }
+        }
+    }
+
+    for (_rollout_key, rollout) in inner.active_rollouts.iter_mut() {
+        if rollout.target_version == target_version {
+            rollout.in_flight_node_ids.remove(node_id);
+            rollout.failed_node_ids.insert(node_id.to_string());
+            rollout.is_halted = true;
+            rollout.halt_reason = Some(format!(
+                "Node '{}' failed upgrade with {}: {}",
+                node_id, error_code, error_message
+            ));
+            rollout_store.save_rollout(rollout).ok();
+        }
+    }
 }
 
 fn promote_next_canary_if_ready(
     inner: &mut SchedulerInner,
     completed_node_id: &str,
     now_epoch_ms: u64,
+    rollout_store: &crate::scheduler::rollout_store::RolloutStore,
 ) {
     let mut touched_rollouts = Vec::new();
     for (rollout_id, rollout) in inner.active_rollouts.iter_mut() {
+        if rollout.is_halted {
+            continue;
+        }
         if rollout.in_flight_node_ids.remove(completed_node_id) {
             rollout.completed_node_ids.insert(completed_node_id.to_string());
             touched_rollouts.push(rollout_id.clone());
@@ -2088,6 +2287,9 @@ fn promote_next_canary_if_ready(
 
     for rollout_id in touched_rollouts {
         if let Some(rollout) = inner.active_rollouts.get_mut(&rollout_id) {
+            if rollout.is_halted {
+                continue;
+            }
             while let Some(next_nid) = rollout.staged_node_ids.pop_front() {
                 if let Some(w) = inner.workers.get_mut(&next_nid) {
                     if w.client_version == rollout.target_version {
@@ -2106,6 +2308,7 @@ fn promote_next_canary_if_ready(
                     break;
                 }
             }
+            rollout_store.save_rollout(rollout).ok();
         }
     }
 }
@@ -2582,6 +2785,7 @@ fn resolve_target_node_ids(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{LastUpgradeOutcome, UpgradeInstallStatus};
     use std::collections::HashMap;
 
     fn make_test_capabilities(is_rooted: bool, is_metered: bool) -> NodeCapabilities {
@@ -4660,5 +4864,180 @@ mod tests {
                 .target_version,
             "0.3.0"
         );
+    }
+
+    #[test]
+    fn test_upgrade_nodes_terminal_failure_halts_canary_and_clears_directive() {
+        let scheduler = ClusterScheduler::new();
+        for id in ["c1", "c2", "c3", "c4"] {
+            scheduler
+                .register_node(
+                    id.to_string(),
+                    make_test_capabilities(false, false),
+                    "0.1.0".to_string(),
+                    1000,
+                )
+                .unwrap();
+        }
+
+        // Rolling upgrade with 25% rollout percentage (targeting c1)
+        let res = scheduler
+            .upgrade_nodes(UpgradeNodesRequest {
+                node_group: String::new(),
+                node_ids: vec![
+                    "c1".to_string(),
+                    "c2".to_string(),
+                    "c3".to_string(),
+                    "c4".to_string(),
+                ],
+                target_version: "0.2.0".to_string(),
+                apk_url: "https://dl.androgrid.net/apk/v0.2.0.apk".to_string(),
+                apk_sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                    .to_string(),
+                rollout_strategy: UpgradeRolloutStrategy::Rolling as i32,
+                rollout_percentage: 25,
+                drain_before_upgrade: true,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(res.targeted_node_ids, vec!["c1"]);
+
+        // c1 receives upgrade directive on sync
+        let sync1 = scheduler
+            .sync_node_state("c1", "session-c1-1000", &[], 1050)
+            .unwrap();
+        assert!(sync1.upgrade_directive.is_some());
+
+        // c1 fails terminally (e.g., INSTALL_FAILED_VERSION_DOWNGRADE) and reports outcome
+        let outcome = LastUpgradeOutcome {
+            target_version: "0.2.0".to_string(),
+            apk_sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                .to_string(),
+            status: UpgradeInstallStatus::TerminallyRejected as i32,
+            error_code: "INSTALL_FAILED_VERSION_DOWNGRADE".to_string(),
+            error_message: "System rejected version downgrade".to_string(),
+            attempt_count: 1,
+        };
+
+        let sync_fail = scheduler
+            .sync_node_state_with_outcome("c1", "session-c1-1000", &[], Some(outcome), 1100)
+            .unwrap();
+
+        // 1. Directive is cleared for c1 (no infinite loop)
+        assert!(sync_fail.upgrade_directive.is_none());
+
+        // 2. c1 is un-drained
+        let nodes = scheduler.list_worker_nodes();
+        let n1 = nodes.iter().find(|n| n.node_id == "c1").unwrap();
+        assert!(!n1.draining);
+        assert_eq!(n1.desired_client_version, "");
+
+        // 3. Canary cohort promotion is immediately HALTED: c2 is NOT promoted
+        let n2 = nodes.iter().find(|n| n.node_id == "c2").unwrap();
+        assert!(!n2.draining);
+        assert_eq!(n2.desired_client_version, "");
+
+        // Even if c1 subsequently reconnects or syncs again, canary remains halted
+        let sync_c2 = scheduler
+            .sync_node_state("c2", "session-c2-1000", &[], 1200)
+            .unwrap();
+        assert!(sync_c2.upgrade_directive.is_none());
+    }
+
+    #[test]
+    fn test_upgrade_nodes_rollout_store_durability_and_restart_reconciliation() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "androgrid_rollout_test_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+
+        let store1 = Arc::new(crate::scheduler::rollout_store::RolloutStore::with_directory(&temp_dir));
+        let scheduler1 = ClusterScheduler::with_rollout_store(store1);
+
+        for id in ["c1", "c2", "c3", "c4"] {
+            scheduler1
+                .register_node(
+                    id.to_string(),
+                    make_test_capabilities(false, false),
+                    "0.1.0".to_string(),
+                    1000,
+                )
+                .unwrap();
+        }
+
+        // Start 25% rolling rollout (targets c1)
+        scheduler1
+            .upgrade_nodes(UpgradeNodesRequest {
+                node_group: String::new(),
+                node_ids: vec![
+                    "c1".to_string(),
+                    "c2".to_string(),
+                    "c3".to_string(),
+                    "c4".to_string(),
+                ],
+                target_version: "0.2.0".to_string(),
+                apk_url: "https://dl.androgrid.net/apk/v0.2.0.apk".to_string(),
+                apk_sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                    .to_string(),
+                rollout_strategy: UpgradeRolloutStrategy::Rolling as i32,
+                rollout_percentage: 25,
+                drain_before_upgrade: true,
+                ..Default::default()
+            })
+            .unwrap();
+
+        // Simulate Orchestrator restart: new scheduler instance with the same storage directory
+        let store2 = Arc::new(crate::scheduler::rollout_store::RolloutStore::with_directory(&temp_dir));
+        let scheduler2 = ClusterScheduler::with_rollout_store(store2);
+
+        // Nodes reconnect to new orchestrator instance on version 0.1.0
+        for id in ["c1", "c2", "c3", "c4"] {
+            scheduler2
+                .register_node(
+                    id.to_string(),
+                    make_test_capabilities(false, false),
+                    "0.1.0".to_string(),
+                    2000,
+                )
+                .unwrap();
+        }
+
+        // Reconcile rollouts from store on startup
+        let reconciled = scheduler2.reconcile_rollouts_from_store().unwrap();
+        assert_eq!(reconciled, 1);
+
+        // Ground-truth check: c1 has not completed upgrade, so c2..c4 MUST NOT be promoted (no split-brain blast)
+        let nodes = scheduler2.list_worker_nodes();
+        let n1 = nodes.iter().find(|n| n.node_id == "c1").unwrap();
+        let n2 = nodes.iter().find(|n| n.node_id == "c2").unwrap();
+        assert!(n1.draining);
+        assert_eq!(n1.desired_client_version, "0.2.0");
+        assert!(!n2.draining);
+        assert_eq!(n2.desired_client_version, "");
+
+        // c1 completes upgrade and registers with version 0.2.0
+        scheduler2
+            .register_node(
+                "c1".to_string(),
+                make_test_capabilities(false, false),
+                "0.2.0".to_string(),
+                2100,
+            )
+            .unwrap();
+
+        // Now c1 is upgraded and auto-undrained, and c2 is cleanly promoted to the next canary cohort
+        let nodes_after = scheduler2.list_worker_nodes();
+        let n1_after = nodes_after.iter().find(|n| n.node_id == "c1").unwrap();
+        let n2_after = nodes_after.iter().find(|n| n.node_id == "c2").unwrap();
+        assert!(!n1_after.draining);
+        assert_eq!(n1_after.desired_client_version, "");
+        assert!(n2_after.draining);
+        assert_eq!(n2_after.desired_client_version, "0.2.0");
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }

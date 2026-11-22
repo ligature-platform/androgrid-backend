@@ -385,6 +385,7 @@ async fn test_admin_service_upload_and_decoupled_task_dispatch_under_4kb() {
             capabilities: Some(worker_caps.clone()),
             client_version: "0.1.0".to_string(),
             labels: Default::default(),
+            last_upgrade_outcome: None,
         })
         .await
         .expect("Register node must succeed");

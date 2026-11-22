@@ -187,6 +187,25 @@ message NodeUpgradeDirective {
   bool drain_before_upgrade = 7;
 }
 
+// Terminal or transient outcome status of an applied upgrade directive.
+enum UpgradeInstallStatus {
+  UPGRADE_INSTALL_STATUS_UNSPECIFIED = 0;
+  UPGRADE_INSTALL_STATUS_SUCCEEDED = 1;
+  UPGRADE_INSTALL_STATUS_FAILED_TRANSIENT = 2;
+  UPGRADE_INSTALL_STATUS_TERMINALLY_REJECTED = 3;
+}
+
+// Structured outcome report from a worker node on its last attempted upgrade.
+// Traces to: [REQ-OP-001], [REQ-OP-002], [NFR-SEC-001], [NFR-POW-001]
+message LastUpgradeOutcome {
+  string target_version = 1;
+  string apk_sha256 = 2;
+  UpgradeInstallStatus status = 3;
+  string error_code = 4;
+  string error_message = 5;
+  uint32 attempt_count = 6;
+}
+
 // Hardware and platform capabilities reported by worker node.
 // Traces to: [REQ-VER-002], [INV-006], [REQ-OP-003]
 message NodeCapabilities {
@@ -270,6 +289,7 @@ message RegisterNodeRequest {
   NodeCapabilities capabilities = 2;
   string client_version = 3;
   map<string, string> labels = 4;
+  LastUpgradeOutcome last_upgrade_outcome = 5;
 }
 
 // Registration lease response.
@@ -298,6 +318,7 @@ message SyncNodeStateRequest {
   string session_token = 2;
   repeated TaskExecutionReport active_tasks = 3;
   repeated TaskExecutionReport completed_tasks = 4;
+  LastUpgradeOutcome last_upgrade_outcome = 5;
 }
 
 // Orchestrator response with desired tasks and acknowledgments.

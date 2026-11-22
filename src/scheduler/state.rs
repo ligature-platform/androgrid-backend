@@ -119,9 +119,13 @@ pub struct UpgradeRolloutRecord {
     pub eligible_node_ids: Vec<String>,
     pub in_flight_node_ids: HashSet<String>,
     pub completed_node_ids: HashSet<String>,
+    pub failed_node_ids: HashSet<String>,
     pub staged_node_ids: VecDeque<String>,
     pub lease_timeout_seconds: u32,
     pub drain_before_upgrade: bool,
+    pub is_halted: bool,
+    pub halt_reason: Option<String>,
+    pub created_at_epoch_ms: u64,
 }
 
 impl WorkerRecord {

@@ -222,6 +222,7 @@ async fn test_e2e_mtls_certificate_renewal_and_reconnect() {
             }),
             client_version: "0.1.0".to_string(),
             labels: Default::default(),
+            last_upgrade_outcome: None,
         })
         .await
         .expect("Renewed certificate must authenticate operational RPCs")

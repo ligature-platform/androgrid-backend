@@ -193,6 +193,7 @@ async fn spike_live_grpc_mtls_full_lifecycle_and_monotonic_fencing() {
         }),
         client_version: "1.0.0".to_string(),
         labels: Default::default(),
+        last_upgrade_outcome: None,
     };
 
     let reg_res = client
@@ -283,6 +284,7 @@ async fn spike_live_grpc_mtls_full_lifecycle_and_monotonic_fencing() {
         session_token: wifi_reg.session_token,
         active_tasks: Vec::new(),
         completed_tasks: Vec::new(),
+        last_upgrade_outcome: None,
     };
 
     let sync_res = client
@@ -374,6 +376,7 @@ async fn spike_live_grpc_mtls_rejects_untrusted_client_certificate() {
                     capabilities: None,
                     client_version: "1.0.0".to_string(),
                     labels: Default::default(),
+                    last_upgrade_outcome: None,
                 })
                 .await;
             assert!(
