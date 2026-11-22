@@ -184,6 +184,7 @@ fn spike_task_spec_wasm_bytecode_payload_bounds() {
         task_available: true,
         task: Some(task),
         deadline_epoch_seconds: 1730736000,
+        upgrade_directive: None,
     };
 
     let mut buffer = Vec::new();
@@ -261,6 +262,7 @@ fn spike_tonic_service_trait_definition_presence() {
                 cancel_task_ids: Vec::new(),
                 acknowledged_task_ids: Vec::new(),
                 desired_client_version: String::new(),
+                upgrade_directive: None,
             }))
         }
 
@@ -272,6 +274,7 @@ fn spike_tonic_service_trait_definition_presence() {
                 task_available: false,
                 task: None,
                 deadline_epoch_seconds: 0,
+                upgrade_directive: None,
             }))
         }
 

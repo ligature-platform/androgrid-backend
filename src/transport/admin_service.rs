@@ -1117,6 +1117,7 @@ mod tests {
             node_ids: Vec::new(),
             target_version: "0.2.0".to_string(),
             drain_before_upgrade: false,
+            ..Default::default()
         });
         r_upg.extensions_mut().insert(worker_peer);
         assert_eq!(

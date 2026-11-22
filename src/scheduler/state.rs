@@ -2,11 +2,11 @@
 //!
 //! Traces to: AG-SPEC-2026-V2 Section 4.1, Section 6.1, Section 6.2, [INV-004], [INV-005], [INV-006]
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 
 use crate::{
-    ExecutionEngine, NetworkTransportType, NodeCapabilities, TaskGroupState, TaskSpec, TaskState,
-    TaskTemplate,
+    ExecutionEngine, NetworkTransportType, NodeCapabilities, NodeUpgradeDirective, TaskGroupState,
+    TaskSpec, TaskState, TaskTemplate, UpgradeRolloutStrategy,
 };
 
 /// Execution artifacts committed by a winning worker node.
@@ -102,6 +102,26 @@ pub struct WorkerRecord {
     pub draining: bool,
     pub drained_for_upgrade: bool,
     pub desired_client_version: Option<String>,
+    pub upgrade_directive: Option<NodeUpgradeDirective>,
+    pub upgrade_lease_deadline_ms: u64,
+}
+
+/// Active OTA upgrade rollout state tracking canary cohorts and staged nodes.
+///
+/// Traces to: ADR-010, [REQ-OP-001], [REQ-OP-002], [NFR-REL-001]
+#[derive(Debug, Clone)]
+pub struct UpgradeRolloutRecord {
+    pub rollout_id: String,
+    pub target_version: String,
+    pub directive_template: NodeUpgradeDirective,
+    pub rollout_strategy: UpgradeRolloutStrategy,
+    pub rollout_percentage: u32,
+    pub eligible_node_ids: Vec<String>,
+    pub in_flight_node_ids: HashSet<String>,
+    pub completed_node_ids: HashSet<String>,
+    pub staged_node_ids: VecDeque<String>,
+    pub lease_timeout_seconds: u32,
+    pub drain_before_upgrade: bool,
 }
 
 impl WorkerRecord {

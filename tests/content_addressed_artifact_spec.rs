@@ -443,6 +443,7 @@ async fn test_admin_service_upload_and_decoupled_task_dispatch_under_4kb() {
         task_available: true,
         task: Some(large_inband_task),
         deadline_epoch_seconds: 12345,
+        upgrade_directive: None,
     }
     .encode(&mut inband_buf)
     .expect("Encoding inband response");

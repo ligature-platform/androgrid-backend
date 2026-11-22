@@ -161,6 +161,32 @@ enum ReplaceStrategy {
   REPLACE_STRATEGY_DRAIN = 2;
 }
 
+// Network policy specifying allowed transport interfaces for OTA upgrade downloads.
+enum UpgradeNetworkPolicy {
+  UPGRADE_NETWORK_POLICY_UNSPECIFIED = 0;
+  UPGRADE_NETWORK_POLICY_WIFI_ONLY = 1;
+  UPGRADE_NETWORK_POLICY_ALLOW_CELLULAR = 2;
+}
+
+// Installation rollout strategy for node upgrades.
+enum UpgradeRolloutStrategy {
+  UPGRADE_ROLLOUT_STRATEGY_UNSPECIFIED = 0;
+  UPGRADE_ROLLOUT_STRATEGY_IMMEDIATE = 1;
+  UPGRADE_ROLLOUT_STRATEGY_ROLLING = 2;
+}
+
+// Declarative upgrade directive instructing a worker node to fetch and install an updated client.
+// Traces to: [REQ-OP-001], [REQ-OP-002], [INV-001], [INV-002], [INV-003], [ANTI-003], [NFR-POW-001], [NFR-SEC-001]
+message NodeUpgradeDirective {
+  string target_version = 1;
+  string apk_url = 2;
+  string apk_sha256 = 3;
+  UpgradeNetworkPolicy network_policy = 4;
+  UpgradeRolloutStrategy rollout_strategy = 5;
+  uint32 upgrade_lease_timeout_seconds = 6;
+  bool drain_before_upgrade = 7;
+}
+
 // Hardware and platform capabilities reported by worker node.
 // Traces to: [REQ-VER-002], [INV-006], [REQ-OP-003]
 message NodeCapabilities {
@@ -214,6 +240,7 @@ message ClaimCellularTaskResponse {
   bool task_available = 1;
   TaskSpec task = 2;
   uint32 deadline_epoch_seconds = 3;
+  NodeUpgradeDirective upgrade_directive = 4;
 }
 
 // Atomic result submission with monotonic run_attempt.
@@ -280,6 +307,7 @@ message SyncNodeStateResponse {
   repeated string cancel_task_ids = 3;
   repeated string acknowledged_task_ids = 4;
   string desired_client_version = 5;
+  NodeUpgradeDirective upgrade_directive = 6;
 }
 
 
@@ -672,6 +700,12 @@ message UpgradeNodesRequest {
   repeated string node_ids = 2;
   string target_version = 3;
   bool drain_before_upgrade = 4;
+  string apk_url = 5;
+  string apk_sha256 = 6;
+  UpgradeNetworkPolicy network_policy = 7;
+  UpgradeRolloutStrategy rollout_strategy = 8;
+  uint32 rollout_percentage = 9;
+  uint32 lease_timeout_seconds = 10;
 }
 
 // Response acknowledging node upgrade signaling.
@@ -681,6 +715,8 @@ message UpgradeNodesResponse {
   repeated string targeted_node_ids = 3;
   string target_version = 4;
   string message = 5;
+  uint32 eligible_nodes = 6;
+  uint32 in_flight_upgrades = 7;
 }
 
 

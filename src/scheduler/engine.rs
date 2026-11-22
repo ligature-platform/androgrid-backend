@@ -4,23 +4,25 @@
 //! [REQ-OP-001], [REQ-OP-002], [REQ-OP-003], [REQ-OP-004],
 //! [INV-004], [INV-005], [INV-006], [ANTI-003], [NFR-REL-001]
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 
 use crate::scheduler::errors::SchedulingError;
 use crate::scheduler::state::{
-    NodeGroupRecord, TaskExecutionResult, TaskGroupRecord, TaskRecord, WorkerRecord,
+    NodeGroupRecord, TaskExecutionResult, TaskGroupRecord, TaskRecord, UpgradeRolloutRecord,
+    WorkerRecord,
 };
 use crate::scheduler::thermal::{ThermalAction, ThermalPolicy};
 use crate::{
     AssignNodesToGroupRequest, AssignNodesToGroupResponse, CancelTaskGroupResponse,
     ClaimCellularTaskResponse, CreateNodeGroupRequest, CreateNodeGroupResponse, DrainNodesRequest,
     DrainNodesResponse, ExecutionEngine, GetTaskGroupStatusResponse, NetworkTransportType,
-    NodeCapabilities, NodeGroup, RegisterNodeResponse, ReplaceStrategy, ReplaceTaskGroupRequest,
-    ReplaceTaskGroupResponse, SubmitCellularResultResponse, SubmitTaskGroupResponse,
-    SyncNodeStateResponse, TaskExecutionReport, TaskGroupSpec, TaskGroupState, TaskGroupSummary,
-    TaskPartitionSpec, TaskSpec, TaskState, TaskTemplate, UpdateNodeGroupRequest,
-    UpdateNodeGroupResponse, UpgradeNodesRequest, UpgradeNodesResponse,
+    NodeCapabilities, NodeGroup, NodeUpgradeDirective, RegisterNodeResponse, ReplaceStrategy,
+    ReplaceTaskGroupRequest, ReplaceTaskGroupResponse, SubmitCellularResultResponse,
+    SubmitTaskGroupResponse, SyncNodeStateResponse, TaskExecutionReport, TaskGroupSpec,
+    TaskGroupState, TaskGroupSummary, TaskPartitionSpec, TaskSpec, TaskState, TaskTemplate,
+    UpdateNodeGroupRequest, UpdateNodeGroupResponse, UpgradeNetworkPolicy, UpgradeNodesRequest,
+    UpgradeNodesResponse, UpgradeRolloutStrategy,
 };
 
 /// Maximum number of partitions allowed in a single TaskGroup submission or replacement.
@@ -72,6 +74,7 @@ struct SchedulerInner {
     groups: HashMap<String, TaskGroupRecord>,
     node_groups: HashMap<String, NodeGroupRecord>,
     pending_cancellations: HashMap<String, Vec<String>>,
+    active_rollouts: HashMap<String, UpgradeRolloutRecord>,
     allow_insecure_root_tasks: bool,
     thermal_policy: ThermalPolicy,
 }
@@ -94,6 +97,7 @@ impl ClusterScheduler {
                 groups: HashMap::new(),
                 node_groups: HashMap::new(),
                 pending_cancellations: HashMap::new(),
+                active_rollouts: HashMap::new(),
                 allow_insecure_root_tasks,
                 thermal_policy,
             })),
@@ -217,6 +221,9 @@ impl ClusterScheduler {
             drained_for_upgrade,
             active_task_ids,
             desired_client_version,
+            upgrade_directive,
+            upgrade_lease_deadline_ms,
+            upgrade_completed,
         ) = if let Some(existing) = inner.workers.get(&node_id) {
             let (next_desired, upgrade_completed) = match existing.desired_client_version.as_deref()
             {
@@ -230,12 +237,23 @@ impl ClusterScheduler {
                 } else {
                     (existing.draining, existing.drained_for_upgrade)
                 };
+            let (next_directive, next_deadline) = if upgrade_completed {
+                (None, 0)
+            } else {
+                (
+                    existing.upgrade_directive.clone(),
+                    existing.upgrade_lease_deadline_ms,
+                )
+            };
             (
                 existing.explicit_node_group.clone(),
                 next_draining,
                 next_drained_for_upgrade,
                 existing.active_task_ids.clone(),
                 next_desired,
+                next_directive,
+                next_deadline,
+                upgrade_completed,
             )
         } else {
             let pre_pinned = inner
@@ -243,7 +261,7 @@ impl ClusterScheduler {
                 .iter()
                 .find(|(_, grp)| grp.member_node_ids.contains(&node_id))
                 .map(|(gid, _)| gid.clone());
-            (pre_pinned, false, false, Vec::new(), None)
+            (pre_pinned, false, false, Vec::new(), None, None, 0, false)
         };
 
         let worker = WorkerRecord {
@@ -262,7 +280,13 @@ impl ClusterScheduler {
             draining,
             drained_for_upgrade,
             desired_client_version,
+            upgrade_directive,
+            upgrade_lease_deadline_ms,
         };
+
+        if upgrade_completed {
+            promote_next_canary_if_ready(&mut inner, &node_id, now_epoch_ms);
+        }
 
         let transport_str = if worker.capabilities.current_transport
             == NetworkTransportType::NetworkTransportWifiLan as i32
@@ -346,7 +370,7 @@ impl ClusterScheduler {
     ) -> Result<ClaimCellularTaskResponse, SchedulingError> {
         let mut inner = self.inner.write().expect("RwLock write lock poisoned");
 
-        let (is_rooted, policy, allow_root, worker_snapshot) = {
+        let (is_rooted, policy, allow_root, worker_snapshot, cellular_upgrade_directive) = {
             let worker = inner
                 .workers
                 .get_mut(node_id)
@@ -370,11 +394,22 @@ impl ClusterScheduler {
                 NetworkTransportType::NetworkTransportCellularWan as i32;
             worker.capabilities.is_metered = true;
 
+            let cellular_directive = if let Some(ref dir) = worker.upgrade_directive {
+                if dir.network_policy == UpgradeNetworkPolicy::AllowCellular as i32 {
+                    Some(dir.clone())
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
             if worker.draining {
                 return Ok(ClaimCellularTaskResponse {
                     task_available: false,
                     task: None,
                     deadline_epoch_seconds: 0,
+                    upgrade_directive: cellular_directive,
                 });
             }
 
@@ -384,6 +419,7 @@ impl ClusterScheduler {
                 inner.thermal_policy,
                 inner.allow_insecure_root_tasks,
                 worker_snap,
+                cellular_directive,
             )
         };
 
@@ -395,6 +431,7 @@ impl ClusterScheduler {
                         task_available: false,
                         task: None,
                         deadline_epoch_seconds: 0,
+                        upgrade_directive: cellular_upgrade_directive,
                     });
                 }
                 ThermalAction::Reject => {
@@ -477,12 +514,14 @@ impl ClusterScheduler {
                     task_available: true,
                     task: Some(out_spec),
                     deadline_epoch_seconds: deadline as u32,
+                    upgrade_directive: cellular_upgrade_directive,
                 })
             }
             None => Ok(ClaimCellularTaskResponse {
                 task_available: false,
                 task: None,
                 deadline_epoch_seconds: 0,
+                upgrade_directive: cellular_upgrade_directive,
             }),
         }
     }
@@ -517,6 +556,7 @@ impl ClusterScheduler {
             allow_root,
             is_draining,
             desired_version,
+            upgrade_directive,
             worker_snapshot,
         ) = {
             let policy = inner.thermal_policy;
@@ -541,10 +581,19 @@ impl ClusterScheduler {
             let unmetered = !worker.capabilities.is_metered
                 || worker.capabilities.current_transport
                     == NetworkTransportType::NetworkTransportWifiLan as i32;
-            let desired_version = if unmetered {
-                pending_desired_version(worker)
+
+            let allows_cellular_upgrade = worker
+                .upgrade_directive
+                .as_ref()
+                .map(|d| d.network_policy == UpgradeNetworkPolicy::AllowCellular as i32)
+                .unwrap_or(false);
+
+            let upgrade_eligible = unmetered || allows_cellular_upgrade;
+
+            let (desired_version, upgrade_directive) = if upgrade_eligible {
+                (pending_desired_version(worker), worker.upgrade_directive.clone())
             } else {
-                String::new()
+                (String::new(), None)
             };
 
             (
@@ -554,6 +603,7 @@ impl ClusterScheduler {
                 allow_root,
                 worker.draining,
                 desired_version,
+                upgrade_directive,
                 worker.clone(),
             )
         };
@@ -716,6 +766,7 @@ impl ClusterScheduler {
             cancel_task_ids,
             acknowledged_task_ids: acknowledged_ids,
             desired_client_version: desired_version,
+            upgrade_directive,
         })
     }
 
@@ -1846,10 +1897,9 @@ impl ClusterScheduler {
         })
     }
 
-    /// Signals a target client version upgrade to targeted worker nodes (excluding nodes
-    /// already running `target_version`).
+    /// Signals a declarative OTA client upgrade to targeted worker nodes or NodeGroups.
     ///
-    /// Traces to: [REQ-OP-002], [INV-003], [NFR-POW-001], [NFR-REL-001]
+    /// Traces to: ADR-007, ADR-010, [REQ-OP-001], [REQ-OP-002], [INV-001], [INV-002], [INV-003], [ANTI-003], [NFR-POW-001], [NFR-SEC-001]
     pub fn upgrade_nodes(
         &self,
         req: UpgradeNodesRequest,
@@ -1864,40 +1914,199 @@ impl ClusterScheduler {
             ));
         }
 
+        let apk_url = req.apk_url.trim().to_string();
+        if !apk_url.is_empty() {
+            if apk_url.len() > 1024 {
+                return Err(SchedulingError::InvalidNodeGroupRequest(
+                    "apk_url exceeds 1024 characters maximum bound".to_string(),
+                ));
+            }
+            if !apk_url.starts_with("http://")
+                && !apk_url.starts_with("https://")
+                && !apk_url.starts_with("/v1/blobs/")
+            {
+                return Err(SchedulingError::InvalidNodeGroupRequest(
+                    "apk_url must be a valid http, https, or /v1/blobs/ endpoint".to_string(),
+                ));
+            }
+        }
+
+        let apk_sha256 = req.apk_sha256.trim().to_lowercase();
+        if !apk_sha256.is_empty() {
+            if apk_sha256.len() != 64 || !apk_sha256.chars().all(|c| c.is_ascii_hexdigit()) {
+                return Err(SchedulingError::InvalidNodeGroupRequest(
+                    "apk_sha256 must be a 64-character hexadecimal SHA-256 digest".to_string(),
+                ));
+            }
+        }
+
+        let network_policy = if req.network_policy == 0 {
+            UpgradeNetworkPolicy::WifiOnly as i32
+        } else {
+            req.network_policy
+        };
+
+        let rollout_strategy = if req.rollout_strategy == 0 {
+            UpgradeRolloutStrategy::Immediate as i32
+        } else {
+            req.rollout_strategy
+        };
+
+        let lease_timeout_seconds = if req.lease_timeout_seconds == 0 {
+            600
+        } else {
+            req.lease_timeout_seconds.min(86400)
+        };
+
+        let rollout_pct = if req.rollout_percentage == 0 {
+            100
+        } else {
+            req.rollout_percentage.min(100)
+        };
+
         let mut inner = self.inner.write().expect("RwLock write lock poisoned");
         let candidate_ids = resolve_target_node_ids(&inner, &req.node_group, &req.node_ids)?;
 
-        let mut targeted = Vec::new();
-        for nid in candidate_ids {
-            if let Some(w) = inner.workers.get_mut(&nid) {
+        let directive_template = NodeUpgradeDirective {
+            target_version: target_version.clone(),
+            apk_url: apk_url.clone(),
+            apk_sha256: apk_sha256.clone(),
+            network_policy,
+            rollout_strategy,
+            upgrade_lease_timeout_seconds: lease_timeout_seconds,
+            drain_before_upgrade: req.drain_before_upgrade,
+        };
+
+        let mut eligible_ids = Vec::new();
+        for nid in &candidate_ids {
+            if let Some(w) = inner.workers.get_mut(nid) {
                 if w.client_version == target_version {
                     w.desired_client_version = None;
+                    w.upgrade_directive = None;
+                    w.upgrade_lease_deadline_ms = 0;
                     if w.drained_for_upgrade {
                         w.draining = false;
                         w.drained_for_upgrade = false;
                     }
                     continue;
                 }
+                eligible_ids.push(nid.clone());
+            }
+        }
+
+        let total_eligible = eligible_ids.len();
+        let (active_cohort, staged_cohort): (Vec<String>, Vec<String>) =
+            if rollout_strategy == UpgradeRolloutStrategy::Rolling as i32
+                && total_eligible > 0
+                && rollout_pct < 100
+            {
+                let batch_size = ((total_eligible * (rollout_pct as usize) + 99) / 100).max(1);
+                let (active, staged) = eligible_ids.split_at(batch_size.min(total_eligible));
+                (active.to_vec(), staged.to_vec())
+            } else {
+                (eligible_ids.clone(), Vec::new())
+            };
+
+        let now_epoch_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+
+        let mut targeted = Vec::new();
+        for nid in &active_cohort {
+            if let Some(w) = inner.workers.get_mut(nid) {
                 w.desired_client_version = Some(target_version.clone());
+                w.upgrade_directive = Some(directive_template.clone());
+                w.upgrade_lease_deadline_ms =
+                    now_epoch_ms + (lease_timeout_seconds as u64) * 1000;
                 if req.drain_before_upgrade && !w.draining {
                     w.draining = true;
                     w.drained_for_upgrade = true;
                 }
-                targeted.push(nid);
+                targeted.push(nid.clone());
             }
         }
 
+        let rollout_key = if !req.node_group.is_empty() {
+            req.node_group.clone()
+        } else {
+            format!("nodes-{}", target_version)
+        };
+
+        inner.active_rollouts.insert(
+            rollout_key,
+            UpgradeRolloutRecord {
+                rollout_id: format!("rollout-{}-{}", target_version, now_epoch_ms),
+                target_version: target_version.clone(),
+                directive_template,
+                rollout_strategy: if rollout_strategy
+                    == UpgradeRolloutStrategy::Rolling as i32
+                {
+                    UpgradeRolloutStrategy::Rolling
+                } else {
+                    UpgradeRolloutStrategy::Immediate
+                },
+                rollout_percentage: rollout_pct,
+                eligible_node_ids: eligible_ids.clone(),
+                in_flight_node_ids: targeted.iter().cloned().collect(),
+                completed_node_ids: HashSet::new(),
+                staged_node_ids: staged_cohort.into_iter().collect(),
+                lease_timeout_seconds,
+                drain_before_upgrade: req.drain_before_upgrade,
+            },
+        );
+
         let count = targeted.len() as u32;
+        let eligible_count = total_eligible as u32;
         Ok(UpgradeNodesResponse {
             success: true,
             targeted_nodes: count,
             targeted_node_ids: targeted,
             target_version: target_version.clone(),
             message: format!(
-                "Signaled upgrade to '{}' for {} worker node(s)",
-                target_version, count
+                "Signaled upgrade to '{}' for {} worker node(s) ({} eligible, {} in-flight)",
+                target_version, count, eligible_count, count
             ),
+            eligible_nodes: eligible_count,
+            in_flight_upgrades: count,
         })
+    }
+}
+
+fn promote_next_canary_if_ready(
+    inner: &mut SchedulerInner,
+    completed_node_id: &str,
+    now_epoch_ms: u64,
+) {
+    let mut touched_rollouts = Vec::new();
+    for (rollout_id, rollout) in inner.active_rollouts.iter_mut() {
+        if rollout.in_flight_node_ids.remove(completed_node_id) {
+            rollout.completed_node_ids.insert(completed_node_id.to_string());
+            touched_rollouts.push(rollout_id.clone());
+        }
+    }
+
+    for rollout_id in touched_rollouts {
+        if let Some(rollout) = inner.active_rollouts.get_mut(&rollout_id) {
+            while let Some(next_nid) = rollout.staged_node_ids.pop_front() {
+                if let Some(w) = inner.workers.get_mut(&next_nid) {
+                    if w.client_version == rollout.target_version {
+                        rollout.completed_node_ids.insert(next_nid);
+                        continue;
+                    }
+                    w.desired_client_version = Some(rollout.target_version.clone());
+                    w.upgrade_directive = Some(rollout.directive_template.clone());
+                    w.upgrade_lease_deadline_ms =
+                        now_epoch_ms + (rollout.lease_timeout_seconds as u64) * 1000;
+                    if rollout.drain_before_upgrade && !w.draining {
+                        w.draining = true;
+                        w.drained_for_upgrade = true;
+                    }
+                    rollout.in_flight_node_ids.insert(next_nid);
+                    break;
+                }
+            }
+        }
     }
 }
 
@@ -3554,6 +3763,7 @@ mod tests {
                 node_ids: Vec::new(),
                 target_version: "0.2.0".to_string(),
                 drain_before_upgrade: true,
+                ..Default::default()
             })
             .unwrap();
 
@@ -3788,6 +3998,7 @@ mod tests {
                 node_ids: Vec::new(),
                 target_version: "0.2.0".to_string(),
                 drain_before_upgrade: true,
+                ..Default::default()
             })
             .unwrap();
         assert_eq!(upg.targeted_nodes, 1);
@@ -3853,6 +4064,7 @@ mod tests {
                 node_ids: vec!["dual-1".to_string()],
                 target_version: "0.2.0".to_string(),
                 drain_before_upgrade: false,
+                ..Default::default()
             })
             .unwrap();
 
@@ -3918,6 +4130,7 @@ mod tests {
                 node_ids: vec!["rb-1".to_string(), "rb-2".to_string()],
                 target_version: "0.2.0".to_string(),
                 drain_before_upgrade: true,
+                ..Default::default()
             })
             .unwrap();
 
@@ -3927,6 +4140,7 @@ mod tests {
                 node_ids: vec!["rb-1".to_string(), "rb-2".to_string()],
                 target_version: "0.1.0".to_string(),
                 drain_before_upgrade: false,
+                ..Default::default()
             })
             .unwrap();
         assert_eq!(rb.targeted_nodes, 0);
@@ -4110,6 +4324,7 @@ mod tests {
                 node_ids: vec!["u1".to_string(), "u2".to_string()],
                 target_version: "0.2.0".to_string(),
                 drain_before_upgrade: true,
+                ..Default::default()
             })
             .unwrap();
 
@@ -4254,5 +4469,196 @@ mod tests {
             }),
             Err(SchedulingError::NodeNotFound(_))
         ));
+    }
+
+    #[test]
+    fn test_upgrade_nodes_validates_apk_url_and_sha256() {
+        let scheduler = ClusterScheduler::new();
+        scheduler
+            .register_node(
+                "n1".to_string(),
+                make_test_capabilities(false, false),
+                "0.1.0".to_string(),
+                1000,
+            )
+            .unwrap();
+
+        // Invalid APK URL (ftp scheme)
+        let res_bad_url = scheduler.upgrade_nodes(UpgradeNodesRequest {
+            node_group: String::new(),
+            node_ids: vec!["n1".to_string()],
+            target_version: "0.2.0".to_string(),
+            apk_url: "ftp://example.com/app.apk".to_string(),
+            ..Default::default()
+        });
+        assert!(matches!(
+            res_bad_url,
+            Err(SchedulingError::InvalidNodeGroupRequest(_))
+        ));
+
+        // Invalid SHA-256 (too short)
+        let res_bad_sha = scheduler.upgrade_nodes(UpgradeNodesRequest {
+            node_group: String::new(),
+            node_ids: vec!["n1".to_string()],
+            target_version: "0.2.0".to_string(),
+            apk_sha256: "abcd123".to_string(),
+            ..Default::default()
+        });
+        assert!(matches!(
+            res_bad_sha,
+            Err(SchedulingError::InvalidNodeGroupRequest(_))
+        ));
+
+        // Valid APK URL and SHA-256
+        let res_valid = scheduler.upgrade_nodes(UpgradeNodesRequest {
+            node_group: String::new(),
+            node_ids: vec!["n1".to_string()],
+            target_version: "0.2.0".to_string(),
+            apk_url: "https://dl.androgrid.net/apk/v0.2.0.apk".to_string(),
+            apk_sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                .to_string(),
+            ..Default::default()
+        });
+        assert!(res_valid.is_ok());
+    }
+
+    #[test]
+    fn test_upgrade_nodes_rolling_canary_rollout_and_automatic_promotion() {
+        let scheduler = ClusterScheduler::new();
+        for id in ["c1", "c2", "c3", "c4"] {
+            scheduler
+                .register_node(
+                    id.to_string(),
+                    make_test_capabilities(false, false),
+                    "0.1.0".to_string(),
+                    1000,
+                )
+                .unwrap();
+        }
+
+        // Rolling upgrade with 25% rollout percentage (1 of 4 nodes)
+        let res = scheduler
+            .upgrade_nodes(UpgradeNodesRequest {
+                node_group: String::new(),
+                node_ids: vec![
+                    "c1".to_string(),
+                    "c2".to_string(),
+                    "c3".to_string(),
+                    "c4".to_string(),
+                ],
+                target_version: "0.2.0".to_string(),
+                apk_url:
+                    "/v1/blobs/e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                        .to_string(),
+                apk_sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                    .to_string(),
+                rollout_strategy: UpgradeRolloutStrategy::Rolling as i32,
+                rollout_percentage: 25,
+                drain_before_upgrade: true,
+                ..Default::default()
+            })
+            .unwrap();
+
+        assert_eq!(res.eligible_nodes, 4);
+        assert_eq!(res.targeted_nodes, 1);
+        assert_eq!(res.targeted_node_ids, vec!["c1"]);
+
+        // Verify c1 has directive and is drained; c2..c4 are not drained
+        let nodes = scheduler.list_worker_nodes();
+        let n1 = nodes.iter().find(|n| n.node_id == "c1").unwrap();
+        let n2 = nodes.iter().find(|n| n.node_id == "c2").unwrap();
+        assert!(n1.draining);
+        assert!(!n2.draining);
+
+        // c1 completes upgrade and reconnects with 0.2.0
+        let r1 = scheduler
+            .register_node(
+                "c1".to_string(),
+                make_test_capabilities(false, false),
+                "0.2.0".to_string(),
+                1100,
+            )
+            .unwrap();
+        assert_eq!(r1.session_token.is_empty(), false);
+
+        // c1 is now auto-undrained, and c2 was automatically promoted!
+        let nodes_after = scheduler.list_worker_nodes();
+        let n1_after = nodes_after.iter().find(|n| n.node_id == "c1").unwrap();
+        let n2_after = nodes_after.iter().find(|n| n.node_id == "c2").unwrap();
+        assert!(!n1_after.draining);
+        assert_eq!(n1_after.desired_client_version, "");
+        assert!(n2_after.draining);
+        assert_eq!(n2_after.desired_client_version, "0.2.0");
+    }
+
+    #[test]
+    fn test_upgrade_nodes_cellular_network_policy_enforcement() {
+        let scheduler = ClusterScheduler::new();
+        let reg = scheduler
+            .register_node(
+                "cell-1".to_string(),
+                make_test_capabilities(false, false),
+                "0.1.0".to_string(),
+                1000,
+            )
+            .unwrap();
+
+        // 1. Default policy (wifi-only)
+        scheduler
+            .upgrade_nodes(UpgradeNodesRequest {
+                node_group: String::new(),
+                node_ids: vec!["cell-1".to_string()],
+                target_version: "0.2.0".to_string(),
+                apk_url: "https://dl.androgrid.net/apk/v0.2.0.apk".to_string(),
+                apk_sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                    .to_string(),
+                network_policy: UpgradeNetworkPolicy::WifiOnly as i32,
+                ..Default::default()
+            })
+            .unwrap();
+
+        // Over Wi-Fi: receives directive
+        let wifi_sync = scheduler
+            .sync_node_state("cell-1", &reg.session_token, &[], 1100)
+            .unwrap();
+        assert!(wifi_sync.upgrade_directive.is_some());
+        assert_eq!(
+            wifi_sync.upgrade_directive.as_ref().unwrap().target_version,
+            "0.2.0"
+        );
+
+        // Over Cellular WAN: directive is suppressed per [ANTI-003] and [INV-003]
+        let cell_claim = scheduler
+            .claim_cellular_task_nominal("cell-1", 90, false, 1200)
+            .unwrap();
+        assert!(cell_claim.upgrade_directive.is_none());
+
+        // 2. Allow cellular policy
+        scheduler
+            .upgrade_nodes(UpgradeNodesRequest {
+                node_group: String::new(),
+                node_ids: vec!["cell-1".to_string()],
+                target_version: "0.3.0".to_string(),
+                apk_url: "https://dl.androgrid.net/apk/v0.3.0.apk".to_string(),
+                apk_sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                    .to_string(),
+                network_policy: UpgradeNetworkPolicy::AllowCellular as i32,
+                ..Default::default()
+            })
+            .unwrap();
+
+        // Over Cellular WAN: directive IS delivered
+        let cell_claim_allowed = scheduler
+            .claim_cellular_task_nominal("cell-1", 90, false, 1300)
+            .unwrap();
+        assert!(cell_claim_allowed.upgrade_directive.is_some());
+        assert_eq!(
+            cell_claim_allowed
+                .upgrade_directive
+                .as_ref()
+                .unwrap()
+                .target_version,
+            "0.3.0"
+        );
     }
 }
