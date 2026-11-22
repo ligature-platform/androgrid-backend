@@ -138,9 +138,17 @@ impl RolloutStore {
 
         if let Some(ref dir) = self.storage_dir {
             fs::create_dir_all(dir)?;
-            let file_path = dir.join(format!("rollout_{}.json", sanitize_filename(&key)));
+            let sanitized = sanitize_filename(&key);
+            let file_path = dir.join(format!("rollout_{sanitized}.json"));
+            let tmp_path = dir.join(format!(".rollout_{sanitized}.json.tmp"));
             let json = serde_json::to_string_pretty(&descriptor).map_err(std::io::Error::other)?;
-            fs::write(file_path, json)?;
+
+            use std::io::Write;
+            let mut file = fs::File::create(&tmp_path)?;
+            file.write_all(json.as_bytes())?;
+            file.sync_all()?;
+            drop(file);
+            fs::rename(&tmp_path, &file_path)?;
         }
 
         Ok(())
@@ -203,4 +211,69 @@ fn sanitize_filename(name: &str) -> String {
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_rollout_store_atomic_save_and_load() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("androgrid_rollout_test_{}", std::process::id()));
+        let store = RolloutStore::with_directory(&temp_dir);
+
+        let record = UpgradeRolloutRecord {
+            rollout_id: "rollout-test-1".to_string(),
+            target_version: "0.2.0".to_string(),
+            directive_template: NodeUpgradeDirective {
+                target_version: "0.2.0".to_string(),
+                apk_url: "https://example.com/app.apk".to_string(),
+                apk_sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                    .to_string(),
+                network_policy: 0,
+                rollout_strategy: 0,
+                upgrade_lease_timeout_seconds: 600,
+                drain_before_upgrade: false,
+            },
+            rollout_strategy: UpgradeRolloutStrategy::Immediate,
+            rollout_percentage: 100,
+            eligible_node_ids: vec!["node-1".to_string()],
+            in_flight_node_ids: std::collections::HashSet::new(),
+            completed_node_ids: std::collections::HashSet::new(),
+            failed_node_ids: std::collections::HashSet::new(),
+            staged_node_ids: std::collections::VecDeque::new(),
+            lease_timeout_seconds: 600,
+            drain_before_upgrade: false,
+            is_halted: false,
+            halt_reason: None,
+            created_at_epoch_ms: 1000,
+        };
+
+        store
+            .save_rollout(&record)
+            .expect("Atomic save should succeed");
+
+        // Verify tmp file was cleaned up and final json exists
+        let tmp_file = temp_dir.join(".rollout_0.2.0.json.tmp");
+        let json_file = temp_dir.join("rollout_0.2.0.json");
+        assert!(!tmp_file.exists());
+        assert!(json_file.exists());
+
+        // Create new store instance pointing to same directory
+        let store2 = RolloutStore::with_directory(&temp_dir);
+        let loaded = store2.load_rollouts().expect("Load should succeed");
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].target_version, "0.2.0");
+
+        // Delete rollout
+        store2
+            .delete_rollout("0.2.0")
+            .expect("Delete should succeed");
+        assert!(!json_file.exists());
+        let reloaded = store2.load_rollouts().expect("Reload should succeed");
+        assert_eq!(reloaded.len(), 0);
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
 }

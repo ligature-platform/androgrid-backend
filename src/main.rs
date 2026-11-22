@@ -20,7 +20,8 @@ use androgrid_backend::transport::tls::{
 use androgrid_backend::{
     require_client_mtls_interceptor, AdminServiceImpl, AndroGridServiceImpl, ArtifactServer,
     ArtifactStore, CaSigner, CertRenewalManager, CertRenewalPolicy, ClusterConfig,
-    ClusterScheduler, EnrollmentContext, EnrollmentServiceImpl, PairingTokenStore, ThermalPolicy,
+    ClusterScheduler, EnrollmentContext, EnrollmentServiceImpl, PairingTokenStore, RolloutStore,
+    ThermalPolicy,
 };
 
 #[derive(Parser, Debug)]
@@ -81,10 +82,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    let scheduler = Arc::new(ClusterScheduler::with_options(
+    let rollout_store = if let Some(ref dir) = config.rollout_storage_dir {
+        Arc::new(RolloutStore::with_directory(dir))
+    } else {
+        Arc::new(RolloutStore::new())
+    };
+
+    let scheduler = Arc::new(ClusterScheduler::with_options_and_store(
         config.allow_insecure_root_tasks,
         ThermalPolicy::default(),
+        rollout_store,
     ));
+    if let Err(e) = scheduler.reconcile_rollouts_from_store() {
+        warn!(error = %e, "Failed to reconcile active rollouts from durable store on startup");
+    }
 
     let artifact_store = if let Some(ref dir) = config.artifact_storage_dir {
         Arc::new(ArtifactStore::with_directory(dir))

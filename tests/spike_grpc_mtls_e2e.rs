@@ -244,6 +244,8 @@ async fn spike_live_grpc_mtls_full_lifecycle_and_monotonic_fencing() {
         is_charging: false,
         battery_temperature_celsius: 0,
         thermal_status: 0,
+        client_version: "0.1.0".to_string(),
+        last_upgrade_outcome: None,
     };
 
     let claim_res = client

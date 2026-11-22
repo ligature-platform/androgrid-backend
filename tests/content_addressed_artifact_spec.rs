@@ -399,6 +399,8 @@ async fn test_admin_service_upload_and_decoupled_task_dispatch_under_4kb() {
             is_charging: false,
             battery_temperature_celsius: 30,
             thermal_status: 0,
+            client_version: "0.1.0".to_string(),
+            last_upgrade_outcome: None,
         })
         .await
         .expect("Claim task must succeed")

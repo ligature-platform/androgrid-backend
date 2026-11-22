@@ -226,6 +226,8 @@ async fn test_bdd_scenario_1_cellular_disconnected_execution_and_zero_keepalive(
         is_charging: false,
         battery_temperature_celsius: 0,
         thermal_status: 0,
+        client_version: "0.1.0".to_string(),
+        last_upgrade_outcome: None,
     };
 
     let claim_res = client
@@ -357,6 +359,8 @@ async fn test_bdd_scenario_2_cellular_spot_dual_assignment_and_monotonic_fencing
         is_charging: false,
         battery_temperature_celsius: 0,
         thermal_status: 0,
+        client_version: "0.1.0".to_string(),
+        last_upgrade_outcome: None,
     };
 
     let cell_claim_res = cell_client
@@ -655,6 +659,8 @@ async fn test_bdd_scenario_4_thermal_aware_task_scheduling_and_battery_protectio
         is_charging: false,
         battery_temperature_celsius: 42,
         thermal_status: 1,
+        client_version: "0.1.0".to_string(),
+        last_upgrade_outcome: None,
     };
 
     let hot_claim_res = client
@@ -696,6 +702,8 @@ async fn test_bdd_scenario_4_thermal_aware_task_scheduling_and_battery_protectio
         is_charging: false,
         battery_temperature_celsius: 32,
         thermal_status: 0,
+        client_version: "0.1.0".to_string(),
+        last_upgrade_outcome: None,
     };
 
     let cool_claim_res = client

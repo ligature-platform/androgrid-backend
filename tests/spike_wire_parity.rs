@@ -49,6 +49,8 @@ fn spike_claim_cellular_task_request_wire_parity() {
         is_charging: false,
         battery_temperature_celsius: 31,
         thermal_status: 1,
+        client_version: "0.1.0".to_string(),
+        last_upgrade_outcome: None,
     };
 
     let start_encode = Instant::now();
