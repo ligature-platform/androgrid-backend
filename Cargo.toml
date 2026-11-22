@@ -38,12 +38,17 @@ crossterm = "0.29.0"
 tokio-stream = { version = "0.1", features = ["sync"] }
 
 
+[features]
+default = []
+test-utils = []
+
 [build-dependencies]
 tonic-build = { version = "0.12", features = ["prost"] }
 prost-build = "0.13"
 protoc-bin-vendored = "3.3"
 
 [dev-dependencies]
+androgrid-backend = { path = ".", features = ["test-utils"] }
 proptest = "1.5"
 tokio-test = "0.4"
 tokio-stream = { version = "0.1", features = ["net"] }

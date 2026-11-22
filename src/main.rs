@@ -70,8 +70,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         lease_secs = config.lease_timeout_seconds,
         max_frame_mb = config.max_frame_size_bytes / (1024 * 1024),
         allow_insecure_root = config.allow_insecure_root_tasks,
+        enforce_hardware_attestation = config.enforce_hardware_attestation,
+        require_attestation_challenge = config.require_attestation_challenge,
         "Cluster configuration loaded"
     );
+
+    if config.is_mtls_configured() && !config.enforce_hardware_attestation {
+        warn!(
+            "Hardware attestation enforcement is DISABLED while mTLS is configured [NFR-SEC-001]"
+        );
+    }
 
     let scheduler = Arc::new(ClusterScheduler::with_options(
         config.allow_insecure_root_tasks,
@@ -131,9 +139,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         (None, String::new())
     };
 
-    let enrollment_ctx = ca_signer.as_ref().map(|signer| EnrollmentContext {
-        token_store: Arc::clone(&token_store),
-        signer: Arc::clone(signer),
+    let enrollment_ctx = ca_signer.as_ref().map(|signer| {
+        EnrollmentContext::with_hardware_attestation(
+            Arc::clone(&token_store),
+            Arc::clone(signer),
+            config.enforce_hardware_attestation,
+            config.require_attestation_challenge,
+            None,
+        )
     });
 
     let mtls_enabled = config.is_mtls_configured();
@@ -230,9 +243,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .map_err(|e| format!("Failed to build dual-plane TLS config: {e}"))?;
 
         let mut routes = tonic::service::Routes::new(service_server).add_service(admin_server);
-        if let Some(ctx) = enrollment_ctx {
-            let enrollment_service =
-                EnrollmentServiceImpl::new(Arc::clone(&ctx.token_store), Arc::clone(&ctx.signer));
+        if let Some(ctx) = enrollment_ctx.clone() {
+            let enrollment_service = EnrollmentServiceImpl::with_context(ctx);
             let enrollment_server = EnrollmentServiceServer::new(enrollment_service)
                 .max_decoding_message_size(config.max_frame_size_bytes)
                 .max_encoding_message_size(config.max_frame_size_bytes);
@@ -251,9 +263,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .add_service(service_server)
             .add_service(admin_server);
 
-        if let Some(ctx) = enrollment_ctx {
-            let enrollment_service =
-                EnrollmentServiceImpl::new(Arc::clone(&ctx.token_store), Arc::clone(&ctx.signer));
+        if let Some(ctx) = enrollment_ctx.clone() {
+            let enrollment_service = EnrollmentServiceImpl::with_context(ctx);
             let enrollment_server = EnrollmentServiceServer::new(enrollment_service)
                 .max_decoding_message_size(config.max_frame_size_bytes)
                 .max_encoding_message_size(config.max_frame_size_bytes);

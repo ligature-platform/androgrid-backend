@@ -19,10 +19,11 @@ use androgrid_backend::enrollment_service_client::EnrollmentServiceClient;
 use androgrid_backend::enrollment_service_server::EnrollmentServiceServer;
 use androgrid_backend::{
     build_client_mtls_config, build_server_bootstrap_tls_config, build_server_mtls_config,
-    require_client_mtls_interceptor, AdminServiceImpl, AndroGridServiceImpl, ArtifactServer,
-    ArtifactStore, CaSigner, ClusterScheduler, EnrollmentContext, EnrollmentServiceImpl,
-    ExecutionEngine, HttpEnrollRequest, HttpEnrollResponse, NetworkTransportType, NodeCapabilities,
-    PairingError, PairingTokenStore, RegisterNodeRequest, SignerError, SyncNodeStateRequest,
+    build_test_key_description_der, require_client_mtls_interceptor, AdminServiceImpl,
+    AndroGridServiceImpl, ArtifactServer, ArtifactStore, CaSigner, ClusterScheduler,
+    EnrollmentContext, EnrollmentServiceImpl, ExecutionEngine, HttpEnrollRequest,
+    HttpEnrollResponse, NetworkTransportType, NodeCapabilities, PairingError, PairingTokenStore,
+    RegisterNodeRequest, SignerError, SyncNodeStateRequest,
 };
 use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair};
 
@@ -170,10 +171,7 @@ async fn test_http_enrollment_endpoint_lifecycle() {
     let token_store = Arc::new(PairingTokenStore::default());
     let artifact_store = Arc::new(ArtifactStore::new());
 
-    let enrollment_ctx = EnrollmentContext {
-        token_store: Arc::clone(&token_store),
-        signer: Arc::clone(&signer),
-    };
+    let enrollment_ctx = EnrollmentContext::new(Arc::clone(&token_store), Arc::clone(&signer));
 
     let router = ArtifactServer::router_with_enrollment(artifact_store, enrollment_ctx);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -213,6 +211,7 @@ async fn test_http_enrollment_endpoint_lifecycle() {
         pairing_token: record.token.clone(),
         node_id: node_id.to_string(),
         csr_pem: csr_pem.clone(),
+        attestation_certificate_chain_pem: Vec::new(),
     };
 
     let resp = client
@@ -246,6 +245,7 @@ async fn test_http_enrollment_endpoint_lifecycle() {
         pairing_token: "invalid-token-12345".to_string(),
         node_id: node_id.to_string(),
         csr_pem,
+        attestation_certificate_chain_pem: Vec::new(),
     };
     let invalid_resp = client
         .post(format!("{base_url}/api/v1/enroll"))
@@ -332,6 +332,7 @@ async fn test_live_grpc_enrollment_and_subsequent_mtls_registration() {
         pairing_token: token_record.token.clone(),
         node_id: node_id.to_string(),
         csr_pem,
+        attestation_certificate_chain_pem: Vec::new(),
     });
 
     let enroll_res = enroll_client
@@ -493,6 +494,7 @@ async fn test_shared_tls_listener_allows_bootstrap_enrollment_and_enforces_opera
             pairing_token: token_record.token,
             csr_pem,
             node_id: node_id.to_string(),
+            attestation_certificate_chain_pem: Vec::new(),
         })
         .await
         .expect("Bootstrap EnrollmentService RPC must succeed without client cert")
@@ -609,4 +611,287 @@ async fn test_shared_tls_listener_allows_bootstrap_enrollment_and_enforces_opera
         .expect("Operator cert (OU=Control Plane) must succeed on AdminService")
         .into_inner();
     assert_eq!(list_res.nodes.len(), 1);
+}
+
+#[tokio::test]
+async fn test_enforce_hardware_attestation_integration_lifecycle() {
+    use androgrid_backend::pairing::attestation::AttestationSecurityLevel;
+    use androgrid_backend::HardwareAttestationVerifier;
+    use rcgen::CustomExtension;
+
+    let pki = TestClusterPki::generate();
+    let signer = Arc::new(CaSigner::from_pem(&pki.ca_cert_pem, &pki.ca_key_pem).unwrap());
+    let token_store = Arc::new(PairingTokenStore::default());
+    let scheduler = Arc::new(ClusterScheduler::new());
+
+    // Generate simulated Google/OEM Hardware Attestation Root CA
+    let mut attest_root_params = CertificateParams::default();
+    attest_root_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    attest_root_params.distinguished_name.push(
+        DnType::CommonName,
+        "Google Hardware Attestation Root CA Simulated",
+    );
+    let attest_root_key = KeyPair::generate().expect("Attest root key");
+    let attest_root_cert = attest_root_params
+        .self_signed(&attest_root_key)
+        .expect("Attest root cert");
+    let attest_root_spki = attest_root_key.public_key_der();
+
+    let verifier = Arc::new(HardwareAttestationVerifier::with_custom_roots(&[
+        attest_root_spki,
+    ]));
+
+    let enrollment_ctx = EnrollmentContext::with_hardware_attestation(
+        Arc::clone(&token_store),
+        Arc::clone(&signer),
+        true,  // STRICTLY ENFORCE HARDWARE ATTESTATION
+        false, // require_attestation_challenge
+        Some(verifier),
+    );
+
+    // 1. Spawn bootstrap enrollment listener
+    let enroll_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let enroll_addr = enroll_listener.local_addr().unwrap();
+    let enroll_stream = TcpListenerStream::new(enroll_listener);
+
+    let enrollment_service = EnrollmentServiceImpl::with_context(enrollment_ctx);
+
+    tokio::spawn(async move {
+        Server::builder()
+            .add_service(EnrollmentServiceServer::new(enrollment_service))
+            .serve_with_incoming(enroll_stream)
+            .await
+            .unwrap();
+    });
+
+    // 2. Spawn mTLS operational listener
+    let mtls_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mtls_addr = mtls_listener.local_addr().unwrap();
+    let mtls_stream = TcpListenerStream::new(mtls_listener);
+
+    let server_tls = build_server_mtls_config(
+        pki.server_cert_pem.as_bytes(),
+        pki.server_key_pem.as_bytes(),
+        pki.ca_cert_pem.as_bytes(),
+    );
+    let andro_service = AndroGridServiceImpl::new(Arc::clone(&scheduler));
+
+    tokio::spawn(async move {
+        Server::builder()
+            .tls_config(server_tls)
+            .unwrap()
+            .add_service(AndroGridServiceServer::new(andro_service))
+            .serve_with_incoming(mtls_stream)
+            .await
+            .unwrap();
+    });
+
+    let mut enroll_client = EnrollmentServiceClient::connect(format!("http://{enroll_addr}"))
+        .await
+        .unwrap();
+
+    // Scenario A: Software worker without attestation is rejected
+    let node_a = "worker-soft-no-chain";
+    let token_a = token_store
+        .generate_token(Some(node_a.to_string()), Some(300))
+        .unwrap();
+    let (csr_a, _key_a) = generate_client_csr(node_a);
+
+    let reject_no_chain = enroll_client
+        .enroll_worker(tonic::Request::new(
+            androgrid_backend::EnrollWorkerRequest {
+                pairing_token: token_a.token.clone(),
+                node_id: node_a.to_string(),
+                csr_pem: csr_a,
+                attestation_certificate_chain_pem: Vec::new(),
+            },
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert!(!reject_no_chain.success, "Software worker must be rejected");
+    assert!(
+        reject_no_chain
+            .error_message
+            .contains("Hardware attestation chain required"),
+        "Unexpected error: {}",
+        reject_no_chain.error_message
+    );
+
+    // Scenario B: Software worker with Software security level is rejected
+    let node_b = "worker-soft-attest";
+    let token_b = token_store
+        .generate_token(Some(node_b.to_string()), Some(300))
+        .unwrap();
+    let (csr_b, key_b) = generate_client_csr(node_b);
+
+    let soft_ext_der = build_test_key_description_der(
+        3,
+        AttestationSecurityLevel::Software,
+        4,
+        AttestationSecurityLevel::Software,
+        b"nonce-b",
+    );
+    let mut soft_leaf_params = CertificateParams::default();
+    soft_leaf_params
+        .distinguished_name
+        .push(DnType::CommonName, node_b);
+    soft_leaf_params
+        .custom_extensions
+        .push(CustomExtension::from_oid_content(
+            &[1, 3, 6, 1, 4, 1, 11129, 2, 1, 17],
+            soft_ext_der,
+        ));
+    let soft_leaf_cert = soft_leaf_params
+        .signed_by(&key_b, &attest_root_cert, &attest_root_key)
+        .unwrap();
+
+    let reject_soft_level = enroll_client
+        .enroll_worker(tonic::Request::new(
+            androgrid_backend::EnrollWorkerRequest {
+                pairing_token: token_b.token.clone(),
+                node_id: node_b.to_string(),
+                csr_pem: csr_b,
+                attestation_certificate_chain_pem: vec![
+                    soft_leaf_cert.pem(),
+                    attest_root_cert.pem(),
+                ],
+            },
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert!(
+        !reject_soft_level.success,
+        "Software level must be rejected"
+    );
+    assert!(
+        reject_soft_level
+            .error_message
+            .contains("Insecure attestation security level"),
+        "Unexpected error: {}",
+        reject_soft_level.error_message
+    );
+
+    // Scenario C: Worker presenting valid TEE hardware attestation chain succeeds
+    let node_c = "worker-tee-genuine";
+    let token_c = token_store
+        .generate_token(Some(node_c.to_string()), Some(300))
+        .unwrap();
+    let (csr_c, key_c) = generate_client_csr(node_c);
+
+    let tee_ext_der = build_test_key_description_der(
+        3,
+        AttestationSecurityLevel::TrustedEnvironment,
+        4,
+        AttestationSecurityLevel::TrustedEnvironment,
+        b"nonce-c",
+    );
+    let mut tee_leaf_params = CertificateParams::default();
+    tee_leaf_params
+        .distinguished_name
+        .push(DnType::CommonName, node_c);
+    tee_leaf_params
+        .custom_extensions
+        .push(CustomExtension::from_oid_content(
+            &[1, 3, 6, 1, 4, 1, 11129, 2, 1, 17],
+            tee_ext_der,
+        ));
+    let tee_leaf_cert = tee_leaf_params
+        .signed_by(&key_c, &attest_root_cert, &attest_root_key)
+        .unwrap();
+
+    let accept_tee = enroll_client
+        .enroll_worker(tonic::Request::new(
+            androgrid_backend::EnrollWorkerRequest {
+                pairing_token: token_c.token.clone(),
+                node_id: node_c.to_string(),
+                csr_pem: csr_c,
+                attestation_certificate_chain_pem: vec![
+                    tee_leaf_cert.pem(),
+                    attest_root_cert.pem(),
+                ],
+            },
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert!(
+        accept_tee.success,
+        "Genuine TEE worker must be accepted: {}",
+        accept_tee.error_message
+    );
+    assert!(!accept_tee.client_cert_pem.is_empty());
+
+    // Scenario D: The provisioned hardware worker connects over mTLS and registers
+    let client_tls = build_client_mtls_config(
+        accept_tee.client_cert_pem.as_bytes(),
+        key_c.serialize_pem().as_bytes(),
+        accept_tee.ca_cert_pem.as_bytes(),
+        "localhost",
+    );
+    let mtls_channel = tonic::transport::Endpoint::from_shared(format!("https://{mtls_addr}"))
+        .unwrap()
+        .tls_config(client_tls)
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+
+    let mut andro_client = AndroGridServiceClient::new(mtls_channel);
+    let reg_res = andro_client
+        .register_node(RegisterNodeRequest {
+            node_id: node_c.to_string(),
+            capabilities: Some(NodeCapabilities {
+                is_rooted: false,
+                supported_engines: vec![ExecutionEngine::WasmWasi as i32],
+                cpu_cores: 8,
+                total_ram_bytes: 8 * 1024 * 1024 * 1024,
+                os_version: "14".to_string(),
+                abi: "arm64-v8a".to_string(),
+                is_metered: false,
+                current_transport: NetworkTransportType::NetworkTransportWifiLan as i32,
+                max_cellular_task_duration_seconds: 180,
+                battery_temperature_celsius: 30,
+                thermal_status: 0,
+            }),
+            client_version: "0.1.0".to_string(),
+            labels: Default::default(),
+        })
+        .await
+        .expect("Hardware-attested worker must succeed in registering over mTLS")
+        .into_inner();
+
+    assert!(!reg_res.session_token.is_empty());
+    assert_eq!(reg_res.heartbeat_interval_seconds, 2);
+
+    // Scenario E: Rejection of oversized attestation chain (> 6 certificates)
+    let node_e = "worker-oversized-chain";
+    let token_e = token_store
+        .generate_token(Some(node_e.to_string()), Some(300))
+        .unwrap();
+    let (csr_e, _key_e) = generate_client_csr(node_e);
+    let mut oversized_chain = Vec::new();
+    for _ in 0..7 {
+        oversized_chain.push(attest_root_cert.pem());
+    }
+    let reject_oversized = enroll_client
+        .enroll_worker(tonic::Request::new(
+            androgrid_backend::EnrollWorkerRequest {
+                pairing_token: token_e.token.clone(),
+                node_id: node_e.to_string(),
+                csr_pem: csr_e,
+                attestation_certificate_chain_pem: oversized_chain,
+            },
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!reject_oversized.success);
+    assert!(reject_oversized
+        .error_message
+        .contains("exceeds maximum limit"));
 }
