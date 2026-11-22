@@ -251,6 +251,8 @@ message ClaimCellularTaskRequest {
   bool is_charging = 4;
   int32 battery_temperature_celsius = 5;
   uint32 thermal_status = 6; // Maps to Android PowerManager.THERMAL_STATUS_*
+  string client_version = 7;
+  LastUpgradeOutcome last_upgrade_outcome = 8;
 }
 
 // Response granting a cellular spot lease.
