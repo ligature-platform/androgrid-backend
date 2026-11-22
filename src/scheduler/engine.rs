@@ -2262,7 +2262,7 @@ fn record_node_upgrade_failure(
         }
     }
 
-    for (_rollout_key, rollout) in inner.active_rollouts.iter_mut() {
+    for rollout in inner.active_rollouts.values_mut() {
         if rollout.target_version == target_version {
             rollout.in_flight_node_ids.remove(node_id);
             rollout.failed_node_ids.insert(node_id.to_string());
