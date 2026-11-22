@@ -97,6 +97,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         warn!(error = %e, "Failed to reconcile active rollouts from durable store on startup");
     }
 
+    // Periodic lease sweeper for timed-out task leases and worker upgrade leases
+    let sweeper_scheduler = Arc::clone(&scheduler);
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
+        loop {
+            interval.tick().await;
+            let now_epoch_s = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            sweeper_scheduler.sweep_timed_out_leases(now_epoch_s);
+        }
+    });
+
     let artifact_store = if let Some(ref dir) = config.artifact_storage_dir {
         Arc::new(ArtifactStore::with_directory(dir))
     } else {
