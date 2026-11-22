@@ -2240,9 +2240,6 @@ impl ClusterScheduler {
             req.rollout_percentage.min(100)
         };
 
-        let mut inner = self.inner.write().expect("RwLock write lock poisoned");
-        let candidate_ids = resolve_target_node_ids(&inner, &req.node_group, &req.node_ids)?;
-
         let directive_template = NodeUpgradeDirective {
             target_version: target_version.clone(),
             apk_url: apk_url.clone(),
@@ -2253,22 +2250,24 @@ impl ClusterScheduler {
             drain_before_upgrade: req.drain_before_upgrade,
         };
 
-        let mut eligible_ids = Vec::new();
-        for nid in &candidate_ids {
-            if let Some(w) = inner.workers.get_mut(nid) {
-                if w.client_version == target_version {
-                    w.desired_client_version = None;
-                    w.upgrade_directive = None;
-                    w.upgrade_lease_deadline_ms = 0;
-                    if w.drained_for_upgrade {
-                        w.draining = false;
-                        w.drained_for_upgrade = false;
+        let now_epoch_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+
+        let (candidate_ids, eligible_ids) = {
+            let inner = self.inner.read().expect("RwLock read lock poisoned");
+            let cids = resolve_target_node_ids(&inner, &req.node_group, &req.node_ids)?;
+            let mut eids = Vec::new();
+            for nid in &cids {
+                if let Some(w) = inner.workers.get(nid) {
+                    if w.client_version != target_version {
+                        eids.push(nid.clone());
                     }
-                    continue;
                 }
-                eligible_ids.push(nid.clone());
             }
-        }
+            (cids, eids)
+        };
 
         let total_eligible = eligible_ids.len();
         let (active_cohort, staged_cohort): (Vec<String>, Vec<String>) = if rollout_strategy
@@ -2285,10 +2284,48 @@ impl ClusterScheduler {
             (eligible_ids.clone(), Vec::new())
         };
 
-        let now_epoch_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
+        let rollout_id = format!("rollout-{}-{}", target_version, now_epoch_ms);
+        let record = UpgradeRolloutRecord {
+            rollout_id: rollout_id.clone(),
+            target_version: target_version.clone(),
+            directive_template: directive_template.clone(),
+            rollout_strategy: if rollout_strategy == UpgradeRolloutStrategy::Rolling as i32 {
+                UpgradeRolloutStrategy::Rolling
+            } else {
+                UpgradeRolloutStrategy::Immediate
+            },
+            rollout_percentage: rollout_pct,
+            eligible_node_ids: eligible_ids.clone(),
+            in_flight_node_ids: active_cohort.iter().cloned().collect(),
+            completed_node_ids: HashSet::new(),
+            failed_node_ids: HashSet::new(),
+            staged_node_ids: staged_cohort.into_iter().collect(),
+            lease_timeout_seconds,
+            drain_before_upgrade: req.drain_before_upgrade,
+            is_halted: false,
+            halt_reason: None,
+            created_at_epoch_ms: now_epoch_ms,
+        };
+
+        // Persist to durable storage outside the RwLock write guard
+        self.rollout_store
+            .save_rollout(&record)
+            .map_err(|e| SchedulingError::StorageError(e.to_string()))?;
+
+        let mut inner = self.inner.write().expect("RwLock write lock poisoned");
+        for nid in &candidate_ids {
+            if let Some(w) = inner.workers.get_mut(nid) {
+                if w.client_version == target_version {
+                    w.desired_client_version = None;
+                    w.upgrade_directive = None;
+                    w.upgrade_lease_deadline_ms = 0;
+                    if w.drained_for_upgrade {
+                        w.draining = false;
+                        w.drained_for_upgrade = false;
+                    }
+                }
+            }
+        }
 
         let mut targeted = Vec::new();
         for nid in &active_cohort {
@@ -2304,36 +2341,7 @@ impl ClusterScheduler {
             }
         }
 
-        let rollout_key = if !req.node_group.is_empty() {
-            req.node_group.clone()
-        } else {
-            format!("nodes-{}", target_version)
-        };
-
-        let record = UpgradeRolloutRecord {
-            rollout_id: format!("rollout-{}-{}", target_version, now_epoch_ms),
-            target_version: target_version.clone(),
-            directive_template,
-            rollout_strategy: if rollout_strategy == UpgradeRolloutStrategy::Rolling as i32 {
-                UpgradeRolloutStrategy::Rolling
-            } else {
-                UpgradeRolloutStrategy::Immediate
-            },
-            rollout_percentage: rollout_pct,
-            eligible_node_ids: eligible_ids.clone(),
-            in_flight_node_ids: targeted.iter().cloned().collect(),
-            completed_node_ids: HashSet::new(),
-            failed_node_ids: HashSet::new(),
-            staged_node_ids: staged_cohort.into_iter().collect(),
-            lease_timeout_seconds,
-            drain_before_upgrade: req.drain_before_upgrade,
-            is_halted: false,
-            halt_reason: None,
-            created_at_epoch_ms: now_epoch_ms,
-        };
-
-        self.rollout_store.save_rollout(&record).ok();
-        inner.active_rollouts.insert(rollout_key, record);
+        inner.active_rollouts.insert(rollout_id, record);
 
         let count = targeted.len() as u32;
         let eligible_count = total_eligible as u32;
