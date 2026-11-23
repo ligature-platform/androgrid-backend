@@ -281,7 +281,6 @@ async fn test_http_benchmark_orchestrator_submission_and_lifecycle() {
         "https://api.staging.benchmark.org/get".to_string(),
     );
     env_vars.insert("METHOD".to_string(), "GET".to_string());
-    env_vars.insert("CONCURRENCY".to_string(), "4".to_string());
     env_vars.insert("DURATION_SECS".to_string(), "5".to_string());
     env_vars.insert("MAX_REQUESTS".to_string(), "100".to_string());
 
@@ -474,4 +473,41 @@ fn test_zero_unicode_dashes_in_http_benchmark_workload() {
     }
 
     check_dir(&workload_dir);
+}
+
+#[test]
+fn test_scheduler_rejects_hex_and_non_alphabetic_tld_egress() {
+    use androgrid_backend::scheduler::engine::validate_network_egress_policy_params;
+
+    // Hex IPv4 literals must be rejected because TLD is non-alphabetic
+    let hex_res = validate_network_egress_policy_params(
+        1, // WasmWasi
+        2, // Allowlist
+        &["0x7f.0x00.0x00.0x01".to_string()],
+        1024 * 1024,
+    );
+    assert!(hex_res.is_err(), "Hex IPv4 must be rejected");
+
+    let num_tld_res = validate_network_egress_policy_params(
+        1, // WasmWasi
+        2, // Allowlist
+        &["sub.domain.123".to_string()],
+        1024 * 1024,
+    );
+    assert!(num_tld_res.is_err(), "Numeric TLD must be rejected");
+
+    let valid_res = validate_network_egress_policy_params(
+        1, // WasmWasi
+        2, // Allowlist
+        &[
+            "api.example.com".to_string(),
+            "*.benchmarks.internal.org".to_string(),
+            "xn--p1ai.xn--80a0a5b.xn--p1ai".to_string(),
+        ],
+        1024 * 1024,
+    );
+    assert!(
+        valid_res.is_ok(),
+        "Valid alphabetic and punycode hostnames must be accepted"
+    );
 }

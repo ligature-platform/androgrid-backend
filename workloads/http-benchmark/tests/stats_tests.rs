@@ -157,3 +157,27 @@ fn test_json_and_tabular_formatting() {
     assert_eq!(deserialized.task_id, report.task_id);
     assert_eq!(deserialized.total_requests, report.total_requests);
 }
+
+#[test]
+fn test_metrics_collector_reservoir_sampling_cap() {
+    let mut collector = MetricsCollector::new();
+
+    // Insert 70,000 requests exceeding MAX_RESERVOIR_SAMPLES (65,536)
+    for i in 1..=70_000 {
+        collector.record_response(200, 64, (i % 500 + 1) * 1000);
+    }
+
+    let report = collector.finalize(
+        "task_reservoir".to_string(),
+        "https://example.com/api".to_string(),
+        "GET".to_string(),
+        10_000_000,
+        1024,
+    );
+
+    assert_eq!(report.total_requests, 70_000);
+    assert_eq!(report.successful_requests, 70_000);
+    assert!(report.latency_percentiles.min_ms >= 1.0);
+    assert!(report.latency_percentiles.max_ms <= 500.0);
+    assert!(report.latency_percentiles.mean_ms > 0.0);
+}

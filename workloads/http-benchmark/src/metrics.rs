@@ -226,18 +226,65 @@ impl BenchmarkReport {
     }
 }
 
+/// Maximum number of latency samples retained for percentile computation.
+///
+/// Prevents unbounded memory growth in long-running benchmarks via Algorithm R reservoir sampling.
+/// Traces to: [NFR-PERF-001]
+pub const MAX_RESERVOIR_SAMPLES: usize = 65_536;
+
+/// Minimal hermetic 64-bit XorShift pseudo-random number generator.
+///
+/// Provides deterministic zero-dependency PRNG for reservoir sampling in WASI contexts.
+#[derive(Debug)]
+struct SimpleRng {
+    state: u64,
+}
+
+impl SimpleRng {
+    fn new(seed: u64) -> Self {
+        Self {
+            state: if seed == 0 { 0x853c49e6748fea9b } else { seed },
+        }
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        let mut x = self.state;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.state = x;
+        x
+    }
+}
+
 /// Dynamic statistical metrics accumulator.
 ///
 /// Traces to: [NFR-PERF-001]
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct MetricsCollector {
     total_requests: u64,
     successful_requests: u64,
     status_codes: BTreeMap<String, u64>,
     errors: ErrorCounts,
     success_latencies_micros: Vec<u64>,
-    error_latencies_micros: Vec<u64>,
     total_bytes_received: u64,
+    sample_count: usize,
+    rng: SimpleRng,
+}
+
+impl Default for MetricsCollector {
+    fn default() -> Self {
+        Self {
+            total_requests: 0,
+            successful_requests: 0,
+            status_codes: BTreeMap::new(),
+            errors: ErrorCounts::default(),
+            success_latencies_micros: Vec::new(),
+            total_bytes_received: 0,
+            sample_count: 0,
+            rng: SimpleRng::new(0x2545F4914F6CDD1D),
+        }
+    }
 }
 
 impl MetricsCollector {
@@ -254,7 +301,17 @@ impl MetricsCollector {
         latency_micros: u64,
     ) {
         self.total_requests += 1;
-        self.success_latencies_micros.push(latency_micros);
+        self.sample_count += 1;
+
+        if self.success_latencies_micros.len() < MAX_RESERVOIR_SAMPLES {
+            self.success_latencies_micros.push(latency_micros);
+        } else {
+            let j = (self.rng.next_u64() % self.sample_count as u64) as usize;
+            if j < MAX_RESERVOIR_SAMPLES {
+                self.success_latencies_micros[j] = latency_micros;
+            }
+        }
+
         self.total_bytes_received += bytes_received as u64;
 
         if (200..=299).contains(&status_code) {
@@ -266,9 +323,8 @@ impl MetricsCollector {
     }
 
     /// Records a transport or security error.
-    pub fn record_error(&mut self, error: &TransportError, latency_micros: u64) {
+    pub fn record_error(&mut self, error: &TransportError, _latency_micros: u64) {
         self.total_requests += 1;
-        self.error_latencies_micros.push(latency_micros);
 
         match error {
             TransportError::IoFailure => self.errors.io_failure += 1,
@@ -287,7 +343,7 @@ impl MetricsCollector {
 
         latencies.sort_unstable();
         let len = latencies.len();
-        let sum: u64 = latencies.iter().sum();
+        let sum: u128 = latencies.iter().map(|&x| x as u128).sum();
         let mean_ms = (sum as f64 / len as f64) / 1000.0;
         let min_ms = latencies[0] as f64 / 1000.0;
         let max_ms = latencies[len - 1] as f64 / 1000.0;

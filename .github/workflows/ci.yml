@@ -44,6 +44,7 @@ jobs:
         run: |
           cargo test --manifest-path workloads/http-benchmark/Cargo.toml
           cargo build --manifest-path workloads/http-benchmark/Cargo.toml --target wasm32-wasip1 --release
+          cmp workloads/http-benchmark/target/wasm32-wasip1/release/http_benchmark.wasm tests/fixtures/wasm/http_benchmark.wasm
 
       - name: Verify Section 8 Gherkin BDD Acceptance Suite
         run: cargo test --test bdd_acceptance_spec
