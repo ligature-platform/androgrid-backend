@@ -323,7 +323,10 @@ async fn test_http_benchmark_orchestrator_submission_and_lifecycle() {
     assert_eq!(sync_res.desired_tasks.len(), 1);
     let assigned_task = &sync_res.desired_tasks[0];
     assert_eq!(assigned_task.task_id, task_id);
-    assert_eq!(assigned_task.egress_policy, NetworkEgressPolicy::Allowlist as i32);
+    assert_eq!(
+        assigned_task.egress_policy,
+        NetworkEgressPolicy::Allowlist as i32
+    );
     assert_eq!(
         assigned_task.allowed_hostnames,
         vec!["api.staging.benchmark.org".to_string()]
