@@ -52,14 +52,13 @@ Operators target specific node groups using the `node_group_affinity` field on `
 Below is an example submission utilizing the `androgrid` CLI to dispatch a distributed load generation TaskGroup:
 
 ```bash
-androgrid admin submit-task \
+androgrid submit \
+  --wasm target/wasm32-wasip1/release/http_load_generator.wasm \
   --entrypoint "_start" \
   --timeout 120 \
-  --engine wasm_wasi \
   --egress-policy allowlist \
   --allowed-hostnames "api.staging.target.com,*.loadtest.internal" \
-  --max-egress-bytes 10485760 \
-  --wasm-file target/wasm32-wasip1/release/http_load_generator.wasm
+  --max-egress-bytes 10485760
 ```
 
 ### Task Specification Details
