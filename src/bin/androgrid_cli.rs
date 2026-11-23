@@ -31,7 +31,7 @@ use androgrid_backend::{
 #[command(
     name = "androgrid-cli",
     about = "AndroGrid Operator Management CLI and Cluster Observability",
-    version = "0.1.0"
+    version = env!("CARGO_PKG_VERSION")
 )]
 struct Cli {
     /// gRPC control plane endpoint

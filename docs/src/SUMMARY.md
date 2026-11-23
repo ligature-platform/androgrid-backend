@@ -41,7 +41,7 @@
 
 # Alpha Testing & Hardware Verification
 
-- [Hardware Alpha Testing Guide - v0.0.1-alpha.4](testing/hardware_alpha_guide.md)
+- [Hardware Alpha Testing Guide - v0.0.1-alpha.5](testing/hardware_alpha_guide.md)
   - [Offline PKI & Hardware E2E Test Case](testing/cert_e2e_verification.md)
   - [OTA Hardware Verification Spike Report - v0.0.1-alpha.4](testing/ota_hardware_spike_report.md)
   - [WASM Network Egress Technical Spike Report](testing/wasm_network_egress_spike_report.md)

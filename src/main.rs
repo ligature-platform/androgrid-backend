@@ -28,7 +28,7 @@ use androgrid_backend::{
 #[command(
     name = "androgrid-backend",
     about = "AndroGrid Control Plane Orchestrator",
-    version = "0.1.0"
+    version = env!("CARGO_PKG_VERSION")
 )]
 struct ServerArgs {
     /// Allow scheduling of insecure root shell tasks (diagnostic / laboratory mode)
