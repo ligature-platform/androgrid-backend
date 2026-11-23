@@ -17,12 +17,16 @@ pub enum ConfigError {
     InvalidTargetUrlScheme(String),
     /// HTTP method is unsupported or invalid.
     InvalidMethod(String),
-    /// Concurrency value was invalid or non-positive.
-    InvalidConcurrency(String),
     /// Duration value was invalid or non-positive.
     InvalidDuration(String),
     /// Max requests value was invalid or non-positive.
     InvalidMaxRequests(String),
+    /// Task ID contains forbidden control characters.
+    InvalidTaskId(String),
+    /// Custom headers contain forbidden control characters or malformed lines.
+    InvalidHeaders(String),
+    /// Buffer size was invalid or out of allowed bounds.
+    InvalidBufferSize(String),
 }
 
 impl std::fmt::Display for ConfigError {
@@ -33,9 +37,13 @@ impl std::fmt::Display for ConfigError {
                 write!(f, "TARGET_URL '{url}' must start with http:// or https://")
             }
             Self::InvalidMethod(m) => write!(f, "Invalid HTTP method '{m}'"),
-            Self::InvalidConcurrency(c) => write!(f, "Invalid CONCURRENCY value '{c}'"),
             Self::InvalidDuration(d) => write!(f, "Invalid DURATION_SECS value '{d}'"),
             Self::InvalidMaxRequests(r) => write!(f, "Invalid MAX_REQUESTS value '{r}'"),
+            Self::InvalidTaskId(t) => {
+                write!(f, "TASK_ID '{t}' contains forbidden control characters")
+            }
+            Self::InvalidHeaders(h) => write!(f, "REQUEST_HEADERS invalid: {h}"),
+            Self::InvalidBufferSize(b) => write!(f, "Invalid BUFFER_SIZE value '{b}'"),
         }
     }
 }
@@ -51,8 +59,6 @@ pub struct BenchmarkConfig {
     pub target_url: String,
     /// HTTP method verb (GET, POST, PUT, DELETE, HEAD, PATCH). Default: "GET".
     pub method: String,
-    /// Number of simulated concurrent workers. Default: 4.
-    pub concurrency: usize,
     /// Total duration of the benchmark run in seconds. Default: 10.
     pub duration_secs: u64,
     /// Optional limit on total requests before stopping early.
@@ -71,8 +77,11 @@ impl BenchmarkConfig {
     /// Default response buffer size (64 KB) to bound linear memory usage.
     pub const DEFAULT_BUFFER_SIZE: usize = 65536;
 
-    /// Default concurrency level for virtual load generation.
-    pub const DEFAULT_CONCURRENCY: usize = 4;
+    /// Minimum allowed response buffer size (1 KB).
+    pub const MIN_BUFFER_SIZE: usize = 1024;
+
+    /// Maximum allowed response buffer size (4 MB).
+    pub const MAX_BUFFER_SIZE: usize = 4 * 1024 * 1024;
 
     /// Default load duration in seconds.
     pub const DEFAULT_DURATION_SECS: u64 = 10;
@@ -114,19 +123,6 @@ impl BenchmarkConfig {
             _ => "GET".to_string(),
         };
 
-        let concurrency = match vars.get("CONCURRENCY").map(|s| s.trim()) {
-            Some(c) if !c.is_empty() => {
-                let parsed = c
-                    .parse::<usize>()
-                    .map_err(|_| ConfigError::InvalidConcurrency(c.to_string()))?;
-                if parsed == 0 || parsed > 1024 {
-                    return Err(ConfigError::InvalidConcurrency(c.to_string()));
-                }
-                parsed
-            }
-            _ => Self::DEFAULT_CONCURRENCY,
-        };
-
         let duration_secs = match vars.get("DURATION_SECS").map(|s| s.trim()) {
             Some(d) if !d.is_empty() => {
                 let parsed = d
@@ -159,27 +155,66 @@ impl BenchmarkConfig {
             .filter(|s| !s.is_empty())
             .cloned();
 
-        let custom_headers = vars
-            .get("REQUEST_HEADERS")
-            .or_else(|| vars.get("HEADERS"))
-            .filter(|s| !s.is_empty())
-            .cloned();
-
-        let task_id = vars
+        let raw_task_id = vars
             .get("ANDROGRID_TASK_ID")
             .or_else(|| vars.get("TASK_ID"))
             .cloned()
             .unwrap_or_else(|| "task_local_bench".to_string());
 
+        if raw_task_id
+            .chars()
+            .any(|c| c == '\r' || c == '\n' || c == '\0')
+        {
+            return Err(ConfigError::InvalidTaskId(raw_task_id));
+        }
+        let task_id = raw_task_id;
+
+        let custom_headers = match vars.get("REQUEST_HEADERS").or_else(|| vars.get("HEADERS")) {
+            Some(raw) if !raw.trim().is_empty() => {
+                for line in raw.lines() {
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    if trimmed
+                        .chars()
+                        .any(|c| (c < ' ' && c != '\t') || c == '\x7f')
+                    {
+                        return Err(ConfigError::InvalidHeaders(
+                            "Control characters forbidden in headers".to_string(),
+                        ));
+                    }
+                    if !trimmed.contains(':') {
+                        return Err(ConfigError::InvalidHeaders(format!(
+                            "Header line missing colon: '{trimmed}'"
+                        )));
+                    }
+                }
+                Some(raw.clone())
+            }
+            _ => None,
+        };
+
         let buffer_size = match vars.get("BUFFER_SIZE").map(|s| s.trim()) {
-            Some(b) if !b.is_empty() => b.parse::<usize>().unwrap_or(Self::DEFAULT_BUFFER_SIZE),
+            Some(b) if !b.is_empty() => {
+                let parsed = b
+                    .parse::<usize>()
+                    .map_err(|_| ConfigError::InvalidBufferSize(b.to_string()))?;
+                if parsed < Self::MIN_BUFFER_SIZE || parsed > Self::MAX_BUFFER_SIZE {
+                    return Err(ConfigError::InvalidBufferSize(format!(
+                        "{parsed} outside bounds {}..={}",
+                        Self::MIN_BUFFER_SIZE,
+                        Self::MAX_BUFFER_SIZE
+                    )));
+                }
+                parsed
+            }
             _ => Self::DEFAULT_BUFFER_SIZE,
         };
 
         Ok(Self {
             target_url: trimmed_url.to_string(),
             method,
-            concurrency,
             duration_secs,
             max_requests,
             request_body,

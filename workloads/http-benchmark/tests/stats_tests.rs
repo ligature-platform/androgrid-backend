@@ -12,7 +12,6 @@ fn test_metrics_collector_empty() {
         "task_1".to_string(),
         "https://example.com/api".to_string(),
         "GET".to_string(),
-        4,
         1_000_000,
         0,
     );
@@ -37,7 +36,6 @@ fn test_metrics_collector_percentiles_calculation() {
         "task_100".to_string(),
         "https://example.com/api".to_string(),
         "GET".to_string(),
-        4,
         1_000_000, // 1 second
         5000,
     );
@@ -62,6 +60,37 @@ fn test_metrics_collector_percentiles_calculation() {
 }
 
 #[test]
+fn test_metrics_collector_error_latencies_do_not_skew_success_percentiles() {
+    let mut collector = MetricsCollector::new();
+
+    // 10 successful requests with 100ms latency
+    for _ in 0..10 {
+        collector.record_response(200, 50, 100_000);
+    }
+
+    // 10 error requests with fast 1ms failure
+    for _ in 0..10 {
+        collector.record_error(&TransportError::IoFailure, 1_000);
+    }
+
+    let report = collector.finalize(
+        "task_skew_test".to_string(),
+        "https://example.com/api".to_string(),
+        "GET".to_string(),
+        1_000_000,
+        1000,
+    );
+
+    assert_eq!(report.total_requests, 20);
+    assert_eq!(report.successful_requests, 10);
+    assert_eq!(report.errors.io_failure, 10);
+
+    // Percentiles must strictly reflect successful requests (100ms), NOT 1ms errors
+    assert!((report.latency_percentiles.min_ms - 100.0).abs() < 0.01);
+    assert!((report.latency_percentiles.p50_ms - 100.0).abs() < 0.01);
+}
+
+#[test]
 fn test_metrics_collector_error_breakdown() {
     let mut collector = MetricsCollector::new();
 
@@ -79,7 +108,6 @@ fn test_metrics_collector_error_breakdown() {
         "task_errors".to_string(),
         "https://example.com/api".to_string(),
         "GET".to_string(),
-        2,
         2_000_000,
         1000,
     );
@@ -107,7 +135,6 @@ fn test_json_and_tabular_formatting() {
         "task_fmt".to_string(),
         "https://example.com/api".to_string(),
         "GET".to_string(),
-        4,
         1_000_000,
         256,
     );

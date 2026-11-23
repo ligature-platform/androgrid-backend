@@ -84,8 +84,6 @@ pub struct BenchmarkReport {
     pub target_url: String,
     /// HTTP method verb.
     pub method: String,
-    /// Simulated concurrency worker count.
-    pub concurrency: usize,
     /// Total execution duration in seconds.
     pub duration_secs: f64,
     /// Total requests dispatched.
@@ -102,7 +100,7 @@ pub struct BenchmarkReport {
     pub status_codes: BTreeMap<String, u64>,
     /// Summary of network and sandbox error counts.
     pub errors: ErrorCounts,
-    /// Latency percentile distribution in milliseconds.
+    /// Latency percentile distribution of successful requests in milliseconds.
     pub latency_percentiles: LatencyPercentiles,
 }
 
@@ -112,18 +110,32 @@ impl BenchmarkReport {
     /// Traces to: [REQ-OP-002]
     pub fn format_tabular(&self) -> String {
         let mut out = String::with_capacity(1024);
-        out.push_str("================================================================================\n");
-        out.push_str("                     AndroGrid Distributed HTTP Benchmark                       \n");
-        out.push_str("================================================================================\n");
+        out.push_str(
+            "================================================================================\n",
+        );
+        out.push_str(
+            "                     AndroGrid Distributed HTTP Benchmark                       \n",
+        );
+        out.push_str(
+            "================================================================================\n",
+        );
         out.push_str(&format!("Task ID:             {}\n", self.task_id));
         out.push_str(&format!("Target URL:          {}\n", self.target_url));
         out.push_str(&format!("HTTP Method:         {}\n", self.method));
-        out.push_str(&format!("Concurrency:         {}\n", self.concurrency));
-        out.push_str(&format!("Duration:            {:.2}s\n", self.duration_secs));
+        out.push_str(&format!(
+            "Duration:            {:.2}s\n",
+            self.duration_secs
+        ));
         out.push_str(&format!("Total Requests:      {}\n", self.total_requests));
-        out.push_str(&format!("Successful (2xx):    {}\n", self.successful_requests));
+        out.push_str(&format!(
+            "Successful (2xx):    {}\n",
+            self.successful_requests
+        ));
         out.push_str(&format!("Total Errors:        {}\n", self.errors.total()));
-        out.push_str(&format!("Total Bytes:         {} bytes\n", self.total_bytes_transferred));
+        out.push_str(&format!(
+            "Total Bytes:         {} bytes\n",
+            self.total_bytes_transferred
+        ));
         out.push_str(&format!(
             "Throughput:          {:.2} req/sec ({:.2} KB/sec)\n",
             self.requests_per_sec,
@@ -140,31 +152,69 @@ impl BenchmarkReport {
         if self.errors.total() > 0 {
             out.push_str("\nError Breakdown:\n");
             if self.errors.io_failure > 0 {
-                out.push_str(&format!("  IO Failures (-1):            {}\n", self.errors.io_failure));
+                out.push_str(&format!(
+                    "  IO Failures (-1):            {}\n",
+                    self.errors.io_failure
+                ));
             }
             if self.errors.security_violation > 0 {
-                out.push_str(&format!("  Security Violations (-403):  {}\n", self.errors.security_violation));
+                out.push_str(&format!(
+                    "  Security Violations (-403):  {}\n",
+                    self.errors.security_violation
+                ));
             }
             if self.errors.buffer_too_small > 0 {
-                out.push_str(&format!("  Buffer Too Small (-413):     {}\n", self.errors.buffer_too_small));
+                out.push_str(&format!(
+                    "  Buffer Too Small (-413):     {}\n",
+                    self.errors.buffer_too_small
+                ));
             }
             if self.errors.quota_exceeded > 0 {
-                out.push_str(&format!("  Quota Exceeded (-429):       {}\n", self.errors.quota_exceeded));
+                out.push_str(&format!(
+                    "  Quota Exceeded (-429):       {}\n",
+                    self.errors.quota_exceeded
+                ));
             }
             if self.errors.other_errors > 0 {
-                out.push_str(&format!("  Other Errors:                {}\n", self.errors.other_errors));
+                out.push_str(&format!(
+                    "  Other Errors:                {}\n",
+                    self.errors.other_errors
+                ));
             }
         }
 
         out.push_str("\nLatency Distribution (ms):\n");
-        out.push_str(&format!("  Min:               {:.2} ms\n", self.latency_percentiles.min_ms));
-        out.push_str(&format!("  p50:               {:.2} ms\n", self.latency_percentiles.p50_ms));
-        out.push_str(&format!("  p90:               {:.2} ms\n", self.latency_percentiles.p90_ms));
-        out.push_str(&format!("  p95:               {:.2} ms\n", self.latency_percentiles.p95_ms));
-        out.push_str(&format!("  p99:               {:.2} ms\n", self.latency_percentiles.p99_ms));
-        out.push_str(&format!("  Max:               {:.2} ms\n", self.latency_percentiles.max_ms));
-        out.push_str(&format!("  Mean:              {:.2} ms\n", self.latency_percentiles.mean_ms));
-        out.push_str("================================================================================\n");
+        out.push_str(&format!(
+            "  Min:               {:.2} ms\n",
+            self.latency_percentiles.min_ms
+        ));
+        out.push_str(&format!(
+            "  p50:               {:.2} ms\n",
+            self.latency_percentiles.p50_ms
+        ));
+        out.push_str(&format!(
+            "  p90:               {:.2} ms\n",
+            self.latency_percentiles.p90_ms
+        ));
+        out.push_str(&format!(
+            "  p95:               {:.2} ms\n",
+            self.latency_percentiles.p95_ms
+        ));
+        out.push_str(&format!(
+            "  p99:               {:.2} ms\n",
+            self.latency_percentiles.p99_ms
+        ));
+        out.push_str(&format!(
+            "  Max:               {:.2} ms\n",
+            self.latency_percentiles.max_ms
+        ));
+        out.push_str(&format!(
+            "  Mean:              {:.2} ms\n",
+            self.latency_percentiles.mean_ms
+        ));
+        out.push_str(
+            "================================================================================\n",
+        );
         out
     }
 
@@ -185,7 +235,8 @@ pub struct MetricsCollector {
     successful_requests: u64,
     status_codes: BTreeMap<String, u64>,
     errors: ErrorCounts,
-    latencies_micros: Vec<u64>,
+    success_latencies_micros: Vec<u64>,
+    error_latencies_micros: Vec<u64>,
     total_bytes_received: u64,
 }
 
@@ -196,9 +247,14 @@ impl MetricsCollector {
     }
 
     /// Records a completed HTTP response.
-    pub fn record_response(&mut self, status_code: u16, bytes_received: usize, latency_micros: u64) {
+    pub fn record_response(
+        &mut self,
+        status_code: u16,
+        bytes_received: usize,
+        latency_micros: u64,
+    ) {
         self.total_requests += 1;
-        self.latencies_micros.push(latency_micros);
+        self.success_latencies_micros.push(latency_micros);
         self.total_bytes_received += bytes_received as u64;
 
         if (200..=299).contains(&status_code) {
@@ -212,7 +268,7 @@ impl MetricsCollector {
     /// Records a transport or security error.
     pub fn record_error(&mut self, error: &TransportError, latency_micros: u64) {
         self.total_requests += 1;
-        self.latencies_micros.push(latency_micros);
+        self.error_latencies_micros.push(latency_micros);
 
         match error {
             TransportError::IoFailure => self.errors.io_failure += 1,
@@ -247,8 +303,8 @@ impl MetricsCollector {
                 latencies[lower] as f64 / 1000.0
             } else {
                 let weight = rank - lower as f64;
-                let val = (latencies[lower] as f64 * (1.0 - weight))
-                    + (latencies[upper] as f64 * weight);
+                let val =
+                    (latencies[lower] as f64 * (1.0 - weight)) + (latencies[upper] as f64 * weight);
                 val / 1000.0
             }
         };
@@ -270,7 +326,6 @@ impl MetricsCollector {
         task_id: String,
         target_url: String,
         method: String,
-        concurrency: usize,
         total_duration_micros: u128,
         total_bytes_sent: u64,
     ) -> BenchmarkReport {
@@ -279,13 +334,12 @@ impl MetricsCollector {
         let requests_per_sec = self.total_requests as f64 / duration_secs;
         let bytes_per_sec = total_bytes_transferred as f64 / duration_secs;
 
-        let latency_percentiles = Self::calculate_percentiles(self.latencies_micros);
+        let latency_percentiles = Self::calculate_percentiles(self.success_latencies_micros);
 
         BenchmarkReport {
             task_id,
             target_url,
             method,
-            concurrency,
             duration_secs,
             total_requests: self.total_requests,
             successful_requests: self.successful_requests,

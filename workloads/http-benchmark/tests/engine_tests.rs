@@ -20,7 +20,7 @@ fn test_engine_executes_max_requests() {
     let config = BenchmarkConfig::from_map(&vars).unwrap();
 
     let mut transport = MockHttpTransport::new();
-    transport.set_default_success(200, b"{\"status\": \"ok\"}", 5_000);
+    transport.set_default_success(200, 100, 5_000);
 
     let mut engine = BenchmarkEngine::new(&config, &mut transport);
     let report = engine.run();
@@ -32,7 +32,7 @@ fn test_engine_executes_max_requests() {
 }
 
 #[test]
-fn test_engine_idempotency_key_injection_for_mutating_verbs() {
+fn test_engine_idempotency_key_injection_for_mutating_verbs_with_sequence() {
     let mut vars = HashMap::new();
     vars.insert(
         "TARGET_URL".to_string(),
@@ -41,18 +41,27 @@ fn test_engine_idempotency_key_injection_for_mutating_verbs() {
     vars.insert("METHOD".to_string(), "POST".to_string());
     vars.insert("TASK_ID".to_string(), "task_alpha_42".to_string());
     vars.insert("BODY".to_string(), "{\"load\": 1}".to_string());
-    vars.insert("MAX_REQUESTS".to_string(), "1".to_string());
+    vars.insert("MAX_REQUESTS".to_string(), "2".to_string());
 
     let config = BenchmarkConfig::from_map(&vars).unwrap();
 
     let mut transport = MockHttpTransport::new();
-    let engine = BenchmarkEngine::new(&config, &mut transport);
-    let req = engine.build_request();
+    transport.set_default_success(201, 50, 1000);
 
-    assert_eq!(req.method, "POST");
-    assert!(req.headers.contains("Idempotency-Key: task_alpha_42"));
-    assert!(req.headers.contains("Content-Type: application/json"));
-    assert_eq!(req.body, b"{\"load\": 1}");
+    let mut engine = BenchmarkEngine::new(&config, &mut transport);
+    let report = engine.run();
+
+    assert_eq!(report.total_requests, 2);
+    assert_eq!(transport.recorded_requests.len(), 2);
+
+    let req1 = &transport.recorded_requests[0];
+    assert_eq!(req1.method, "POST");
+    assert!(req1.headers.contains("Idempotency-Key: task_alpha_42:1"));
+    assert!(req1.headers.contains("Content-Type: application/json"));
+    assert_eq!(req1.body, b"{\"load\": 1}");
+
+    let req2 = &transport.recorded_requests[1];
+    assert!(req2.headers.contains("Idempotency-Key: task_alpha_42:2"));
 }
 
 #[test]
@@ -69,7 +78,7 @@ fn test_engine_get_does_not_inject_idempotency_key() {
 
     let mut transport = MockHttpTransport::new();
     let engine = BenchmarkEngine::new(&config, &mut transport);
-    let req = engine.build_request();
+    let req = engine.build_request(1);
 
     assert_eq!(req.method, "GET");
     assert!(!req.headers.contains("Idempotency-Key:"));
@@ -77,28 +86,50 @@ fn test_engine_get_does_not_inject_idempotency_key() {
 }
 
 #[test]
-fn test_engine_handles_transport_errors_cleanly() {
+fn test_engine_aborts_immediately_on_fatal_quota_or_security_error() {
     let mut vars = HashMap::new();
     vars.insert(
         "TARGET_URL".to_string(),
         "https://httpbin.org/get".to_string(),
     );
-    vars.insert("MAX_REQUESTS".to_string(), "4".to_string());
+    vars.insert("MAX_REQUESTS".to_string(), "100".to_string());
 
     let config = BenchmarkConfig::from_map(&vars).unwrap();
 
     let mut transport = MockHttpTransport::new();
-    transport.queue_response(200, b"OK", 1000);
-    transport.queue_error(TransportError::SecurityViolation);
-    transport.queue_error(TransportError::BufferTooSmall);
+    transport.queue_response(200, 10, 1000);
     transport.queue_error(TransportError::QuotaExceeded);
+    // Even though 100 requests were configured, it must break immediately on QuotaExceeded
+    transport.queue_response(200, 10, 1000);
 
     let mut engine = BenchmarkEngine::new(&config, &mut transport);
     let report = engine.run();
 
-    assert_eq!(report.total_requests, 4);
+    assert_eq!(report.total_requests, 2);
     assert_eq!(report.successful_requests, 1);
-    assert_eq!(report.errors.security_violation, 1);
-    assert_eq!(report.errors.buffer_too_small, 1);
     assert_eq!(report.errors.quota_exceeded, 1);
+}
+
+#[test]
+fn test_engine_aborts_on_ten_consecutive_io_errors() {
+    let mut vars = HashMap::new();
+    vars.insert(
+        "TARGET_URL".to_string(),
+        "https://httpbin.org/get".to_string(),
+    );
+    vars.insert("MAX_REQUESTS".to_string(), "100".to_string());
+
+    let config = BenchmarkConfig::from_map(&vars).unwrap();
+
+    let mut transport = MockHttpTransport::new();
+    for _ in 0..20 {
+        transport.queue_error(TransportError::IoFailure);
+    }
+
+    let mut engine = BenchmarkEngine::new(&config, &mut transport);
+    let report = engine.run();
+
+    // Must break at 10 consecutive failures, not execute all 100
+    assert_eq!(report.total_requests, 10);
+    assert_eq!(report.errors.io_failure, 10);
 }

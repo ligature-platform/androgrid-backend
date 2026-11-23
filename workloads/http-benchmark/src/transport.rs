@@ -33,13 +33,13 @@ pub struct HttpRequest {
 
 /// Outbound HTTP execution response returned from the transport.
 ///
-/// Traces to: [REQ-OP-002], [INV-006]
+/// Zero-heap response record avoiding payload buffer copying in the benchmark hot loop.
+///
+/// Traces to: [REQ-OP-002], [INV-006], [NFR-PERF-001]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HttpResponse {
     /// HTTP response status code (e.g. 200, 404, 500).
     pub status_code: u16,
-    /// Response payload bytes written by host.
-    pub body_bytes: Vec<u8>,
     /// Exact byte count written into buffer.
     pub bytes_written: usize,
     /// Measured request round-trip latency in microseconds.
@@ -53,7 +53,7 @@ pub struct HttpResponse {
 pub enum TransportError {
     /// Remote network connection failure, TCP timeout, or DNS lookup error.
     IoFailure,
-    /// Egress security violation (SSRF, disallowed IP, unlisted hostname, metered route).
+    /// Egress security policy violation (SSRF, disallowed IP, unlisted hostname, metered route).
     SecurityViolation,
     /// Response payload exceeded buffer capacity.
     BufferTooSmall,
@@ -63,18 +63,34 @@ pub enum TransportError {
     Unknown(i32),
 }
 
+impl TransportError {
+    /// Indicates whether the error is fatal and cannot recover with retries.
+    pub fn is_fatal(&self) -> bool {
+        matches!(self, Self::SecurityViolation | Self::QuotaExceeded)
+    }
+}
+
 impl fmt::Display for TransportError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::IoFailure => write!(f, "Network I/O failure (ERR_IO_FAILURE: -1)"),
             Self::SecurityViolation => {
-                write!(f, "Egress security policy violation (ERR_SECURITY_VIOLATION: -403)")
+                write!(
+                    f,
+                    "Egress security policy violation (ERR_SECURITY_VIOLATION: -403)"
+                )
             }
             Self::BufferTooSmall => {
-                write!(f, "Response buffer capacity exceeded (ERR_BUFFER_TOO_SMALL: -413)")
+                write!(
+                    f,
+                    "Response buffer capacity exceeded (ERR_BUFFER_TOO_SMALL: -413)"
+                )
             }
             Self::QuotaExceeded => {
-                write!(f, "Cumulative egress byte quota exceeded (ERR_QUOTA_EXCEEDED: -429)")
+                write!(
+                    f,
+                    "Cumulative egress byte quota exceeded (ERR_QUOTA_EXCEEDED: -429)"
+                )
             }
             Self::Unknown(code) => write!(f, "Unknown transport error code: {code}"),
         }
@@ -176,10 +192,8 @@ impl HttpTransport for WasiHttpTransport {
 
             if status >= 100 {
                 let written = (bytes_written.max(0) as usize).min(self.buffer.len());
-                let body_slice = self.buffer[..written].to_vec();
                 Ok(HttpResponse {
                     status_code: status as u16,
-                    body_bytes: body_slice,
                     bytes_written: written,
                     latency_micros,
                 })
@@ -192,6 +206,7 @@ impl HttpTransport for WasiHttpTransport {
         {
             let _ = request;
             let _ = start_time;
+            let _ = &self.buffer;
             Err(TransportError::IoFailure)
         }
     }
@@ -220,13 +235,12 @@ impl MockHttpTransport {
     pub fn queue_response(
         &mut self,
         status_code: u16,
-        body: &[u8],
+        bytes_written: usize,
         latency_micros: u64,
     ) -> &mut Self {
         self.canned_responses.push(Ok(HttpResponse {
             status_code,
-            body_bytes: body.to_vec(),
-            bytes_written: body.len(),
+            bytes_written,
             latency_micros,
         }));
         self
@@ -242,13 +256,12 @@ impl MockHttpTransport {
     pub fn set_default_success(
         &mut self,
         status_code: u16,
-        body: &[u8],
+        bytes_written: usize,
         latency_micros: u64,
     ) -> &mut Self {
         self.default_response = Some(Ok(HttpResponse {
             status_code,
-            body_bytes: body.to_vec(),
-            bytes_written: body.len(),
+            bytes_written,
             latency_micros,
         }));
         self
@@ -268,7 +281,6 @@ impl HttpTransport for MockHttpTransport {
         } else {
             Ok(HttpResponse {
                 status_code: 200,
-                body_bytes: b"OK".to_vec(),
                 bytes_written: 2,
                 latency_micros: 1000,
             })

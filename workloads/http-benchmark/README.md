@@ -3,7 +3,7 @@
 ## 1. Executive Summary & Overview
 This directory contains the canonical WebAssembly (WASI Preview 1) distributed HTTP/HTTPS load testing benchmark workload for AndroGrid. It provides an immediate, tangible demonstration that proves the platform's core capability: executing sandboxed computations across mobile devices with real network I/O.
 
-Similar in function to `hey` or `wrk`, this workload runs in the Chicory WASI sandbox on mobile workers, issues concurrent HTTP GET/POST/PUT/DELETE requests to target URLs permitted by the orchestrator egress allowlist, computes nanosecond-precision latency percentiles (min, p50, p90, p95, p99, max), and emits structured tabular and JSON reports to standard output.
+Similar in function to `hey` or `wrk`, this workload runs in the Chicory WASI sandbox on mobile workers, issues sequential HTTP GET/POST/PUT/DELETE requests to target URLs permitted by the orchestrator egress allowlist, computes nanosecond-precision latency percentiles (min, p50, p90, p95, p99, max), and emits structured tabular and JSON reports to standard output. Horizontal concurrency across the cluster is achieved via orchestrator TaskGroup partitioning.
 
 Traces to: AG-SPEC-2026-V2, [REQ-OP-002], [REQ-OP-003], [INV-001], [INV-006], [NFR-PERF-001], ADR-011
 
@@ -18,7 +18,7 @@ Traces to: AG-SPEC-2026-V2, [REQ-OP-002], [REQ-OP-003], [INV-001], [INV-006], [N
 | **Network Egress** | `androgrid_net:http_fetch` host module | [INV-001], ADR-011 |
 | **Memory Bound** | < 16 MB peak linear memory usage | [NFR-PERF-001] |
 | **Binary Size** | < 500 KB release bytecode payload | [NFR-PERF-001] |
-| **Idempotency** | Injects `Idempotency-Key: <task_id>` on mutating methods | ADR-011 |
+| **Idempotency** | Injects `Idempotency-Key: <task_id>:<seq>` on mutating methods | ADR-011 |
 
 ---
 
@@ -30,12 +30,11 @@ The workload reads runtime parameters via standard environment variables:
 | :--- | :--- | :--- | :--- |
 | `TARGET_URL` | Yes | None | Destination endpoint URL (e.g. `https://httpbin.org/get`). Must use `http://` or `https://`. |
 | `METHOD` | No | `GET` | HTTP verb: `GET`, `POST`, `PUT`, `DELETE`, `HEAD`, `PATCH`. |
-| `CONCURRENCY` | No | `4` | Number of simulated concurrent workers (1 to 1024). |
 | `DURATION_SECS` | No | `10` | Total duration of the load generation window in seconds. |
 | `MAX_REQUESTS` | No | Unlimited | Optional maximum number of requests to execute before stopping. |
 | `REQUEST_BODY` | No | Empty | Request body string sent with mutating methods (`POST`, `PUT`, `PATCH`). |
 | `REQUEST_HEADERS` | No | Empty | Newline-delimited list of custom headers (`Header-Name: Value`). |
-| `BUFFER_SIZE` | No | `65536` | Maximum response buffer capacity (64 KB default). |
+| `BUFFER_SIZE` | No | `65536` | Maximum response buffer capacity (1 KB to 4 MB allowed, 64 KB default). |
 | `ANDROGRID_TASK_ID` | No | `task_local_bench` | Task identifier used to populate `Idempotency-Key` headers. |
 
 ---
@@ -76,7 +75,6 @@ androgrid submit \
   --max-egress-bytes 10485760 \
   --env TARGET_URL=https://api.staging.target.com/get \
   --env METHOD=GET \
-  --env CONCURRENCY=4 \
   --env DURATION_SECS=10
 ```
 
@@ -98,7 +96,6 @@ The workload writes a human-readable tabular summary and a machine-readable JSON
 Task ID:             task_bench_001
 Target URL:          https://api.staging.target.com/get
 HTTP Method:         GET
-Concurrency:         4
 Duration:            10.02s
 Total Requests:      150
 Successful (2xx):    150
@@ -123,7 +120,6 @@ JSON Report:
   "task_id": "task_bench_001",
   "target_url": "https://api.staging.target.com/get",
   "method": "GET",
-  "concurrency": 4,
   "duration_secs": 10.02,
   "total_requests": 150,
   "successful_requests": 150,
