@@ -1277,12 +1277,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     WasiValidator::validate_egress_policy(&meta, egress_policy_val)
                         .map_err(|e| format!("Network egress policy validation failed: {e}"))?;
 
-                    if egress_policy_val == NetworkEgressPolicy::Blocked as i32 {
-                        if !allowed_hostnames.is_empty() || max_egress_bytes > 0 {
-                            return Err(
-                                "Cannot specify --allowed-hostnames or --max-egress-bytes when --egress-policy is blocked".into(),
-                            );
-                        }
+                    if egress_policy_val == NetworkEgressPolicy::Blocked as i32
+                        && (!allowed_hostnames.is_empty() || max_egress_bytes > 0)
+                    {
+                        return Err(
+                            "Cannot specify --allowed-hostnames or --max-egress-bytes when --egress-policy is blocked".into(),
+                        );
                     }
 
                     let sha256_hex = meta.artifact_sha256;
@@ -1832,12 +1832,12 @@ async fn resolve_group_template(
         WasiValidator::validate_egress_policy(&meta, egress_policy)
             .map_err(|e| format!("Network egress policy validation failed: {e}"))?;
 
-        if egress_policy == NetworkEgressPolicy::Blocked as i32 {
-            if !allowed_hostnames.is_empty() || max_egress_bytes > 0 {
-                return Err(
-                    "Cannot specify --allowed-hostnames or --max-egress-bytes when --egress-policy is blocked".into(),
-                );
-            }
+        if egress_policy == NetworkEgressPolicy::Blocked as i32
+            && (!allowed_hostnames.is_empty() || max_egress_bytes > 0)
+        {
+            return Err(
+                "Cannot specify --allowed-hostnames or --max-egress-bytes when --egress-policy is blocked".into(),
+            );
         }
 
         let sha256_hex = meta.artifact_sha256;
