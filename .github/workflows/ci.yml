@@ -26,6 +26,7 @@ jobs:
         uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
         with:
           components: clippy, rustfmt
+          targets: wasm32-wasip1
 
       - name: Cache Cargo Dependencies
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
@@ -38,6 +39,11 @@ jobs:
 
       - name: Execute Unit and Property Tests
         run: cargo test --all-targets
+
+      - name: Verify HTTP Benchmark WASM Workload
+        run: |
+          cargo test --manifest-path workloads/http-benchmark/Cargo.toml
+          cargo build --manifest-path workloads/http-benchmark/Cargo.toml --target wasm32-wasip1 --release
 
       - name: Verify Section 8 Gherkin BDD Acceptance Suite
         run: cargo test --test bdd_acceptance_spec
@@ -54,7 +60,7 @@ jobs:
       - name: Audit Typographic Standards (Zero Em/En Dashes)
         run: |
           echo "Scanning for forbidden em dashes and en dashes..."
-          if grep -rnP '[\x{2013}\x{2014}]' src/ tests/ proto/ deploy/ tools/ docs/; then
+          if grep -rnP '[\x{2013}\x{2014}]' src/ tests/ proto/ deploy/ tools/ docs/ workloads/; then
             echo "Error: Forbidden em dash or en dash detected!"
             exit 1
           fi
