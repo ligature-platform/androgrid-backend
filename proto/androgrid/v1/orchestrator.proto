@@ -518,6 +518,9 @@ message TaskTemplate {
   string shell_command = 6;
   bool requires_unmetered = 7;
   string node_group_affinity = 8;
+  NetworkEgressPolicy egress_policy = 9;
+  repeated string allowed_hostnames = 10;
+  uint64 max_egress_bytes = 11;
 }
 
 // Per-partition environment overrides within a TaskGroup.

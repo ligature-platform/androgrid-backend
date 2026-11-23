@@ -19,10 +19,10 @@ use androgrid_backend::{
     BenchmarkDispatcher, BenchmarkFilter, CaSource, CancelTaskGroupRequest, CancelTaskRequest,
     CreateNodeGroupRequest, DrainNodesRequest, ExecutionEngine, GeneratePairingTokenRequest,
     GetTaskGroupStatusRequest, GetTaskStatusRequest, ListNodeGroupsRequest, ListTaskGroupsRequest,
-    ListTasksRequest, ListWorkerNodesRequest, PkiInitConfig, PkiIssueAdminConfig,
-    PkiIssueCsrConfig, PkiIssueServerConfig, PkiOperationSummary, ReplaceStrategy,
-    ReplaceTaskGroupRequest, SubmitTaskGroupRequest, SubmitTaskRequest, TaskGroupSpec,
-    TaskGroupState, TaskPartitionSpec, TaskSpec, TaskState, TaskTemplate, TerminalGuard, TuiAction,
+    ListTasksRequest, ListWorkerNodesRequest, NetworkEgressPolicy, PkiInitConfig,
+    PkiIssueAdminConfig, PkiIssueCsrConfig, PkiIssueServerConfig, PkiOperationSummary,
+    ReplaceStrategy, ReplaceTaskGroupRequest, SubmitTaskGroupRequest, SubmitTaskRequest,
+    TaskGroupSpec, TaskGroupState, TaskPartitionSpec, TaskSpec, TaskState, TaskTemplate, TerminalGuard, TuiAction,
     TuiApp, UpdateNodeGroupRequest, UpgradeNetworkPolicy, UpgradeNodesRequest,
     UpgradeRolloutStrategy, UploadArtifactRequest, WasiValidator,
 };
@@ -126,6 +126,18 @@ enum Commands {
         /// Optional target NodeGroup affinity for scheduling
         #[arg(long)]
         node_group: Option<String>,
+
+        /// Network egress policy: blocked (default) or allowlist
+        #[arg(long, default_value = "blocked")]
+        egress_policy: String,
+
+        /// Allowed hostnames for outbound HTTP/HTTPS network egress (repeatable or comma-separated)
+        #[arg(long, value_delimiter = ',')]
+        allowed_hostnames: Vec<String>,
+
+        /// Maximum cumulative outbound and inbound network egress bytes
+        #[arg(long, default_value_t = 0)]
+        max_egress_bytes: u64,
     },
 
     /// Query the status and output of a specific task
@@ -407,6 +419,18 @@ enum GroupCommands {
         /// Optional target NodeGroup affinity for scheduling
         #[arg(long)]
         node_group: Option<String>,
+
+        /// Network egress policy: blocked (default) or allowlist
+        #[arg(long, default_value = "blocked")]
+        egress_policy: String,
+
+        /// Allowed hostnames for outbound HTTP/HTTPS network egress (repeatable or comma-separated)
+        #[arg(long, value_delimiter = ',')]
+        allowed_hostnames: Vec<String>,
+
+        /// Maximum cumulative outbound and inbound network egress bytes
+        #[arg(long, default_value_t = 0)]
+        max_egress_bytes: u64,
     },
 
     /// Atomically replace a TaskGroup workload with a new epoch
@@ -458,6 +482,18 @@ enum GroupCommands {
         /// Optional target NodeGroup affinity for scheduling
         #[arg(long)]
         node_group: Option<String>,
+
+        /// Network egress policy: blocked (default) or allowlist
+        #[arg(long, default_value = "blocked")]
+        egress_policy: String,
+
+        /// Allowed hostnames for outbound HTTP/HTTPS network egress (repeatable or comma-separated)
+        #[arg(long, value_delimiter = ',')]
+        allowed_hostnames: Vec<String>,
+
+        /// Maximum cumulative outbound and inbound network egress bytes
+        #[arg(long, default_value_t = 0)]
+        max_egress_bytes: u64,
     },
 
     /// Cancel an active or draining TaskGroup
@@ -631,6 +667,17 @@ fn parse_key_val(s: &str) -> Result<(String, String), String> {
     s.split_once('=')
         .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
         .ok_or_else(|| format!("Invalid environment variable format '{s}': expected KEY=VALUE"))
+}
+
+/// Parses network egress policy string into enum integer.
+fn parse_egress_policy_flag(s: &str) -> Result<i32, String> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "blocked" | "block" | "none" | "0" => Ok(NetworkEgressPolicy::Blocked as i32),
+        "allowlist" | "allowed" | "1" => Ok(NetworkEgressPolicy::Allowlist as i32),
+        other => Err(format!(
+            "invalid egress policy '{other}': expected 'blocked' or 'allowlist'"
+        )),
+    }
 }
 
 #[derive(Serialize)]
@@ -1200,7 +1247,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             artifact_url,
             env,
             node_group,
+            egress_policy,
+            allowed_hostnames,
+            max_egress_bytes,
         } => {
+            let egress_policy_val = parse_egress_policy_flag(&egress_policy)?;
             let actual_task_id = task_id.unwrap_or_else(|| {
                 let millis = SystemTime::now()
                     .duration_since(SystemTime::UNIX_EPOCH)
@@ -1287,9 +1338,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 group_id: String::new(),
                 group_epoch: 0,
                 node_group_affinity: node_group.unwrap_or_default(),
-                egress_policy: 0,
-                allowed_hostnames: Vec::new(),
-                max_egress_bytes: 0,
+                egress_policy: egress_policy_val,
+                allowed_hostnames,
+                max_egress_bytes,
             };
 
             let response = client
@@ -1729,6 +1780,9 @@ struct GroupTemplateArgs {
     requires_unmetered: bool,
     env: Vec<(String, String)>,
     node_group: Option<String>,
+    egress_policy: i32,
+    allowed_hostnames: Vec<String>,
+    max_egress_bytes: u64,
 }
 
 async fn resolve_group_template(
@@ -1748,6 +1802,9 @@ async fn resolve_group_template(
         requires_unmetered,
         env,
         node_group,
+        egress_policy,
+        allowed_hostnames,
+        max_egress_bytes,
     } = args;
     let (engine, shell_command, artifact_sha256) = if let Some(wasm_path) = wasm {
         let bytecode = tokio::fs::read(&wasm_path).await.map_err(|e| {
@@ -1790,6 +1847,9 @@ async fn resolve_group_template(
         shell_command,
         requires_unmetered,
         node_group_affinity: node_group.unwrap_or_default(),
+        egress_policy,
+        allowed_hostnames,
+        max_egress_bytes,
     })
 }
 
@@ -1914,7 +1974,11 @@ async fn handle_group_command(
             requires_unmetered,
             env,
             node_group,
+            egress_policy,
+            allowed_hostnames,
+            max_egress_bytes,
         } => {
+            let egress_policy_val = parse_egress_policy_flag(&egress_policy)?;
             let template = resolve_group_template(
                 client,
                 endpoint,
@@ -1930,6 +1994,9 @@ async fn handle_group_command(
                     requires_unmetered,
                     env,
                     node_group,
+                    egress_policy: egress_policy_val,
+                    allowed_hostnames,
+                    max_egress_bytes,
                 },
             )
             .await?;
@@ -1974,6 +2041,9 @@ async fn handle_group_command(
             requires_unmetered,
             env,
             node_group,
+            egress_policy,
+            allowed_hostnames,
+            max_egress_bytes,
         } => {
             let strat = match strategy.to_ascii_lowercase().as_str() {
                 "immediate" => ReplaceStrategy::Immediate as i32,
@@ -1986,6 +2056,7 @@ async fn handle_group_command(
                     .into());
                 }
             };
+            let egress_policy_val = parse_egress_policy_flag(&egress_policy)?;
             let template = resolve_group_template(
                 client,
                 endpoint,
@@ -2001,6 +2072,9 @@ async fn handle_group_command(
                     requires_unmetered,
                     env,
                     node_group,
+                    egress_policy: egress_policy_val,
+                    allowed_hostnames,
+                    max_egress_bytes,
                 },
             )
             .await?;
