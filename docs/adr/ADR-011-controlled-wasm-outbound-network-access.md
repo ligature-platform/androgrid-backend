@@ -49,7 +49,7 @@ enum NetworkEgressPolicy {
 
 ### 3. Threat Model & Socket-Level Security Guards
 
-1. **Pre-flight Scheme & Protocol Enforcement:** Target URLs must strictly use `http` or `https` schemes. Raw TCP/UDP socket binding and arbitrary ports are strictly prohibited, upholding [INV-001].
+1. **Pre-flight Scheme & Protocol Enforcement:** Target URLs must strictly use `https` (port 443) on production workers, or `http` (port 80) strictly during hermetic local loopback testing. Cleartext HTTP traffic is rejected on Android worker devices per [NFR-SEC-001]. Raw TCP/UDP socket binding and arbitrary ports are strictly prohibited, upholding [INV-001].
 2. **Destination Allowlist & Public-Suffix Boundaries:**
    - Exact FQDN matching is preferred (e.g., `api.example.com`).
    - Bare `*` wildcards are strictly prohibited and rejected by scheduler validation.
@@ -66,7 +66,8 @@ enum NetworkEgressPolicy {
      - Carrier-Grade NAT (`100.64.0.0/10`)
      - Multicast (`224.0.0.0/4`, `ff00::/8`)
      - Wildcard / Unspecified (`0.0.0.0`, `::`)
-     - IPv4-mapped IPv6 addresses (`::ffff:0:0/96`) are unpacked and evaluated against the full IPv4 disallow list.
+     - NAT64 well-known prefix (`64:ff9b::/96`) and IPv4-mapped IPv6 addresses (`::ffff:0:0/96`) are unpacked and evaluated against the full IPv4 disallow list.
+     - Reserved / future use (`240.0.0.0/4`).
 4. **Zero Redirect Following (Anti-SSRF):**
    - The egress HTTP client explicitly configures `followRedirects = false` and `followSslRedirects = false`.
    - Automatic 3xx redirection is forbidden to prevent open-redirect SSRF bypasses to internal services.

@@ -37,7 +37,7 @@ All empirical evaluations succeeded across both local test harnesses (`WasmNetwo
 ### 2.2. Physical Device Hardware Profile
 | Parameter | Evaluated Hardware Value | Architectural Impact |
 | :--- | :--- | :--- |
-| **Device Model** | Google Pixel 8 (Device ID: `37171FDJH009TA`) | Production consumer hardware baseline |
+| **Device Model** | Google Pixel 8 (Device ID: `Pixel-8-Hardware-Lab-01`) | Production consumer hardware baseline |
 | **Operating System** | Android 17 (Vanilla Ice Cream Dev Baseline) | Validates modern Android security boundaries and permissions |
 | **Java Runtime** | Android Runtime (ART) | Validates heap behavior, garbage collector, and memory bounds |
 | **TLS Provider** | Conscrypt (BoringSSL-backed) | Validates native socket teardown and TLS 1.3 lifecycle |
