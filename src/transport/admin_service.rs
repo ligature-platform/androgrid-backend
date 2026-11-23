@@ -108,6 +108,8 @@ impl AdminServiceImpl {
         engine: i32,
         wasm_bytecode: &[u8],
         artifact_sha256: &str,
+        entrypoint: &str,
+        egress_policy: i32,
     ) -> Result<(), Status> {
         if engine == crate::ExecutionEngine::WasmWasi as i32 && wasm_bytecode.is_empty() {
             let clean_sha = artifact_sha256.trim().to_ascii_lowercase();
@@ -128,7 +130,15 @@ impl AdminServiceImpl {
                         kind.as_str()
                     )));
                 }
-                Some(_) => {}
+                Some(_) => {
+                    if let Some(bytecode) = self.artifact_store.get_artifact(&clean_sha) {
+                        let ep = if entrypoint.is_empty() { "_start" } else { entrypoint };
+                        let meta = crate::artifact::wasi_validator::WasiValidator::validate(&bytecode, ep)
+                            .map_err(|e| Status::invalid_argument(format!("WASM validation failed: {e}")))?;
+                        crate::artifact::wasi_validator::WasiValidator::validate_egress_policy(&meta, egress_policy)
+                            .map_err(|e| Status::invalid_argument(format!("WASM egress policy violation: {e}")))?;
+                    }
+                }
             }
         }
         Ok(())
@@ -169,7 +179,13 @@ impl AdminService for AdminServiceImpl {
             ));
         }
 
-        self.validate_wasm_artifact(task.engine, &task.wasm_bytecode, &task.artifact_sha256)?;
+        self.validate_wasm_artifact(
+            task.engine,
+            &task.wasm_bytecode,
+            &task.artifact_sha256,
+            &task.entrypoint,
+            task.egress_policy,
+        )?;
 
         match self.scheduler.submit_task(task) {
             Ok(()) => Ok(Response::new(SubmitTaskResponse {
@@ -431,7 +447,13 @@ impl AdminService for AdminServiceImpl {
             Status::invalid_argument("template field is required in TaskGroupSpec")
         })?;
 
-        self.validate_wasm_artifact(template.engine, &[], &template.artifact_sha256)?;
+        self.validate_wasm_artifact(
+            template.engine,
+            &[],
+            &template.artifact_sha256,
+            &template.entrypoint,
+            template.egress_policy,
+        )?;
 
         self.scheduler
             .submit_task_group(group, Self::current_epoch_ms())
@@ -452,7 +474,13 @@ impl AdminService for AdminServiceImpl {
             Status::invalid_argument("template field is required in ReplaceTaskGroupRequest")
         })?;
 
-        self.validate_wasm_artifact(template.engine, &[], &template.artifact_sha256)?;
+        self.validate_wasm_artifact(
+            template.engine,
+            &[],
+            &template.artifact_sha256,
+            &template.entrypoint,
+            template.egress_policy,
+        )?;
 
         self.scheduler
             .replace_task_group(req, Self::current_epoch_ms())
@@ -612,9 +640,12 @@ mod tests {
             run_attempt: 1,
             engine: ExecutionEngine::WasmWasi as i32,
             timeout_seconds: 30,
-            entrypoint: String::new(),
+            entrypoint: "_start".to_string(),
             env_vars: std::collections::HashMap::new(),
-            wasm_bytecode: vec![0x00, 0x61, 0x73, 0x6d],
+            wasm_bytecode: vec![
+                0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, // header
+                0x07, 0x0a, 0x01, 0x06, 0x5f, 0x73, 0x74, 0x61, 0x72, 0x74, 0x00, 0x00, // export _start
+            ],
             shell_command: String::new(),
             artifact_sha256: "test_sha256".to_string(),
             requires_unmetered: false,
@@ -825,7 +856,10 @@ mod tests {
             .expect_err("Missing artifact in store must fail fast");
         assert_eq!(err.code(), tonic::Code::FailedPrecondition);
 
-        let wasm_bytes = b"\x00asm\x01\x00\x00\x00".to_vec();
+        let mut wasm_bytes = b"\x00asm\x01\x00\x00\x00".to_vec();
+        wasm_bytes.extend_from_slice(&[
+            0x07, 0x0a, 0x01, 0x06, 0x5f, 0x73, 0x74, 0x61, 0x72, 0x74, 0x00, 0x00,
+        ]);
         let upload = service
             .upload_artifact(Request::new(UploadArtifactRequest {
                 bytecode: wasm_bytes,
@@ -859,7 +893,10 @@ mod tests {
 
         let scheduler = Arc::new(ClusterScheduler::new());
         let artifact_store = Arc::new(ArtifactStore::new());
-        let wasm_bytes = b"\x00asm\x01\x00\x00\x00".to_vec();
+        let mut wasm_bytes = b"\x00asm\x01\x00\x00\x00".to_vec();
+        wasm_bytes.extend_from_slice(&[
+            0x07, 0x0a, 0x01, 0x06, 0x5f, 0x73, 0x74, 0x61, 0x72, 0x74, 0x00, 0x00,
+        ]);
         let sha256 = artifact_store.store_artifact(&wasm_bytes).unwrap();
 
         let svc = AndroGridServiceImpl::with_artifact_store(scheduler, artifact_store);
@@ -970,9 +1007,11 @@ mod tests {
 
         let scheduler = Arc::new(ClusterScheduler::new());
         let artifact_store = Arc::new(ArtifactStore::new());
-        let sha = artifact_store
-            .store_artifact(b"\x00asm\x01\x00\x00\x00")
-            .unwrap();
+        let mut valid_wasm = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        valid_wasm.extend_from_slice(&[
+            0x07, 0x0a, 0x01, 0x06, 0x5f, 0x73, 0x74, 0x61, 0x72, 0x74, 0x00, 0x00,
+        ]);
+        let sha = artifact_store.store_artifact(&valid_wasm).unwrap();
         let svc = AdminServiceImpl::with_artifact_store(
             scheduler,
             artifact_store,
@@ -1006,6 +1045,9 @@ mod tests {
                     shell_command: String::new(),
                     requires_unmetered: false,
                     node_group_affinity: String::new(),
+                    egress_policy: 0,
+                    allowed_hostnames: Vec::new(),
+                    max_egress_bytes: 0,
                 }),
                 partitions: vec![TaskPartitionSpec::default()],
             }),
@@ -1035,6 +1077,9 @@ mod tests {
                     shell_command: String::new(),
                     requires_unmetered: false,
                     node_group_affinity: String::new(),
+                    egress_policy: 0,
+                    allowed_hostnames: Vec::new(),
+                    max_egress_bytes: 0,
                 }),
                 partitions: vec![TaskPartitionSpec::default(), TaskPartitionSpec::default()],
                 strategy: ReplaceStrategy::Immediate as i32,

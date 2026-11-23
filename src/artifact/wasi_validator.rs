@@ -138,63 +138,73 @@ impl WasiValidator {
                 // Import Section (ID 2)
                 2 => {
                     let mut s_off = 0;
-                    if let Ok((import_count, read)) = Self::read_leb128_u32(&section_data[s_off..])
-                    {
+                    let (import_count, read) = Self::read_leb128_u32(&section_data[s_off..])
+                        .map_err(|e| WasiValidationError::MalformedSection(format!("Invalid import count: {e}")))?;
+                    s_off += read;
+                    for _ in 0..import_count {
+                        if s_off >= section_data.len() {
+                            return Err(WasiValidationError::MalformedSection(
+                                "Unexpected EOF in import section".to_string(),
+                            ));
+                        }
+                        let (mod_name, read) = Self::read_wasm_string(&section_data[s_off..])
+                            .map_err(|e| WasiValidationError::MalformedSection(format!("Invalid import module name: {e}")))?;
                         s_off += read;
-                        for _ in 0..import_count {
-                            if s_off >= section_data.len() {
-                                break;
+                        let (field_name, read) = Self::read_wasm_string(&section_data[s_off..])
+                            .map_err(|e| WasiValidationError::MalformedSection(format!("Invalid import field name: {e}")))?;
+                        s_off += read;
+                        if mod_name == "wasi_snapshot_preview1"
+                            || mod_name == "wasi_unstable"
+                        {
+                            has_wasi_import = true;
+                            wasi_imports.push(format!("{mod_name}::{field_name}"));
+                        } else if mod_name == "androgrid_net" {
+                            has_network_egress_imports = true;
+                            network_imports.push(format!("{mod_name}::{field_name}"));
+                        }
+                        if s_off >= section_data.len() {
+                            return Err(WasiValidationError::MalformedSection(
+                                "Unexpected EOF in import kind".to_string(),
+                            ));
+                        }
+                        let kind = section_data[s_off];
+                        s_off += 1;
+                        match kind {
+                            0 => {
+                                // Function import: type index (LEB128 u32)
+                                let (_, r) = Self::read_leb128_u32(&section_data[s_off..])
+                                    .map_err(|e| WasiValidationError::MalformedSection(format!("Invalid import type index: {e}")))?;
+                                s_off += r;
                             }
-                            if let Ok((mod_name, read)) =
-                                Self::read_wasm_string(&section_data[s_off..])
-                            {
-                                s_off += read;
-                                if let Ok((field_name, read)) =
-                                    Self::read_wasm_string(&section_data[s_off..])
-                                {
-                                    s_off += read;
-                                    if mod_name == "wasi_snapshot_preview1"
-                                        || mod_name == "wasi_unstable"
-                                    {
-                                        has_wasi_import = true;
-                                        wasi_imports.push(format!("{mod_name}::{field_name}"));
-                                    } else if mod_name == "androgrid_net" {
-                                        has_network_egress_imports = true;
-                                        network_imports.push(format!("{mod_name}::{field_name}"));
-                                    }
-                                    if s_off < section_data.len() {
-                                        let kind = section_data[s_off];
-                                        s_off += 1;
-                                        match kind {
-                                            0 => {
-                                                if let Ok((_, r)) =
-                                                    Self::read_leb128_u32(&section_data[s_off..])
-                                                {
-                                                    s_off += r;
-                                                }
-                                            }
-                                            1 => {
-                                                s_off += 1;
-                                                if let Ok((_, r)) =
-                                                    Self::read_leb128_u32(&section_data[s_off..])
-                                                {
-                                                    s_off += r;
-                                                }
-                                            }
-                                            2 => {
-                                                if let Ok((_, r)) =
-                                                    Self::read_leb128_u32(&section_data[s_off..])
-                                                {
-                                                    s_off += r;
-                                                }
-                                            }
-                                            3 => {
-                                                s_off += 2;
-                                            }
-                                            _ => {}
-                                        }
-                                    }
+                            1 => {
+                                // Table import: reftype (byte) + limits
+                                if s_off >= section_data.len() {
+                                    return Err(WasiValidationError::MalformedSection(
+                                        "Unexpected EOF in table import reftype".to_string(),
+                                    ));
                                 }
+                                s_off += 1; // reftype
+                                let r = Self::skip_limits(&section_data[s_off..])?;
+                                s_off += r;
+                            }
+                            2 => {
+                                // Memory import: limits
+                                let r = Self::skip_limits(&section_data[s_off..])?;
+                                s_off += r;
+                            }
+                            3 => {
+                                // Global import: valtype (byte) + mutability (byte)
+                                if s_off + 2 > section_data.len() {
+                                    return Err(WasiValidationError::MalformedSection(
+                                        "Unexpected EOF in global import description".to_string(),
+                                    ));
+                                }
+                                s_off += 2;
+                            }
+                            other => {
+                                return Err(WasiValidationError::MalformedSection(format!(
+                                    "Unknown import kind: {other}"
+                                )));
                             }
                         }
                     }
@@ -202,27 +212,28 @@ impl WasiValidator {
                 // Export Section (ID 7)
                 7 => {
                     let mut s_off = 0;
-                    if let Ok((export_count, read)) = Self::read_leb128_u32(&section_data[s_off..])
-                    {
-                        s_off += read;
-                        for _ in 0..export_count {
-                            if s_off >= section_data.len() {
-                                break;
-                            }
-                            if let Ok((name, read)) = Self::read_wasm_string(&section_data[s_off..])
-                            {
-                                s_off += read;
-                                exports.push(name);
-                                if s_off < section_data.len() {
-                                    s_off += 1; // kind
-                                    if let Ok((_, r)) =
-                                        Self::read_leb128_u32(&section_data[s_off..])
-                                    {
-                                        s_off += r;
-                                    }
-                                }
-                            }
+                    let (export_count, read) = Self::read_leb128_u32(&section_data[s_off..])
+                        .map_err(|e| WasiValidationError::MalformedSection(format!("Invalid export count: {e}")))?;
+                    s_off += read;
+                    for _ in 0..export_count {
+                        if s_off >= section_data.len() {
+                            return Err(WasiValidationError::MalformedSection(
+                                "Unexpected EOF in export section".to_string(),
+                            ));
                         }
+                        let (name, read) = Self::read_wasm_string(&section_data[s_off..])
+                            .map_err(|e| WasiValidationError::MalformedSection(format!("Invalid export name: {e}")))?;
+                        s_off += read;
+                        exports.push(name);
+                        if s_off >= section_data.len() {
+                            return Err(WasiValidationError::MalformedSection(
+                                "Unexpected EOF in export description".to_string(),
+                            ));
+                        }
+                        s_off += 1; // kind
+                        let (_, r) = Self::read_leb128_u32(&section_data[s_off..])
+                            .map_err(|e| WasiValidationError::MalformedSection(format!("Invalid export index: {e}")))?;
+                        s_off += r;
                     }
                 }
                 _ => {}
@@ -270,6 +281,33 @@ impl WasiValidator {
             )));
         }
         Ok(())
+    }
+
+    /// Skips a WebAssembly limits structure (flags: u8, min: u32, [max: u32]).
+    fn skip_limits(data: &[u8]) -> Result<usize, WasiValidationError> {
+        if data.is_empty() {
+            return Err(WasiValidationError::MalformedSection(
+                "Unexpected EOF reading limits flags".to_string(),
+            ));
+        }
+        let flags = data[0];
+        let mut off = 1;
+        let (_min, r1) = Self::read_leb128_u32(&data[off..])
+            .map_err(|e| WasiValidationError::MalformedSection(format!("Invalid limits min: {e}")))?;
+        off += r1;
+        match flags {
+            0 => Ok(off),
+            1 => {
+                let (_max, r2) = Self::read_leb128_u32(&data[off..]).map_err(|e| {
+                    WasiValidationError::MalformedSection(format!("Invalid limits max: {e}"))
+                })?;
+                off += r2;
+                Ok(off)
+            }
+            other => Err(WasiValidationError::MalformedSection(format!(
+                "Invalid limits flags: expected 0 or 1, found {other}"
+            ))),
+        }
     }
 
     /// Reads variable-length unsigned LEB128 integer.
@@ -347,5 +385,55 @@ mod tests {
             WasiValidator::validate(&bad_version, "_start"),
             Err(WasiValidationError::UnsupportedVersion(2))
         ));
+    }
+
+    #[test]
+    fn test_import_section_table_and_memory_limits_parsing() {
+        let mut wasm = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+
+        let mut import_data = Vec::new();
+        import_data.push(0x03); // 3 imports
+
+        // Import 1: Table
+        import_data.extend_from_slice(&[0x03, 0x65, 0x6e, 0x76]); // "env"
+        import_data.extend_from_slice(&[0x03, 0x74, 0x62, 0x6c]); // "tbl"
+        import_data.push(0x01); // kind = 1 (table)
+        import_data.push(0x70); // funcref
+        import_data.push(0x01); // flags = 1 (min and max)
+        import_data.push(0x01); // min = 1
+        import_data.push(0x0a); // max = 10
+
+        // Import 2: Memory
+        import_data.extend_from_slice(&[0x03, 0x65, 0x6e, 0x76]); // "env"
+        import_data.extend_from_slice(&[0x03, 0x6d, 0x65, 0x6d]); // "mem"
+        import_data.push(0x02); // kind = 2 (memory)
+        import_data.push(0x00); // flags = 0 (min only)
+        import_data.push(0x02); // min = 2
+
+        // Import 3: Function androgrid_net::http_fetch
+        import_data.extend_from_slice(&[
+            0x0d, b'a', b'n', b'd', b'r', b'o', b'g', b'r', b'i', b'd', b'_', b'n', b'e', b't',
+        ]);
+        import_data.extend_from_slice(&[
+            0x0a, b'h', b't', b't', b'p', b'_', b'f', b'e', b't', b'c', b'h',
+        ]);
+        import_data.push(0x00); // kind = 0 (function)
+        import_data.push(0x00); // type_idx = 0
+
+        wasm.push(0x02); // import section id
+        wasm.push(import_data.len() as u8);
+        wasm.extend_from_slice(&import_data);
+
+        // Export section with "_start"
+        wasm.extend_from_slice(&[
+            0x07, 0x0a, 0x01, 0x06, 0x5f, 0x73, 0x74, 0x61, 0x72, 0x74, 0x00, 0x00,
+        ]);
+
+        let meta = WasiValidator::validate(&wasm, "_start").expect("Validation must succeed");
+        assert!(meta.has_network_egress_imports);
+        assert_eq!(
+            meta.network_imports,
+            vec!["androgrid_net::http_fetch".to_string()]
+        );
     }
 }
