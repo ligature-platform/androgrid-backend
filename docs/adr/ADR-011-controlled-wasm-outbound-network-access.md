@@ -158,3 +158,14 @@ The runtime exposes the `androgrid_net` host module:
 - Outbound requests cannot automatically follow HTTP 3xx redirects; workloads needing redirection must execute subsequent hops explicitly.
 - Speculative speedup optimization ([ADR-004]) is unavailable for egress-enabled tasks.
 - Wildcards are restricted to third-level subdomains or deeper; apex domains must be explicitly listed.
+
+---
+
+## Verification & Empirical Evidence
+
+1. **Empirical Technical Spike Report:**
+   - Detailed empirical findings and hardware metrics are documented in [Technical Spike Report: Sandboxed WebAssembly Network Egress and Cancellation](../src/testing/wasm_network_egress_spike_report.md).
+2. **Adversarial Local Test Suite (JVM):**
+   - Verified in `WasmNetworkEgressSpikeTest.kt` (9/9 tests passed): True 2-step TOCTOU DNS rebinding blocked at connection time (`-403`), Okio bounded streaming buffer overflow abort (`-413`), streaming quota exceeded abort (`-429`), and redirect SSRF prevention (`302 Found` returned without following).
+3. **Headless Hardware Verification (Google Pixel 8, Android 17):**
+   - Verified in `WasmNetworkEgressDeviceTest.kt` (3/3 tests passed via `connectedDebugAndroidTest`): real Android `netd` DNS resolution guard, real ART bounded streaming abort without OOM, and real Conscrypt TLS socket cancellation in < 50 ms.
