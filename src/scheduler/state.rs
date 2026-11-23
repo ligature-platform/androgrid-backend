@@ -32,6 +32,7 @@ pub struct TaskRecord {
     pub spec: TaskSpec,
     pub state: TaskState,
     pub active_attempt: u32,
+    pub max_attempts: u32,
     pub assigned_node_id: Option<String>,
     pub speculative_node_id: Option<String>,
     pub lease_deadline_epoch_s: u64,
@@ -54,10 +55,16 @@ impl TaskRecord {
         } else {
             Some(spec.group_epoch)
         };
+        let max_attempts = if spec.egress_policy == crate::NetworkEgressPolicy::Allowlist as i32 {
+            1
+        } else {
+            3
+        };
         Self {
             spec,
             state: TaskState::Pending,
             active_attempt: 0,
+            max_attempts,
             assigned_node_id: None,
             speculative_node_id: None,
             lease_deadline_epoch_s: 0,

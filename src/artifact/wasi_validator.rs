@@ -32,6 +32,9 @@ pub enum WasiValidationError {
 
     #[error("Specified entrypoint '{0}' not found in WebAssembly export section")]
     EntrypointNotFound(String),
+
+    #[error("Disallowed network egress imports: {0}")]
+    DisallowedNetworkImports(String),
 }
 
 /// Extracted metadata from validated WebAssembly module.
@@ -51,6 +54,12 @@ pub struct WasiMetadata {
 
     /// List of imported functions and modules.
     pub wasi_imports: Vec<String>,
+
+    /// Whether the module imports androgrid_net host functions.
+    pub has_network_egress_imports: bool,
+
+    /// List of imported androgrid_net functions.
+    pub network_imports: Vec<String>,
 
     /// List of exported symbol names.
     pub exports: Vec<String>,
@@ -100,7 +109,9 @@ impl WasiValidator {
         let mut offset = 8;
         let mut exports = Vec::new();
         let mut wasi_imports = Vec::new();
+        let mut network_imports = Vec::new();
         let mut has_wasi_import = false;
+        let mut has_network_egress_imports = false;
 
         while offset < bytecode.len() {
             if offset >= bytecode.len() {
@@ -147,6 +158,9 @@ impl WasiValidator {
                                     {
                                         has_wasi_import = true;
                                         wasi_imports.push(format!("{mod_name}::{field_name}"));
+                                    } else if mod_name == "androgrid_net" {
+                                        has_network_egress_imports = true;
+                                        network_imports.push(format!("{mod_name}::{field_name}"));
                                     }
                                     if s_off < section_data.len() {
                                         let kind = section_data[s_off];
@@ -236,8 +250,26 @@ impl WasiValidator {
             size_bytes: bytecode.len(),
             is_wasi_compatible,
             wasi_imports,
+            has_network_egress_imports,
+            network_imports,
             exports,
         })
+    }
+
+    /// Asserts that network egress imports in the WebAssembly module match the declared policy.
+    ///
+    /// Traces to: [INV-006], ADR-011
+    pub fn validate_egress_policy(
+        meta: &WasiMetadata,
+        egress_policy: i32,
+    ) -> Result<(), WasiValidationError> {
+        if meta.has_network_egress_imports && (egress_policy == 0 || egress_policy == 1) {
+            return Err(WasiValidationError::DisallowedNetworkImports(format!(
+                "Module imports 'androgrid_net' interfaces ({:?}) but egress_policy is BLOCKED or unspecified",
+                meta.network_imports
+            )));
+        }
+        Ok(())
     }
 
     /// Reads variable-length unsigned LEB128 integer.

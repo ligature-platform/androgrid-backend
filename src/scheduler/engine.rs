@@ -431,6 +431,21 @@ impl ClusterScheduler {
     /// Submits a new compute task specification to the pending queue.
     pub fn submit_task(&self, spec: TaskSpec) -> Result<(), SchedulingError> {
         validate_network_egress_policy(&spec)?;
+        if spec.engine == ExecutionEngine::WasmWasi as i32 && !spec.wasm_bytecode.is_empty() {
+            if let Ok(meta) = crate::artifact::wasi_validator::WasiValidator::validate(
+                &spec.wasm_bytecode,
+                &spec.entrypoint,
+            ) {
+                if let Err(e) =
+                    crate::artifact::wasi_validator::WasiValidator::validate_egress_policy(
+                        &meta,
+                        spec.egress_policy,
+                    )
+                {
+                    return Err(SchedulingError::InvalidNetworkEgress(e.to_string()));
+                }
+            }
+        }
         let mut inner = self.inner.write().expect("RwLock write lock poisoned");
         let task_id = spec.task_id.clone();
         if is_reserved_group_task_id(&task_id) {
@@ -955,6 +970,12 @@ impl ClusterScheduler {
                     if record.state == TaskState::Leased
                         && record.assigned_node_id.as_deref() != Some(node_id)
                     {
+                        // Invariant: ADR-011 strictly disables speculative dual-assignment
+                        // for tasks with outbound network egress.
+                        if record.spec.egress_policy == NetworkEgressPolicy::Allowlist as i32 {
+                            continue;
+                        }
+
                         if !is_task_eligible_for_worker(
                             &record.spec,
                             is_rooted,
@@ -2831,6 +2852,11 @@ pub fn validate_network_egress_policy(spec: &TaskSpec) -> Result<(), SchedulingE
         }
         2 => {
             // NetworkEgressPolicyAllowlist
+            if spec.max_egress_bytes == 0 {
+                return Err(SchedulingError::InvalidNetworkEgress(
+                    "max_egress_bytes must be greater than zero when egress_policy is NETWORK_EGRESS_POLICY_ALLOWLIST (fail-closed default)".to_string(),
+                ));
+            }
             if spec.allowed_hostnames.is_empty() {
                 return Err(SchedulingError::InvalidNetworkEgress(
                     "allowed_hostnames must not be empty when egress_policy is NETWORK_EGRESS_POLICY_ALLOWLIST".to_string(),
@@ -2841,6 +2867,11 @@ pub fn validate_network_egress_policy(spec: &TaskSpec) -> Result<(), SchedulingE
                 if trimmed.is_empty() {
                     return Err(SchedulingError::InvalidNetworkEgress(
                         "allowed_hostnames cannot contain empty hostnames".to_string(),
+                    ));
+                }
+                if trimmed == "*" || trimmed == "*.*" {
+                    return Err(SchedulingError::InvalidNetworkEgress(
+                        "Bare wildcard '*' is strictly forbidden in allowed_hostnames".to_string(),
                     ));
                 }
                 if trimmed.contains("://")
@@ -2856,13 +2887,38 @@ pub fn validate_network_egress_policy(spec: &TaskSpec) -> Result<(), SchedulingE
                 if lower == "localhost"
                     || lower == "127.0.0.1"
                     || lower == "::1"
+                    || lower == "0.0.0.0"
                     || lower.starts_with("10.")
                     || lower.starts_with("192.168.")
                     || lower.starts_with("169.254.")
+                    || lower.starts_with("100.64.")
+                    || lower.starts_with("127.")
+                    || lower.starts_with("fc")
+                    || lower.starts_with("fd")
+                    || lower.starts_with("fe80")
+                    || (lower.starts_with("172.") && is_rfc1918_172(&lower))
                 {
                     return Err(SchedulingError::InvalidNetworkEgress(format!(
                         "Host '{trimmed}' in allowed_hostnames targets a forbidden private, loopback, or link-local address"
                     )));
+                }
+                if let Some(domain_part) = lower.strip_prefix("*.") {
+                    let parts: Vec<&str> = domain_part.split('.').collect();
+                    if parts.len() < 2 {
+                        return Err(SchedulingError::InvalidNetworkEgress(format!(
+                            "Wildcard '{trimmed}' must have at least three dot-separated components (e.g. '*.api.example.com')"
+                        )));
+                    }
+                    const FORBIDDEN_SUFFIXES: &[&str] = &[
+                        "com", "org", "net", "edu", "gov", "mil", "io", "co.uk", "org.uk",
+                        "gov.uk", "com.au", "net.au", "co.jp", "com.br", "co.nz", "com.sg",
+                        "co.za", "de", "fr", "nl", "ru", "cn", "in", "uk", "au", "ca", "jp", "eu",
+                    ];
+                    if FORBIDDEN_SUFFIXES.contains(&domain_part) {
+                        return Err(SchedulingError::InvalidNetworkEgress(format!(
+                            "Wildcard '{trimmed}' targets a public suffix or top-level domain"
+                        )));
+                    }
                 }
             }
             Ok(())
@@ -2871,6 +2927,17 @@ pub fn validate_network_egress_policy(spec: &TaskSpec) -> Result<(), SchedulingE
             "Unknown egress_policy value: {other}"
         ))),
     }
+}
+
+fn is_rfc1918_172(s: &str) -> bool {
+    if let Some(rest) = s.strip_prefix("172.") {
+        if let Some(second_octet_str) = rest.split('.').next() {
+            if let Ok(second_octet) = second_octet_str.parse::<u8>() {
+                return (16..=31).contains(&second_octet);
+            }
+        }
+    }
+    false
 }
 
 fn validate_node_group_affinity(
@@ -3135,16 +3202,46 @@ mod tests {
         let err3 = scheduler.submit_task(task_private).unwrap_err();
         assert!(matches!(err3, SchedulingError::InvalidNetworkEgress(_)));
 
-        // 4. Valid FQDN and wildcard succeeds
+        // 4. Valid FQDN and wildcard succeeds (requires max_egress_bytes > 0)
         let mut task_valid = make_test_task("task-egress-04", 30, false, ExecutionEngine::WasmWasi);
         task_valid.egress_policy = NetworkEgressPolicy::Allowlist as i32;
-        task_valid.allowed_hostnames =
-            vec!["api.example.com".to_string(), "*.trusted.org".to_string()];
+        task_valid.max_egress_bytes = 1024 * 1024;
+        task_valid.allowed_hostnames = vec![
+            "api.example.com".to_string(),
+            "*.api.trusted.org".to_string(),
+        ];
         assert!(scheduler.submit_task(task_valid).is_ok());
 
-        // 5. BLOCKED policy succeeds
-        let mut task_blocked =
+        // 5. ALLOWLIST with max_egress_bytes == 0 is rejected (fail-closed)
+        let mut task_zero_quota =
             make_test_task("task-egress-05", 30, false, ExecutionEngine::WasmWasi);
+        task_zero_quota.egress_policy = NetworkEgressPolicy::Allowlist as i32;
+        task_zero_quota.max_egress_bytes = 0;
+        task_zero_quota.allowed_hostnames = vec!["api.example.com".to_string()];
+        let err_zero = scheduler.submit_task(task_zero_quota).unwrap_err();
+        assert!(matches!(err_zero, SchedulingError::InvalidNetworkEgress(_)));
+
+        // 6. Bare wildcard '*' is rejected
+        let mut task_bare_wildcard =
+            make_test_task("task-egress-06", 30, false, ExecutionEngine::WasmWasi);
+        task_bare_wildcard.egress_policy = NetworkEgressPolicy::Allowlist as i32;
+        task_bare_wildcard.max_egress_bytes = 1024;
+        task_bare_wildcard.allowed_hostnames = vec!["*".to_string()];
+        let err_bare = scheduler.submit_task(task_bare_wildcard).unwrap_err();
+        assert!(matches!(err_bare, SchedulingError::InvalidNetworkEgress(_)));
+
+        // 7. Public suffix wildcard '*.com' or '*.co.uk' is rejected
+        let mut task_ps_wildcard =
+            make_test_task("task-egress-07", 30, false, ExecutionEngine::WasmWasi);
+        task_ps_wildcard.egress_policy = NetworkEgressPolicy::Allowlist as i32;
+        task_ps_wildcard.max_egress_bytes = 1024;
+        task_ps_wildcard.allowed_hostnames = vec!["*.co.uk".to_string()];
+        let err_ps = scheduler.submit_task(task_ps_wildcard).unwrap_err();
+        assert!(matches!(err_ps, SchedulingError::InvalidNetworkEgress(_)));
+
+        // 8. BLOCKED policy succeeds
+        let mut task_blocked =
+            make_test_task("task-egress-08", 30, false, ExecutionEngine::WasmWasi);
         task_blocked.egress_policy = NetworkEgressPolicy::Blocked as i32;
         assert!(scheduler.submit_task(task_blocked).is_ok());
     }
@@ -3167,6 +3264,7 @@ mod tests {
             make_test_task("task-egress-cell", 60, false, ExecutionEngine::WasmWasi);
         task_egress.egress_policy = NetworkEgressPolicy::Allowlist as i32;
         task_egress.allowed_hostnames = vec!["api.example.com".to_string()];
+        task_egress.max_egress_bytes = 1024 * 1024;
         scheduler.submit_task(task_egress).unwrap();
 
         // Cellular worker attempts to claim task -> must be skipped per [ANTI-003], [INV-003], [NFR-POW-001]
@@ -3176,6 +3274,98 @@ mod tests {
         assert!(
             !claim.task_available,
             "Cellular worker must not be leased tasks with network egress"
+        );
+    }
+
+    #[test]
+    fn test_egress_task_disables_speculative_dual_assignment() {
+        let scheduler = ClusterScheduler::new();
+        let wifi_caps = make_test_capabilities(false, false);
+        let reg = scheduler
+            .register_node(
+                "wifi-worker-1".to_string(),
+                wifi_caps,
+                "1.0.0".to_string(),
+                1000,
+            )
+            .unwrap();
+
+        let mut egress_task =
+            make_test_task("task-egress-no-dual", 60, false, ExecutionEngine::WasmWasi);
+        egress_task.egress_policy = NetworkEgressPolicy::Allowlist as i32;
+        egress_task.allowed_hostnames = vec!["api.example.com".to_string()];
+        egress_task.max_egress_bytes = 1024 * 1024;
+        scheduler.submit_task(egress_task).unwrap();
+
+        // First worker claims the task
+        let sync1 = scheduler
+            .sync_node_state("wifi-worker-1", &reg.session_token, &[], 1000)
+            .unwrap();
+        assert_eq!(sync1.desired_tasks.len(), 1);
+
+        // Register second Wi-Fi worker
+        let wifi_caps2 = make_test_capabilities(false, false);
+        let reg2 = scheduler
+            .register_node(
+                "wifi-worker-2".to_string(),
+                wifi_caps2,
+                "1.0.0".to_string(),
+                1001,
+            )
+            .unwrap();
+
+        // Second worker syncs; speculative dual-assignment MUST NOT preempt the active egress task
+        let sync2 = scheduler
+            .sync_node_state("wifi-worker-2", &reg2.session_token, &[], 1002)
+            .unwrap();
+        assert!(
+            sync2.desired_tasks.is_empty(),
+            "Speculative dual-assignment must be disabled for tasks with egress_policy == ALLOWLIST"
+        );
+    }
+
+    #[test]
+    fn test_static_wasi_validator_rejects_disallowed_egress_imports() {
+        let scheduler = ClusterScheduler::new();
+
+        // Construct minimal valid WebAssembly module importing androgrid_net::http_fetch
+        let mut wasm_bytes = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        // Import section (ID 2)
+        // Module: "androgrid_net", Field: "http_fetch", Kind: 0 (Func), TypeIdx: 0
+        let mut import_payload = Vec::new();
+        import_payload.push(1); // 1 import
+        import_payload.push(13); // mod length
+        import_payload.extend_from_slice(b"androgrid_net");
+        import_payload.push(10); // field length
+        import_payload.extend_from_slice(b"http_fetch");
+        import_payload.push(0); // func import
+        import_payload.push(0); // type index 0
+
+        wasm_bytes.push(2); // section id 2
+        wasm_bytes.push(import_payload.len() as u8); // section length
+        wasm_bytes.extend_from_slice(&import_payload);
+
+        // Export section (ID 7) exporting "_start"
+        let mut export_payload = Vec::new();
+        export_payload.push(1); // 1 export
+        export_payload.push(6); // export name length
+        export_payload.extend_from_slice(b"_start");
+        export_payload.push(0); // func export
+        export_payload.push(0); // func index 0
+
+        wasm_bytes.push(7); // section id 7
+        wasm_bytes.push(export_payload.len() as u8);
+        wasm_bytes.extend_from_slice(&export_payload);
+
+        let mut task = make_test_task("task-import-test", 30, false, ExecutionEngine::WasmWasi);
+        task.wasm_bytecode = wasm_bytes;
+        task.egress_policy = NetworkEgressPolicy::Blocked as i32;
+
+        // Submitting with BLOCKED policy must be rejected because module imports androgrid_net
+        let err = scheduler.submit_task(task).unwrap_err();
+        assert!(
+            matches!(err, SchedulingError::InvalidNetworkEgress(_)),
+            "Scheduler must reject task importing androgrid_net when egress_policy is BLOCKED"
         );
     }
 

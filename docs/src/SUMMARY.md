@@ -6,6 +6,7 @@
 - [Getting Started & Quickstart](getting_started/quickstart.md)
 - [Workload Developer Guide: Compiling to WASI](workloads/compilation_guide.md)
   - [Tutorial: Running Your First Parallel Cluster Benchmark](workloads/image_benchmark_tutorial.md)
+  - [Distributed HTTP/HTTPS Load Testing Guide](workloads/distributed_load_testing.md)
 - [Operator Manual & CLI Reference](operator/cli_manual.md)
 - [Security & PKI Architecture](security/architecture.md)
 - [Cloudflare Ingress Deployment Guide](ingress/cloudflare_tunnel.md)

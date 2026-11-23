@@ -1,7 +1,7 @@
 # ADR-011: Controlled Outbound Network Access for Sandboxed Workloads
 
 ## Status
-Proposed
+Accepted
 
 ## Architectural Scope & Requirements
 - Issue Reference: #56 (feat(wasm): support controlled outbound network access for sandboxed workloads)
@@ -11,12 +11,12 @@ Proposed
 ---
 
 ## Context
-Worker nodes execute untrusted WebAssembly workloads inside an in-process Chicory WASI sandbox ([INV-006], [REQ-VER-003]). Several real-world distributed edge workloads (e.g., distributed public web scraping, external API telemetry aggregation, webhook dispatch, content verification, and distributed load/stress testing on single-tenant operator-controlled clusters) require outbound HTTP/HTTPS network access.
+Worker nodes execute untrusted WebAssembly workloads inside an in-process Chicory WASI sandbox ([INV-006], [REQ-VER-003]). Several real-world distributed edge workloads (e.g., distributed public web scraping, external API telemetry aggregation, webhook dispatch, content verification, and distributed load/stress testing on single-operator, operator-controlled clusters supporting multi-node-group load simulation via [ADR-007]) require outbound HTTP/HTTPS network access.
 
 However, granting uncontrolled network egress from mobile devices introduces grave security, operational, and distributed systems risks:
 1. **Server-Side Request Forgery (SSRF) & LAN Lateral Movement:** A malicious or compromised WASM payload running on an Android worker device connected to a home, enterprise, or lab Wi-Fi network could probe and exploit private subnet targets (e.g., RFC 1918 addresses `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`), device loopback (`127.0.0.1`, `::1`), router configuration portals, local IoT endpoints, or cloud link-local metadata endpoints (`169.254.169.254`).
 2. **DNS Rebinding & TOCTOU Sockets:** If DNS resolution validation occurs prior to socket connection, an attacker's nameserver can respond with a short TTL (TTL=0) and return a public IP during pre-flight checks, followed by an internal/private IP during socket connection.
-3. **Open Proxy & Residential IP Abuse:** Without strict destination allowlisting and public-suffix protections, malicious actors could submit workloads transforming the mobile edge cluster into an anonymous residential proxy network for credential stuffing, spamming, or denial-of-service amplification.
+3. **Open Proxy & Residential IP Abuse:** Without strict destination allowlisting and public-suffix protections, malicious actors could submit workloads transforming the mobile edge cluster into an anonymous residential proxy network for credential stuffing, spamming, or denial-of-service amplification. Untrusted multi-tenant SaaS access is strictly out of scope until cryptographic target-ownership verification is introduced.
 4. **Bandwidth Exhaustion & Memory DOS:** Streaming unmetered responses or gzip bombs can exhaust device heap memory or saturate cellular/Wi-Fi quotas without streaming bounds.
 5. **Metered Cellular Radio & Battery Drain ([INV-003], [ANTI-003], [NFR-POW-001]):** Keeping cellular baseband radios active for long-running outbound data streaming violates baseband power management invariants, drains battery, and incurs unexpected cellular data billing.
 6. **Distributed Dual-Assignment Race Conditions ([INV-005], [ADR-004]):** If the orchestrator speculatively reassigns a running cellular task to a faster Wi-Fi node, non-idempotent outbound HTTP mutations (e.g., POST, PUT, DELETE) will execute multiple times across external servers, violating expected execution semantics.
@@ -28,8 +28,9 @@ However, granting uncontrolled network egress from mobile devices introduces gra
 
 We establish a multi-layered, secure, and metered outbound network egress subsystem for sandboxed WebAssembly workloads across `androgrid-backend` and `androgrid-android`:
 
-### 1. MVP Protocol Scope (HTTP/HTTPS Only)
-- This ADR approves an **HTTP/HTTPS-only** egress boundary as our MVP to support distributed HTTP/HTTPS load and stress testing on single-tenant, operator-controlled clusters.
+### 1. MVP Protocol Scope & Tenancy Boundary (HTTP/HTTPS Only)
+- This ADR approves an **HTTP/HTTPS-only** egress boundary as our MVP for **single-operator, operator-controlled clusters (supporting multi-node-group load simulation via ADR-007)**.
+- Untrusted multi-tenant SaaS access is explicitly out of scope until cryptographic target-ownership verification (such as DNS TXT / TLS ACME challenge proof) is introduced.
 - Raw TCP and UDP socket egress is **strictly out of scope for this ADR** and explicitly deferred to a future ADR.
 
 ### 2. Protobuf Contract Alignment (`NetworkEgressPolicy`)
@@ -119,7 +120,8 @@ The runtime exposes the `androgrid_net` host module:
    - `callTimeout = minOf(30s, task_timeout)`
 2. **Shared Base Client & Per-Task Scoping:**
    - `WasmComputeEngine` maintains a single shared base `OkHttpClient` instance configured with an isolated daemon `Dispatcher` and `ConnectionPool(maxIdleConnections = 4, keepAliveDuration = 15s)`.
-   - Each task derives a lightweight child client via `sharedClient.newBuilder().dns(taskScopedDnsGuard).build()`, safely sharing underlying threads and connection pools while strictly isolating per-task `allowed_hostnames`, quota counters, and structured cancellation.
+   - Each task derives a lightweight child client via `sharedClient.newBuilder().dns(taskScopedDnsGuard).build()`, safely sharing underlying threads while strictly isolating per-task `allowed_hostnames`, quota counters, and structured cancellation.
+   - **Socket Reuse Note:** Per-task `Dns` isolation intentionally prevents cross-task TCP connection reuse across different task allowlist security boundaries. This strict isolation is a deliberate security feature to avoid cross-tenant connection pooling or host spoofing.
    - All active calls are tracked and cleanly cancelled via coroutine cancellation hooks (`invokeOnCompletion(onCancelling = true)`).
    - On engine close, `dispatcher.executorService.shutdownNow()` and `connectionPool.evictAll()` ensure zero socket or thread leakage.
 
@@ -141,14 +143,14 @@ The runtime exposes the `androgrid_net` host module:
 ## Consequences
 
 ### Positive
-- Clarifies MVP protocol boundaries (HTTP/HTTPS only) for single-tenant operator load and stress testing clusters.
+- Clarifies MVP protocol boundaries (HTTP/HTTPS only) for single-operator, operator-controlled load and stress testing clusters (supporting multi-node-group simulation via ADR-007).
 - Closes the TOCTOU DNS rebinding vulnerability by validating IP records within the socket connection pipeline.
 - Eliminates open-redirect SSRF vulnerabilities by disabling automatic HTTP redirection.
 - Enforces strict public-suffix, apex, and CIDR space boundaries (including IPv6 ULA `fc00::/7` and IPv4-mapped IPv6).
 - Prevents JVM memory exhaustion via bounded streaming Okio reads.
 - Eliminates fail-open security flaws in default quotas and metered network detection.
 - Locks a robust WASM ABI returning HTTP status codes on success and fixed negative error enums on failure, eliminating status code drop and error code collision.
-- Safely shares client connection pools while scoping DNS security policies per task.
+- Safely isolates per-task DNS security boundaries without connection pooling cross-contamination.
 - Protects external third-party systems from duplicate non-idempotent calls by disabling speculative dual-assignment and scoping idempotency keys strictly to `<task_id>`.
 
 ### Negative / Trade-offs
