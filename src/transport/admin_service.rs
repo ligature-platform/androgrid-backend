@@ -132,11 +132,23 @@ impl AdminServiceImpl {
                 }
                 Some(_) => {
                     if let Some(bytecode) = self.artifact_store.get_artifact(&clean_sha) {
-                        let ep = if entrypoint.is_empty() { "_start" } else { entrypoint };
-                        let meta = crate::artifact::wasi_validator::WasiValidator::validate(&bytecode, ep)
-                            .map_err(|e| Status::invalid_argument(format!("WASM validation failed: {e}")))?;
-                        crate::artifact::wasi_validator::WasiValidator::validate_egress_policy(&meta, egress_policy)
-                            .map_err(|e| Status::invalid_argument(format!("WASM egress policy violation: {e}")))?;
+                        let ep = if entrypoint.is_empty() {
+                            "_start"
+                        } else {
+                            entrypoint
+                        };
+                        let meta =
+                            crate::artifact::wasi_validator::WasiValidator::validate(&bytecode, ep)
+                                .map_err(|e| {
+                                    Status::invalid_argument(format!("WASM validation failed: {e}"))
+                                })?;
+                        crate::artifact::wasi_validator::WasiValidator::validate_egress_policy(
+                            &meta,
+                            egress_policy,
+                        )
+                        .map_err(|e| {
+                            Status::invalid_argument(format!("WASM egress policy violation: {e}"))
+                        })?;
                     }
                 }
             }
@@ -644,7 +656,8 @@ mod tests {
             env_vars: std::collections::HashMap::new(),
             wasm_bytecode: vec![
                 0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, // header
-                0x07, 0x0a, 0x01, 0x06, 0x5f, 0x73, 0x74, 0x61, 0x72, 0x74, 0x00, 0x00, // export _start
+                0x07, 0x0a, 0x01, 0x06, 0x5f, 0x73, 0x74, 0x61, 0x72, 0x74, 0x00,
+                0x00, // export _start
             ],
             shell_command: String::new(),
             artifact_sha256: "test_sha256".to_string(),

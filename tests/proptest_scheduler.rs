@@ -193,6 +193,9 @@ proptest! {
             shell_command: String::new(),
             requires_unmetered: false,
             node_group_affinity: String::new(),
+            egress_policy: 0,
+            allowed_hostnames: Vec::new(),
+            max_egress_bytes: 0,
         };
 
         scheduler

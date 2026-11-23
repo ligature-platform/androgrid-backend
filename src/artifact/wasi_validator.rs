@@ -139,7 +139,11 @@ impl WasiValidator {
                 2 => {
                     let mut s_off = 0;
                     let (import_count, read) = Self::read_leb128_u32(&section_data[s_off..])
-                        .map_err(|e| WasiValidationError::MalformedSection(format!("Invalid import count: {e}")))?;
+                        .map_err(|e| {
+                            WasiValidationError::MalformedSection(format!(
+                                "Invalid import count: {e}"
+                            ))
+                        })?;
                     s_off += read;
                     for _ in 0..import_count {
                         if s_off >= section_data.len() {
@@ -148,14 +152,20 @@ impl WasiValidator {
                             ));
                         }
                         let (mod_name, read) = Self::read_wasm_string(&section_data[s_off..])
-                            .map_err(|e| WasiValidationError::MalformedSection(format!("Invalid import module name: {e}")))?;
+                            .map_err(|e| {
+                                WasiValidationError::MalformedSection(format!(
+                                    "Invalid import module name: {e}"
+                                ))
+                            })?;
                         s_off += read;
                         let (field_name, read) = Self::read_wasm_string(&section_data[s_off..])
-                            .map_err(|e| WasiValidationError::MalformedSection(format!("Invalid import field name: {e}")))?;
+                            .map_err(|e| {
+                                WasiValidationError::MalformedSection(format!(
+                                    "Invalid import field name: {e}"
+                                ))
+                            })?;
                         s_off += read;
-                        if mod_name == "wasi_snapshot_preview1"
-                            || mod_name == "wasi_unstable"
-                        {
+                        if mod_name == "wasi_snapshot_preview1" || mod_name == "wasi_unstable" {
                             has_wasi_import = true;
                             wasi_imports.push(format!("{mod_name}::{field_name}"));
                         } else if mod_name == "androgrid_net" {
@@ -173,7 +183,11 @@ impl WasiValidator {
                             0 => {
                                 // Function import: type index (LEB128 u32)
                                 let (_, r) = Self::read_leb128_u32(&section_data[s_off..])
-                                    .map_err(|e| WasiValidationError::MalformedSection(format!("Invalid import type index: {e}")))?;
+                                    .map_err(|e| {
+                                        WasiValidationError::MalformedSection(format!(
+                                            "Invalid import type index: {e}"
+                                        ))
+                                    })?;
                                 s_off += r;
                             }
                             1 => {
@@ -213,7 +227,11 @@ impl WasiValidator {
                 7 => {
                     let mut s_off = 0;
                     let (export_count, read) = Self::read_leb128_u32(&section_data[s_off..])
-                        .map_err(|e| WasiValidationError::MalformedSection(format!("Invalid export count: {e}")))?;
+                        .map_err(|e| {
+                            WasiValidationError::MalformedSection(format!(
+                                "Invalid export count: {e}"
+                            ))
+                        })?;
                     s_off += read;
                     for _ in 0..export_count {
                         if s_off >= section_data.len() {
@@ -221,8 +239,12 @@ impl WasiValidator {
                                 "Unexpected EOF in export section".to_string(),
                             ));
                         }
-                        let (name, read) = Self::read_wasm_string(&section_data[s_off..])
-                            .map_err(|e| WasiValidationError::MalformedSection(format!("Invalid export name: {e}")))?;
+                        let (name, read) =
+                            Self::read_wasm_string(&section_data[s_off..]).map_err(|e| {
+                                WasiValidationError::MalformedSection(format!(
+                                    "Invalid export name: {e}"
+                                ))
+                            })?;
                         s_off += read;
                         exports.push(name);
                         if s_off >= section_data.len() {
@@ -231,8 +253,12 @@ impl WasiValidator {
                             ));
                         }
                         s_off += 1; // kind
-                        let (_, r) = Self::read_leb128_u32(&section_data[s_off..])
-                            .map_err(|e| WasiValidationError::MalformedSection(format!("Invalid export index: {e}")))?;
+                        let (_, r) =
+                            Self::read_leb128_u32(&section_data[s_off..]).map_err(|e| {
+                                WasiValidationError::MalformedSection(format!(
+                                    "Invalid export index: {e}"
+                                ))
+                            })?;
                         s_off += r;
                     }
                 }
@@ -292,8 +318,9 @@ impl WasiValidator {
         }
         let flags = data[0];
         let mut off = 1;
-        let (_min, r1) = Self::read_leb128_u32(&data[off..])
-            .map_err(|e| WasiValidationError::MalformedSection(format!("Invalid limits min: {e}")))?;
+        let (_min, r1) = Self::read_leb128_u32(&data[off..]).map_err(|e| {
+            WasiValidationError::MalformedSection(format!("Invalid limits min: {e}"))
+        })?;
         off += r1;
         match flags {
             0 => Ok(off),
