@@ -130,10 +130,10 @@ impl AdminServiceImpl {
                         kind.as_str()
                     )));
                 }
-                Some(_) => {
-                    if let Some(bytecode) = self.artifact_store.get_artifact(&clean_sha) {
+                Some(_) => match self.artifact_store.get_artifact(&clean_sha) {
+                    Some(bytecode) => {
                         let ep = if entrypoint.is_empty() {
-                            "_start"
+                            ""
                         } else {
                             entrypoint
                         };
@@ -150,7 +150,12 @@ impl AdminServiceImpl {
                             Status::invalid_argument(format!("WASM egress policy violation: {e}"))
                         })?;
                     }
-                }
+                    None => {
+                        return Err(Status::failed_precondition(format!(
+                            "WASM artifact bytecode for SHA-256 '{clean_sha}' not found in artifact store"
+                        )));
+                    }
+                },
             }
         }
         Ok(())

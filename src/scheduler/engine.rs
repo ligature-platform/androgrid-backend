@@ -2928,6 +2928,19 @@ pub fn validate_network_egress_policy_params(
                         "Bare wildcard '*' is strictly forbidden in allowed_hostnames".to_string(),
                     ));
                 }
+                if trimmed.len() > 253 {
+                    return Err(SchedulingError::InvalidNetworkEgress(format!(
+                        "Hostname '{trimmed}' exceeds maximum RFC 1035 length limit of 253 octets"
+                    )));
+                }
+                if !trimmed
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-' || b == b'*')
+                {
+                    return Err(SchedulingError::InvalidNetworkEgress(format!(
+                        "Invalid characters in hostname '{trimmed}': allowed characters are ASCII a-z, 0-9, hyphen, period, and leading wildcard '*.'"
+                    )));
+                }
                 if trimmed.contains("://")
                     || trimmed.contains('/')
                     || trimmed.contains(':')
@@ -2942,7 +2955,8 @@ pub fn validate_network_egress_policy_params(
                         "Invalid hostname format in allowed_hostnames: '{trimmed}'. Leading, trailing, or consecutive dots are forbidden."
                     )));
                 }
-                if trimmed.len() > 2 && trimmed[2..].contains('*') {
+                let rest = trimmed.strip_prefix("*.").unwrap_or(trimmed);
+                if rest.contains('*') {
                     return Err(SchedulingError::InvalidNetworkEgress(format!(
                         "Invalid wildcard placement in allowed_hostnames: '{trimmed}'. Wildcard '*' is only permitted as a leading '*.' prefix."
                     )));
@@ -2953,7 +2967,7 @@ pub fn validate_network_egress_policy_params(
                         "Host '{trimmed}' in allowed_hostnames is an IP literal; must be a domain name or wildcard"
                     )));
                 }
-                if lower == "localhost" {
+                if lower == "localhost" || lower.ends_with(".localhost") {
                     return Err(SchedulingError::InvalidNetworkEgress(format!(
                         "Host '{trimmed}' in allowed_hostnames targets a forbidden localhost address"
                     )));
@@ -3002,6 +3016,10 @@ pub fn validate_network_egress_policy_params(
                         "workers.dev",
                         "amazonaws.com",
                         "github.io",
+                        "vercel.app",
+                        "netlify.app",
+                        "pages.dev",
+                        "appspot.com",
                     ];
                     if FORBIDDEN_SUFFIXES.contains(&domain_part) {
                         return Err(SchedulingError::InvalidNetworkEgress(format!(
@@ -3406,6 +3424,50 @@ mod tests {
         task_dot.allowed_hostnames = vec!["api.example.com.".to_string()];
         let err_dot = scheduler.submit_task(task_dot).unwrap_err();
         assert!(matches!(err_dot, SchedulingError::InvalidNetworkEgress(_)));
+
+        // 16. Non-ASCII multi-byte UTF-8 hostname does not panic and is rejected
+        let mut task_utf8 = make_test_task("task-egress-16", 30, false, ExecutionEngine::WasmWasi);
+        task_utf8.egress_policy = NetworkEgressPolicy::Allowlist as i32;
+        task_utf8.max_egress_bytes = 1024;
+        task_utf8.allowed_hostnames = vec!["a\u{00e9}.com".to_string()];
+        let err_utf8 = scheduler.submit_task(task_utf8).unwrap_err();
+        assert!(matches!(err_utf8, SchedulingError::InvalidNetworkEgress(_)));
+
+        // 17. Invalid wildcards (*a. or a*.) are rejected
+        let mut task_bad_wc =
+            make_test_task("task-egress-17", 30, false, ExecutionEngine::WasmWasi);
+        task_bad_wc.egress_policy = NetworkEgressPolicy::Allowlist as i32;
+        task_bad_wc.max_egress_bytes = 1024;
+        task_bad_wc.allowed_hostnames = vec!["*a.example.com".to_string()];
+        let err_bad_wc = scheduler.submit_task(task_bad_wc).unwrap_err();
+        assert!(matches!(
+            err_bad_wc,
+            SchedulingError::InvalidNetworkEgress(_)
+        ));
+
+        // 18. Subdomain of localhost (*.localhost / evil.localhost) is rejected
+        let mut task_sub_lh =
+            make_test_task("task-egress-18", 30, false, ExecutionEngine::WasmWasi);
+        task_sub_lh.egress_policy = NetworkEgressPolicy::Allowlist as i32;
+        task_sub_lh.max_egress_bytes = 1024;
+        task_sub_lh.allowed_hostnames = vec!["evil.localhost".to_string()];
+        let err_sub_lh = scheduler.submit_task(task_sub_lh).unwrap_err();
+        assert!(matches!(
+            err_sub_lh,
+            SchedulingError::InvalidNetworkEgress(_)
+        ));
+
+        // 19. Additional cloud suffixes (*.vercel.app, *.pages.dev) are rejected
+        let mut task_cloud2 =
+            make_test_task("task-egress-19", 30, false, ExecutionEngine::WasmWasi);
+        task_cloud2.egress_policy = NetworkEgressPolicy::Allowlist as i32;
+        task_cloud2.max_egress_bytes = 1024;
+        task_cloud2.allowed_hostnames = vec!["*.vercel.app".to_string()];
+        let err_cloud2 = scheduler.submit_task(task_cloud2).unwrap_err();
+        assert!(matches!(
+            err_cloud2,
+            SchedulingError::InvalidNetworkEgress(_)
+        ));
     }
 
     #[test]

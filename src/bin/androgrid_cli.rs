@@ -672,8 +672,8 @@ fn parse_key_val(s: &str) -> Result<(String, String), String> {
 /// Parses network egress policy string into enum integer.
 fn parse_egress_policy_flag(s: &str) -> Result<i32, String> {
     match s.trim().to_ascii_lowercase().as_str() {
-        "blocked" | "block" | "none" | "0" => Ok(NetworkEgressPolicy::Blocked as i32),
-        "allowlist" | "allowed" | "1" => Ok(NetworkEgressPolicy::Allowlist as i32),
+        "blocked" | "block" | "none" => Ok(NetworkEgressPolicy::Blocked as i32),
+        "allowlist" | "allowed" => Ok(NetworkEgressPolicy::Allowlist as i32),
         other => Err(format!(
             "invalid egress policy '{other}': expected 'blocked' or 'allowlist'"
         )),
@@ -3094,5 +3094,34 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn test_parse_egress_policy_flag() {
+        assert_eq!(
+            parse_egress_policy_flag("blocked").unwrap(),
+            NetworkEgressPolicy::Blocked as i32
+        );
+        assert_eq!(
+            parse_egress_policy_flag("BLOCK").unwrap(),
+            NetworkEgressPolicy::Blocked as i32
+        );
+        assert_eq!(
+            parse_egress_policy_flag("none").unwrap(),
+            NetworkEgressPolicy::Blocked as i32
+        );
+        assert_eq!(
+            parse_egress_policy_flag("allowlist").unwrap(),
+            NetworkEgressPolicy::Allowlist as i32
+        );
+        assert_eq!(
+            parse_egress_policy_flag("ALLOWED").unwrap(),
+            NetworkEgressPolicy::Allowlist as i32
+        );
+        // Numeric strings must be rejected to prevent 0/1 inversion
+        assert!(parse_egress_policy_flag("0").is_err());
+        assert!(parse_egress_policy_flag("1").is_err());
+        assert!(parse_egress_policy_flag("2").is_err());
+        assert!(parse_egress_policy_flag("invalid").is_err());
     }
 }
