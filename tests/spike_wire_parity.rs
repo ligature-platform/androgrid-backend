@@ -180,6 +180,9 @@ fn spike_task_spec_wasm_bytecode_payload_bounds() {
         group_id: String::new(),
         group_epoch: 0,
         node_group_affinity: String::new(),
+        allowed_hostnames: vec![],
+        egress_policy: 0,
+        max_egress_bytes: 0,
     };
 
     let response = ClaimCellularTaskResponse {

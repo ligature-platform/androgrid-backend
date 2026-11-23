@@ -317,6 +317,9 @@ impl BenchmarkDispatcher {
                 group_id: String::new(),
                 group_epoch: 0,
                 node_group_affinity: String::new(),
+                egress_policy: 0,
+                allowed_hostnames: Vec::new(),
+                max_egress_bytes: 0,
             };
 
             total_transferred += tile.payload_bytes.len();

@@ -177,6 +177,9 @@ async fn test_bdd_scenario_1_cellular_disconnected_execution_and_zero_keepalive(
         group_id: String::new(),
         group_epoch: 0,
         node_group_affinity: String::new(),
+        allowed_hostnames: vec![],
+        egress_policy: 0,
+        max_egress_bytes: 0,
     };
     harness.scheduler.submit_task(task_501).unwrap();
 
@@ -311,6 +314,9 @@ async fn test_bdd_scenario_2_cellular_spot_dual_assignment_and_monotonic_fencing
         group_id: String::new(),
         group_epoch: 0,
         node_group_affinity: String::new(),
+        allowed_hostnames: vec![],
+        egress_policy: 0,
+        max_egress_bytes: 0,
     };
     harness.scheduler.submit_task(task_601).unwrap();
 
@@ -554,6 +560,9 @@ async fn test_bdd_scenario_3_sandbox_isolation_guard_for_unrooted_nodes() {
         group_id: String::new(),
         group_epoch: 0,
         node_group_affinity: String::new(),
+        allowed_hostnames: vec![],
+        egress_policy: 0,
+        max_egress_bytes: 0,
     };
     harness.scheduler.submit_task(privileged_task).unwrap();
 
@@ -611,6 +620,9 @@ async fn test_bdd_scenario_4_thermal_aware_task_scheduling_and_battery_protectio
         group_id: String::new(),
         group_epoch: 0,
         node_group_affinity: String::new(),
+        allowed_hostnames: vec![],
+        egress_policy: 0,
+        max_egress_bytes: 0,
     };
     harness.scheduler.submit_task(task_spec).unwrap();
 

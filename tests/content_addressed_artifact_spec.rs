@@ -340,6 +340,9 @@ async fn test_admin_service_upload_and_decoupled_task_dispatch_under_4kb() {
         group_id: String::new(),
         group_epoch: 0,
         node_group_affinity: String::new(),
+        allowed_hostnames: vec![],
+        egress_policy: 0,
+        max_egress_bytes: 0,
     };
 
     let submit_req = SubmitTaskRequest {
@@ -440,6 +443,9 @@ async fn test_admin_service_upload_and_decoupled_task_dispatch_under_4kb() {
         group_id: String::new(),
         group_epoch: 0,
         node_group_affinity: String::new(),
+        allowed_hostnames: vec![],
+        egress_policy: 0,
+        max_egress_bytes: 0,
     };
     let mut inband_buf = Vec::new();
     ClaimCellularTaskResponse {

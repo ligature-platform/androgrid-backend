@@ -175,6 +175,14 @@ enum UpgradeRolloutStrategy {
   UPGRADE_ROLLOUT_STRATEGY_ROLLING = 2;
 }
 
+// Outbound network egress access control policy for sandboxed compute workloads.
+// Traces to: [INV-006], [ANTI-003], [NFR-SEC-001], [NFR-POW-001]
+enum NetworkEgressPolicy {
+  NETWORK_EGRESS_POLICY_UNSPECIFIED = 0;
+  NETWORK_EGRESS_POLICY_BLOCKED = 1;
+  NETWORK_EGRESS_POLICY_ALLOWLIST = 2;
+}
+
 // Declarative upgrade directive instructing a worker node to fetch and install an updated client.
 // Traces to: [REQ-OP-001], [REQ-OP-002], [INV-001], [INV-002], [INV-003], [ANTI-003], [NFR-POW-001], [NFR-SEC-001]
 message NodeUpgradeDirective {
@@ -240,6 +248,11 @@ message TaskSpec {
   string group_id = 12;
   uint64 group_epoch = 13;
   string node_group_affinity = 14;
+  // Outbound network egress control policy for WASM workloads.
+  // Traces to: [INV-006], [ANTI-003], [NFR-SEC-001], [NFR-POW-001]
+  NetworkEgressPolicy egress_policy = 15;
+  repeated string allowed_hostnames = 16;
+  uint64 max_egress_bytes = 17;
 }
 
 // Unary request to claim a spot task over cellular WAN.
@@ -505,6 +518,9 @@ message TaskTemplate {
   string shell_command = 6;
   bool requires_unmetered = 7;
   string node_group_affinity = 8;
+  NetworkEgressPolicy egress_policy = 9;
+  repeated string allowed_hostnames = 10;
+  uint64 max_egress_bytes = 11;
 }
 
 // Per-partition environment overrides within a TaskGroup.

@@ -131,4 +131,8 @@ pub enum SchedulingError {
     /// Traces to: ADR-010, [REQ-OP-001]
     #[error("Durable storage error: {0}")]
     StorageError(String),
+
+    /// Traces to: [INV-006], [ANTI-003], [NFR-SEC-001], ADR-011
+    #[error("Invalid network egress policy: {0}")]
+    InvalidNetworkEgress(String),
 }

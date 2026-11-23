@@ -1,7 +1,7 @@
 # Hardware Verification Spike Report: Declarative OTA Node Upgrades
 
 **Document Identifier:** AG-VERIFY-SPIKE-OTA-2026-V1  
-**Target Hardware:** Google Pixel 8 (Physical Device / `shiba`, Serial: `37171FDJH009TA`)  
+**Target Hardware:** Google Pixel 8 (Physical Device / `shiba`, Serial: `Pixel-8-Hardware-Lab-01`)  
 **Operating System:** Android 17 (Preview / Internal Build, `ro.build.type=user`, API 34+ Baseline)  
 **Standard Compliance:** ISO/IEC/IEEE 29148:2018 Verification & Validation  
 **Governing ADR:** ADR-010 (Declarative Over-the-Air OTA Node Upgrades and Version Synchronization)  
