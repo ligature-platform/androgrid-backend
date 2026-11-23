@@ -1,11 +1,11 @@
 # ADR-011: Controlled Outbound Network Access for Sandboxed Workloads
 
 ## Status
-Accepted
+Proposed
 
 ## Architectural Scope & Requirements
 - Issue Reference: #56 (feat(wasm): support controlled outbound network access for sandboxed workloads)
-- Traceability: [INV-001], [INV-003], [INV-006], [ANTI-003], [NFR-SEC-001], [NFR-POW-001], [NFR-PERF-001]
+- Traceability: [INV-001], [INV-003], [INV-004], [INV-006], [ANTI-003], [NFR-SEC-001], [NFR-POW-001], [NFR-PERF-001]
 - Standard: ISO/IEC/IEEE 29148:2018
 
 ---
@@ -13,18 +13,20 @@ Accepted
 ## Context
 Worker nodes execute untrusted WebAssembly workloads inside an in-process Chicory WASI sandbox ([INV-006], [REQ-VER-003]). Several real-world distributed edge workloads (e.g., distributed public web scraping, external API telemetry aggregation, webhook dispatch, content verification) require outbound HTTP/HTTPS network access.
 
-However, granting uncontrolled network egress from mobile devices introduces grave security and operational risks:
+However, granting uncontrolled network egress from mobile devices introduces grave security, operational, and distributed systems risks:
 1. **Server-Side Request Forgery (SSRF) & LAN Lateral Movement:** A malicious or compromised WASM payload running on an Android worker device connected to a home, enterprise, or lab Wi-Fi network could probe and exploit private subnet targets (e.g., RFC 1918 addresses `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`), device loopback (`127.0.0.1`, `::1`), router configuration portals, local IoT endpoints, or cloud link-local metadata endpoints (`169.254.169.254`).
-2. **Open Proxy & Residential IP Abuse:** Without strict destination allowlisting, malicious actors could submit workloads transforming the mobile edge cluster into an anonymous residential proxy network for credential stuffing, spamming, or denial-of-service amplification.
-3. **Bandwidth Exhaustion & Data Exfiltration:** Workloads could exfiltrate gigabytes of sensitive data or saturate device network interfaces without transfer quotas.
-4. **Metered Cellular Radio & Battery Drain ([INV-003], [ANTI-003], [NFR-POW-001]):** Keeping cellular baseband radios active for long-running outbound data streaming violates baseband power management invariants, drains battery, and incurs unexpected cellular data billing.
-5. **Worker Thread Hanging on Cancellation:** Outbound socket operations can block indefinitely on slow or unresponsive remote servers. If the orchestrator preempts a task (`cancel_task_ids`) or the Android service watchdog fires (`WorkerForegroundService.onTimeout`), blocking socket calls must abort immediately to avoid thread and resource leakage.
+2. **DNS Rebinding & TOCTOU Sockets:** If DNS resolution validation occurs prior to socket connection, an attacker's nameserver can respond with a short TTL (TTL=0) and return a public IP during pre-flight checks, followed by an internal/private IP during socket connection.
+3. **Open Proxy & Residential IP Abuse:** Without strict destination allowlisting and public-suffix protections, malicious actors could submit workloads transforming the mobile edge cluster into an anonymous residential proxy network for credential stuffing, spamming, or denial-of-service amplification.
+4. **Bandwidth Exhaustion & Memory DOS:** Streaming unmetered responses or gzip bombs can exhaust device heap memory or saturate cellular/Wi-Fi quotas without streaming bounds.
+5. **Metered Cellular Radio & Battery Drain ([INV-003], [ANTI-003], [NFR-POW-001]):** Keeping cellular baseband radios active for long-running outbound data streaming violates baseband power management invariants, drains battery, and incurs unexpected cellular data billing.
+6. **Distributed Dual-Assignment Race Conditions ([INV-005], [ADR-004]):** If the orchestrator speculatively reassigns a running cellular task to a faster Wi-Fi node, non-idempotent outbound HTTP mutations (e.g., POST, PUT, DELETE) will execute multiple times across external servers, violating expected execution semantics.
+7. **Thread & Socket Leaks on Preemption:** Outbound socket operations can block indefinitely on slow or unresponsive remote servers. If the orchestrator preempts a task (`cancel_task_ids`) or the Android service watchdog fires (`WorkerForegroundService.onTimeout`), blocking socket calls must abort immediately to avoid thread and resource leakage.
 
 ---
 
 ## Decision
 
-We implement a multi-layered, secure, and metered outbound network egress subsystem for sandboxed WebAssembly workloads across `androgrid-backend` and `androgrid-android`:
+We establish a multi-layered, secure, and metered outbound network egress subsystem for sandboxed WebAssembly workloads across `androgrid-backend` and `androgrid-android`:
 
 ### 1. Protobuf Contract Alignment (`NetworkEgressPolicy`)
 We extend `androgrid/v1/orchestrator.proto` with explicit declarative network egress controls:
@@ -37,58 +39,110 @@ enum NetworkEgressPolicy {
 ```
 `TaskSpec` is extended with:
 - `NetworkEgressPolicy egress_policy = 15;` (Default: `BLOCKED`)
-- `repeated string allowed_hostnames = 16;` (Explicit allowed FQDNs or wildcards, e.g., `api.example.com`, `*.public.org`)
+- `repeated string allowed_hostnames = 16;` (Explicit allowed FQDNs or scoped subdomains)
 - `uint64 max_egress_bytes = 17;` (Cumulative payload transfer budget per task attempt)
 
-### 2. Multi-Layer Threat Model & SSRF Guard
-Before any socket connection or TCP handshake is initiated:
-1. **Pre-flight URL Validation:** Target URLs must strictly use `http` or `https` schemes. Raw TCP socket binding or non-HTTP protocols remain strictly prohibited, upholding [INV-001].
-2. **Destination Allowlist Verification:** If `egress_policy == NETWORK_EGRESS_POLICY_ALLOWLIST`, the target hostname must match an entry in `allowed_hostnames`. Exact matches and subdomain wildcards (`*.domain.tld`) are supported. If `egress_policy == NETWORK_EGRESS_POLICY_BLOCKED` or unlisted, the request is rejected with `SecurityException`.
-3. **DNS Resolution & Private IP Guard:**
-   - Hostnames are resolved to IP addresses prior to connection.
-   - Every resolved IP address is verified against private, loopback, and link-local ranges:
+### 2. Threat Model & Socket-Level Security Guards
+
+1. **Pre-flight Scheme & Protocol Enforcement:** Target URLs must strictly use `http` or `https` schemes. Raw TCP/UDP socket binding and arbitrary ports are strictly prohibited, upholding [INV-001].
+2. **Destination Allowlist & Public-Suffix Boundaries:**
+   - Exact FQDN matching is preferred (e.g., `api.example.com`).
+   - Bare `*` wildcards are strictly prohibited and rejected by scheduler validation.
+   - Wildcards must have at least three dot-separated components (e.g., `*.api.example.com`). Wildcards across Public Suffixes (e.g., `*.co.uk`, `*.com`) are rejected.
+   - Wildcards strictly match subdomains and never match the apex domain (`*.example.com` matches `sub.example.com` but does NOT match `example.com`).
+3. **In-Socket Anti-TOCTOU DNS Validation:**
+   - DNS validation is not performed as a disconnected pre-flight check. Instead, IP address validation is bound directly to `OkHttpClient`'s `Dns` resolver interface.
+   - When the HTTP engine resolves hostnames immediately prior to socket establishment, every resolved `InetAddress` is evaluated. If any returned IP falls within a disallowed range, resolution aborts with `UnknownHostException` / `SecurityException`.
+   - Disallowed address spaces:
      - Loopback (`127.0.0.0/8`, `::1`, `localhost`)
      - RFC 1918 Private Spaces (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`)
+     - IPv6 Unique Local Addresses (`fc00::/7`, RFC 4193)
      - Link-Local / Cloud Metadata (`169.254.0.0/16`, `fe80::/10`)
      - Carrier-Grade NAT (`100.64.0.0/10`)
      - Multicast (`224.0.0.0/4`, `ff00::/8`)
      - Wildcard / Unspecified (`0.0.0.0`, `::`)
-   - Any match immediately aborts the call with `SecurityException`, completely eliminating DNS rebinding attacks.
+     - IPv4-mapped IPv6 addresses (`::ffff:0:0/96`) are unpacked and evaluated against the full IPv4 disallow list.
+4. **Zero Redirect Following (Anti-SSRF):**
+   - The egress HTTP client explicitly configures `followRedirects = false` and `followSslRedirects = false`.
+   - Automatic 3xx redirection is forbidden to prevent open-redirect SSRF bypasses to internal services.
 
-### 3. Metered Network Guard ([ANTI-003], [INV-003], [NFR-POW-001])
-- Outbound network requests originating from WASM workloads are strictly rejected when the worker node reports an active metered connection (`capabilities.is_metered == true` or `current_transport == NETWORK_TRANSPORT_CELLULAR_WAN`), unless explicitly authorized by the scheduler and task policy.
-- Cellular spot instances remain dedicated to offline compute followed by fast baseband radio teardown (< 200 ms per [NFR-POW-001]).
+### 3. Fail-Closed Quotas and Streaming Execution
 
-### 4. Quota and Frame Limits ([NFR-PERF-001])
-- Egress transfer bytes (request body plus response body) are tracked against `max_egress_bytes`. If the transferred bytes exceed the allocated budget, the connection is terminated and an error code (`EGRESS_QUOTA_EXCEEDED`) is returned to the WASM caller.
-- Single response payloads cannot exceed the 16 MB frame sizing boundary ([NFR-PERF-001]).
+1. **Fail-Closed Default Quotas:**
+   - In accordance with proto3 defaults, if `egress_policy == ALLOWLIST` but `max_egress_bytes == 0`, the backend scheduler rejects the task as invalid. At runtime, `max_egress_bytes == 0` is treated as 0 allowed bytes (fail-closed).
+2. **Chunked Streaming without Heap Buffering:**
+   - To prevent Out-Of-Memory (OOM) crashes from large responses or compression bombs, the response body is streamed via Okio `BufferedSource` in bounded chunks directly into WASM linear memory.
+   - Total transferred bytes (headers + request body + response body) are tracked dynamically against `max_egress_bytes`. If the incoming stream exceeds the remaining quota or the 16 MB frame limit ([NFR-PERF-001]), the socket is aborted immediately.
+3. **Fail-Closed Metered Network Guard:**
+   - The engine's `isMeteredProvider` defaults to `{ true }` (fail-closed). Network egress is blocked unless an active, verified unmetered connection is explicitly confirmed.
 
-### 5. Chicory Host Function Bridge (`androgrid_net`)
-- Chicory runtime exposes the `androgrid_net` host module:
-  - `http_fetch(url_ptr: i32, url_len: i32, method_ptr: i32, method_len: i32, body_ptr: i32, body_len: i32, out_buf_ptr: i32, out_buf_cap: i32, out_written_ptr: i32) -> i32`
-- Host functions read memory directly from `instance.memory()`. No shared object (.so) files or native libraries are written to disk, maintaining in-memory W^X compliance ([INV-006], [REQ-VER-003]).
+### 4. Chicory Host Function Contract & ABI Specification
 
-### 6. Cooperative Cancellation & Preemption Hook
-- To prevent worker threads from hanging during long-running or delayed network I/O, the host module hooks into the active coroutine job:
-  ```kotlin
-  val handle = executionJob?.invokeOnCompletion(onCancelling = true) { cause ->
-      if (cause != null) {
-          activeCall?.cancel()
-      }
-  }
-  ```
-- When the job is cancelled by orchestrator preemption (`cancel_task_ids`) or service timeout (`WorkerForegroundService.onTimeout`), the underlying OkHttp `Call` is cancelled immediately, tearing down the TCP socket in under 50 ms.
+The runtime exposes the `androgrid_net` host module:
+```wasm
+(import "androgrid_net" "http_fetch" (func $http_fetch 
+  (param $url_ptr i32) (param $url_len i32)
+  (param $method_ptr i32) (param $method_len i32)
+  (param $headers_ptr i32) (param $headers_len i32)
+  (param $body_ptr i32) (param $body_len i32)
+  (param $out_buf_ptr i32) (param $out_buf_cap i32)
+  (result i32)))
+```
+
+1. **Return Codes (Negative Error Codes, Zero Traps for Network Errors):**
+   - Non-negative return value (`n >= 0`): Success. Exactly `n` bytes of response payload were written into `out_buf_ptr`.
+   - `-1` (`ERR_GENERIC_IO`): Remote connection failure, TCP timeout, or DNS resolution failure.
+   - `-403` (`ERR_SECURITY_VIOLATION`): SSRF guard triggered, disallowed IP/scheme, unlisted destination, or metered cellular route.
+   - `-413` (`ERR_BUFFER_TOO_SMALL`): The response payload exceeded `out_buf_cap`. The stream is aborted cleanly without data truncation.
+   - `-429` (`ERR_QUOTA_EXCEEDED`): Cumulative task transfer exceeded `max_egress_bytes`.
+2. **Headers Specification & Anti-Smuggling:**
+   - Headers are passed as a newline-delimited (`\n` or `\r\n`) list of `Key: Value` strings.
+   - Total serialized headers length is capped at 8192 bytes (`MAX_HEADERS_BYTES`) and counted byte-for-byte against `max_egress_bytes`.
+   - Forbidden hop-by-hop and smuggling headers: `Host`, `Transfer-Encoding`, `Content-Length`, `Connection`, `Keep-Alive`, `Proxy-Connection`, `Upgrade`, `TE`, `Trailer`, `Proxy-Authorization`, `Proxy-Authenticate`. Rejection occurs if present.
+   - All header keys and values are verified to be free of ASCII control characters (`\0`, `\r`, `\n`).
+3. **Memory Bounds Verification:**
+   - Host functions assert `url_len >= 0`, `method_len >= 0`, `headers_len >= 0`, `body_len >= 0`, and `out_buf_cap >= 0`.
+   - Bounds are checked against linear memory size prior to reading or writing.
+
+### 5. Client Lifecycle, Timeouts & Resource Teardown
+
+1. **Aggressive Timeout Bounds:**
+   - `connectTimeout = 10s`
+   - `readTimeout = 15s`
+   - `writeTimeout = 15s`
+   - `callTimeout = minOf(30s, task_timeout)`
+2. **Connection Scoping & Teardown:**
+   - A single shared Egress Client Pool is maintained per `WasmComputeEngine` instance, completely isolated from control-plane mTLS sockets.
+   - Dedicated `ConnectionPool(maxIdleConnections = 4, keepAliveDuration = 15s)`.
+   - All active calls are tracked and cleanly cancelled via coroutine cancellation hooks (`invokeOnCompletion(onCancelling = true)`).
+   - On engine close, `dispatcher.executorService.shutdownNow()` and `connectionPool.evictAll()` ensure zero socket or thread leakage.
+
+### 6. Distributed Semantics & Scheduler Invariants
+
+1. **At-Least-Once External Semantics:**
+   - Outbound HTTP requests over distributed networks exhibit **at-least-once execution semantics**. If a node encounters a network disconnection or battery failure after dispatching an outbound request, the orchestrator cannot guarantee whether the remote endpoint processed the request. Workloads performing non-idempotent mutations must supply their own application-level idempotency tokens.
+2. **Disabling Speculative Preemption & Automatic Retries:**
+   - To mitigate duplicate outbound side effects, tasks configured with `egress_policy == ALLOWLIST`:
+     - Have `max_attempts = 1` by default.
+     - Speculative preemption and dual-assignment ([ADR-004], [INV-005]) are strictly **disabled**. Egress-enabled tasks execute exclusively on a single assigned worker.
+3. **Static Bytecode Validation (`wasi_validator.rs`):**
+   - The control plane's `WasiValidator` inspects WebAssembly import sections during artifact upload and task submission.
+   - If a binary imports `androgrid_net:*` host functions while `TaskSpec.egress_policy == BLOCKED` (or unspecified), the task is rejected at submission time with `INVALID_ARGUMENT`.
 
 ---
 
 ## Consequences
 
 ### Positive
-- Enables rich distributed edge computing workloads (data aggregation, web querying, external validation) while maintaining cryptographic sandboxing.
-- Eliminates SSRF, local subnet scanning, and DNS rebinding attacks via deterministic IP filtering.
-- Protects mobile battery life and cellular carrier data allowances by enforcing the metered network guard.
-- Guarantees zero worker thread leakage upon preemption or task cancellation.
+- Closes the TOCTOU DNS rebinding vulnerability by validating IP records within the socket connection pipeline.
+- Eliminates open-redirect SSRF vulnerabilities by disabling automatic HTTP redirection.
+- Enforces strict public-suffix, apex, and CIDR space boundaries (including IPv6 ULA `fc00::/7` and IPv4-mapped IPv6).
+- Prevents JVM memory exhaustion via bounded streaming Okio reads.
+- Eliminates fail-open security flaws in default quotas and metered network detection.
+- Establishes a predictable, trap-free ABI contract with clear error codes and HTTP header capabilities.
+- Protects external third-party systems from duplicate non-idempotent calls by disabling speculative dual-assignment.
 
 ### Negative / Trade-offs
-- Slight latency overhead (typically 10-30 ms) during initial DNS pre-flight address validation.
-- Raw TCP and UDP sockets remain unsupported for WASM payloads; workloads must utilize HTTP/HTTPS request semantics.
+- Outbound requests cannot automatically follow HTTP 3xx redirects; workloads needing redirection must execute subsequent hops explicitly.
+- Speculative speedup optimization ([ADR-004]) is unavailable for egress-enabled tasks.
+- Wildcards are restricted to third-level subdomains or deeper; apex domains must be explicitly listed.
