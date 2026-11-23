@@ -950,6 +950,10 @@ impl ClusterScheduler {
             // First priority: dispatch any pending unassigned tasks
             for record in inner_ref.tasks.values_mut() {
                 if record.state == TaskState::Pending {
+                    if record.active_attempt >= record.max_attempts {
+                        record.state = TaskState::Failed;
+                        continue;
+                    }
                     if !is_task_eligible_for_worker(
                         &record.spec,
                         is_rooted,
@@ -2886,6 +2890,12 @@ pub fn validate_network_egress_policy_params(
     match egress_policy {
         0 | 1 => {
             // Unspecified or Blocked
+            if !allowed_hostnames.is_empty() || max_egress_bytes > 0 {
+                return Err(SchedulingError::InvalidNetworkEgress(
+                    "allowed_hostnames and max_egress_bytes must be empty/zero when egress_policy is BLOCKED or unspecified"
+                        .to_string(),
+                ));
+            }
             Ok(())
         }
         2 => {
@@ -2959,6 +2969,18 @@ pub fn validate_network_egress_policy_params(
                 if rest.contains('*') {
                     return Err(SchedulingError::InvalidNetworkEgress(format!(
                         "Invalid wildcard placement in allowed_hostnames: '{trimmed}'. Wildcard '*' is only permitted as a leading '*.' prefix."
+                    )));
+                }
+                let labels: Vec<&str> = rest.split('.').collect();
+                if labels.len() < 2 {
+                    return Err(SchedulingError::InvalidNetworkEgress(format!(
+                        "Invalid hostname in allowed_hostnames: '{trimmed}'. Must contain at least two dot-separated labels (e.g., 'example.com')."
+                    )));
+                }
+                let tld = labels.last().unwrap();
+                if tld.chars().all(|c| c.is_ascii_digit()) {
+                    return Err(SchedulingError::InvalidNetworkEgress(format!(
+                        "Invalid hostname in allowed_hostnames: '{trimmed}'. Top-level domain cannot be numeric."
                     )));
                 }
                 let lower = trimmed.to_ascii_lowercase();

@@ -217,6 +217,15 @@ async fn test_http_benchmark_wasm_static_validation_and_egress_policy() {
         ),
         "validate_egress_policy must reject when policy is UNSPECIFIED"
     );
+
+    let arbitrary_res = WasiValidator::validate_egress_policy(&meta, 99);
+    assert!(
+        matches!(
+            arbitrary_res,
+            Err(WasiValidationError::DisallowedNetworkImports(_))
+        ),
+        "validate_egress_policy must reject arbitrary integer policy (fail closed)"
+    );
 }
 
 #[tokio::test]
@@ -340,7 +349,6 @@ async fn test_http_benchmark_orchestrator_submission_and_lifecycle() {
 Task ID:             task_bench_e2e_001
 Target URL:          https://api.staging.benchmark.org/get
 HTTP Method:         GET
-Concurrency:         4
 Duration:            5.01s
 Total Requests:      100
 Successful (2xx):    100
@@ -365,7 +373,6 @@ JSON Report:
   "task_id": "task_bench_e2e_001",
   "target_url": "https://api.staging.benchmark.org/get",
   "method": "GET",
-  "concurrency": 4,
   "duration_secs": 5.01,
   "total_requests": 100,
   "successful_requests": 100,

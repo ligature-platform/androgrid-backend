@@ -125,14 +125,17 @@ impl WasiValidator {
             offset += bytes_read;
 
             let section_len = section_len as usize;
-            if offset + section_len > bytecode.len() {
+            let section_end = offset.checked_add(section_len).ok_or_else(|| {
+                WasiValidationError::MalformedSection("Section offset overflow".to_string())
+            })?;
+            if section_end > bytecode.len() {
                 return Err(WasiValidationError::MalformedSection(
                     "Section length extends past end of file".to_string(),
                 ));
             }
 
-            let section_data = &bytecode[offset..offset + section_len];
-            offset += section_len;
+            let section_data = &bytecode[offset..section_end];
+            offset = section_end;
 
             match section_id {
                 // Import Section (ID 2)
@@ -300,10 +303,11 @@ impl WasiValidator {
         meta: &WasiMetadata,
         egress_policy: i32,
     ) -> Result<(), WasiValidationError> {
-        if meta.has_network_egress_imports && (egress_policy == 0 || egress_policy == 1) {
+        let allowlist_val = crate::NetworkEgressPolicy::Allowlist as i32;
+        if meta.has_network_egress_imports && egress_policy != allowlist_val {
             return Err(WasiValidationError::DisallowedNetworkImports(format!(
-                "Module imports 'androgrid_net' interfaces ({:?}) but egress_policy is BLOCKED or unspecified",
-                meta.network_imports
+                "Module imports 'androgrid_net' interfaces ({:?}) but egress_policy is not ALLOWLIST (value={})",
+                meta.network_imports, egress_policy
             )));
         }
         Ok(())
@@ -346,6 +350,9 @@ impl WasiValidator {
         for &byte in data {
             bytes_read += 1;
             let val = (byte & 0x7F) as u32;
+            if shift == 28 && val > 0x0F {
+                return Err("LEB128 integer overflow");
+            }
             result |= val << shift;
             if (byte & 0x80) == 0 {
                 return Ok((result, bytes_read));
@@ -364,7 +371,9 @@ impl WasiValidator {
         let (len, bytes_read) = Self::read_leb128_u32(data)?;
         let len = len as usize;
         let start = bytes_read;
-        let end = start + len;
+        let end = start
+            .checked_add(len)
+            .ok_or("String length offset overflow")?;
 
         if end > data.len() {
             return Err("String length exceeds section data");
