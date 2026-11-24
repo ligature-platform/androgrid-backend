@@ -384,9 +384,10 @@ impl ClusterConfig {
     ///
     /// Prefers `artifact_base_url` (`ANDROGRID_ARTIFACT_BASE_URL`) when configured,
     /// appending `/v1/blobs` if not already present. Otherwise derives an HTTPS URL from
-    /// `listen_addr`, normalizing unspecified bind addresses (`0.0.0.0`, `::`) to loopback.
+    /// the routable cluster endpoint (`resolve_cluster_endpoint()`), ensuring remote workers
+    /// on LAN or WAN reach the correct host IP rather than loopback.
     ///
-    /// Traces to: [INV-002], [NFR-PERF-001], ADR-008
+    /// Traces to: [INV-002], [NFR-PERF-001], ADR-008, [REQ-OP-001]
     pub fn resolve_mtls_blob_base_url(&self) -> String {
         if let Some(ref base) = self.artifact_base_url {
             let trimmed = base.trim_end_matches('/');
@@ -396,17 +397,8 @@ impl ClusterConfig {
                 format!("{trimmed}/v1/blobs")
             }
         } else {
-            let port = self.listen_addr.port();
-            match self.listen_addr.ip() {
-                std::net::IpAddr::V4(ip) if ip.is_unspecified() => {
-                    format!("https://127.0.0.1:{port}/v1/blobs")
-                }
-                std::net::IpAddr::V6(ip) if ip.is_unspecified() => {
-                    format!("https://[::1]:{port}/v1/blobs")
-                }
-                std::net::IpAddr::V6(ip) => format!("https://[{ip}]:{port}/v1/blobs"),
-                std::net::IpAddr::V4(ip) => format!("https://{ip}:{port}/v1/blobs"),
-            }
+            let endpoint = self.resolve_cluster_endpoint();
+            format!("https://{endpoint}/v1/blobs")
         }
     }
 
@@ -495,9 +487,17 @@ mod tests {
             listen_addr: "0.0.0.0:50051".parse().unwrap(),
             ..Default::default()
         };
+        // Unspecified without host IP env defaults to loopback endpoint
         assert_eq!(
             config.resolve_mtls_blob_base_url(),
             "https://127.0.0.1:50051/v1/blobs"
+        );
+
+        // When cluster_endpoint or host IP is set, resolve_mtls_blob_base_url respects it
+        config.cluster_endpoint = Some("192.168.1.100:50051".to_string());
+        assert_eq!(
+            config.resolve_mtls_blob_base_url(),
+            "https://192.168.1.100:50051/v1/blobs"
         );
 
         config.artifact_base_url = Some("https://cluster.example.com/".to_string());
