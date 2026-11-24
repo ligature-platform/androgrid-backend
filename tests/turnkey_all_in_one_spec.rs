@@ -130,6 +130,7 @@ async fn test_web_ui_dashboard_and_pairing_endpoints() {
         ca_fingerprint: ca_fingerprint.clone(),
         cluster_endpoint: cluster_endpoint.clone(),
         apk_download_url: apk_url.clone(),
+        pairing_token_ttl_seconds: 300,
     };
 
     let app = web_ui_router(web_state);
@@ -158,12 +159,12 @@ async fn test_web_ui_dashboard_and_pairing_endpoints() {
     assert!(html_body.contains("Device Pairing"));
     assert!(html_body.contains("node-table"));
 
-    // 2.2 GET /api/pair returns JSON pairing payload with QR data URL
+    // 2.2 POST /api/pair returns JSON pairing payload with QR data URL
     let pair_resp = client
-        .get(format!("http://{addr}/api/pair"))
+        .post(format!("http://{addr}/api/pair"))
         .send()
         .await
-        .expect("GET /api/pair must succeed");
+        .expect("POST /api/pair must succeed");
     assert_eq!(pair_resp.status(), reqwest::StatusCode::OK);
     let pair_data: PairingWebResponse = pair_resp.json().await.unwrap();
     assert_eq!(pair_data.cluster_endpoint, cluster_endpoint);
@@ -174,9 +175,12 @@ async fn test_web_ui_dashboard_and_pairing_endpoints() {
         .starts_with("data:image/png;base64,"));
     assert_eq!(pair_data.apk_download_url, apk_url);
 
-    // 2.3 GET /api/pair/qr.png serves valid PNG image bytes
+    // 2.3 GET /api/pair/qr.png serves valid PNG image bytes for the specific token
     let qr_png_resp = client
-        .get(format!("http://{addr}/api/pair/qr.png"))
+        .get(format!(
+            "http://{addr}/api/pair/qr.png?token={}",
+            pair_data.pairing_token
+        ))
         .send()
         .await
         .expect("GET /api/pair/qr.png must succeed");
@@ -285,6 +289,7 @@ async fn test_end_to_end_worker_pairing_from_web_qr_code() {
         ca_fingerprint: ca_fingerprint.clone(),
         cluster_endpoint: grpc_addr.to_string(),
         apk_download_url: "https://example.com/androgrid-worker.apk".to_string(),
+        pairing_token_ttl_seconds: 300,
     };
     let web_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let web_addr = web_listener.local_addr().unwrap();
@@ -295,10 +300,10 @@ async fn test_end_to_end_worker_pairing_from_web_qr_code() {
             .expect("Web UI run");
     });
 
-    // 4. Operator fetches pairing QR code from Web UI
+    // 4. Operator fetches pairing QR code from Web UI via POST /api/pair
     let http_client = reqwest::Client::new();
     let pair_res: PairingWebResponse = http_client
-        .get(format!("http://{web_addr}/api/pair"))
+        .post(format!("http://{web_addr}/api/pair"))
         .send()
         .await
         .unwrap()
