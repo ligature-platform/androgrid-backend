@@ -429,7 +429,12 @@ impl ClusterScheduler {
     }
 
     /// Submits a new compute task specification to the pending queue.
-    pub fn submit_task(&self, spec: TaskSpec) -> Result<(), SchedulingError> {
+    pub fn submit_task(&self, mut spec: TaskSpec) -> Result<(), SchedulingError> {
+        spec.allowed_hostnames = spec
+            .allowed_hostnames
+            .into_iter()
+            .map(|h| h.trim().to_ascii_lowercase())
+            .collect();
         validate_network_egress_policy(&spec)?;
         if spec.engine == ExecutionEngine::WasmWasi as i32 && !spec.wasm_bytecode.is_empty() {
             if spec.wasm_bytecode.len() < 8 {
@@ -1550,9 +1555,14 @@ impl ClusterScheduler {
     ) -> Result<SubmitTaskGroupResponse, SchedulingError> {
         validate_group_id(&group.group_id)?;
         validate_partitions(&group.partitions)?;
-        let template = group.template.ok_or_else(|| {
+        let mut template = group.template.ok_or_else(|| {
             SchedulingError::InvalidGroupPartitions("template is required".to_string())
         })?;
+        template.allowed_hostnames = template
+            .allowed_hostnames
+            .into_iter()
+            .map(|h| h.trim().to_ascii_lowercase())
+            .collect();
         validate_task_template(&template)?;
 
         let mut inner = self.inner.write().expect("RwLock write lock poisoned");
@@ -2886,6 +2896,12 @@ pub fn validate_network_egress_policy_params(
     match egress_policy {
         0 | 1 => {
             // Unspecified or Blocked
+            if !allowed_hostnames.is_empty() || max_egress_bytes > 0 {
+                return Err(SchedulingError::InvalidNetworkEgress(
+                    "allowed_hostnames and max_egress_bytes must be empty/zero when egress_policy is BLOCKED or unspecified"
+                        .to_string(),
+                ));
+            }
             Ok(())
         }
         2 => {
@@ -2959,6 +2975,25 @@ pub fn validate_network_egress_policy_params(
                 if rest.contains('*') {
                     return Err(SchedulingError::InvalidNetworkEgress(format!(
                         "Invalid wildcard placement in allowed_hostnames: '{trimmed}'. Wildcard '*' is only permitted as a leading '*.' prefix."
+                    )));
+                }
+                let labels: Vec<&str> = rest.split('.').collect();
+                if labels.len() < 2 {
+                    return Err(SchedulingError::InvalidNetworkEgress(format!(
+                        "Invalid hostname in allowed_hostnames: '{trimmed}'. Must contain at least two dot-separated labels (e.g., 'example.com')."
+                    )));
+                }
+                let tld = labels.last().unwrap();
+                let is_valid_tld = tld.len() >= 2
+                    && (tld.chars().all(|c| c.is_ascii_alphabetic())
+                        || (tld.starts_with("xn--")
+                            && tld.len() > 4
+                            && tld[4..]
+                                .chars()
+                                .all(|c| c.is_ascii_alphanumeric() || c == '-')));
+                if !is_valid_tld {
+                    return Err(SchedulingError::InvalidNetworkEgress(format!(
+                        "Invalid hostname in allowed_hostnames: '{trimmed}'. Top-level domain must be valid ASCII alphabetic or punycode."
                     )));
                 }
                 let lower = trimmed.to_ascii_lowercase();

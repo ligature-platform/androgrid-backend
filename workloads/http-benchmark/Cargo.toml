@@ -1,0 +1,24 @@
+[package]
+name = "http-benchmark"
+version = "0.0.1-alpha.1"
+edition = "2021"
+license = "MIT"
+description = "Canonical WASI HTTP/HTTPS Load Testing Benchmark Workload for AndroGrid distributed edge compute"
+
+[lib]
+name = "http_benchmark"
+path = "src/lib.rs"
+
+[[bin]]
+name = "http_benchmark"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true

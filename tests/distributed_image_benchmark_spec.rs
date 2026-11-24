@@ -223,6 +223,7 @@ fn test_zero_unicode_dashes_in_workloads() {
     let paths_to_check = [
         manifest_dir.join("src").join("benchmark"),
         manifest_dir.join("workloads").join("image-processor"),
+        manifest_dir.join("workloads").join("http-benchmark"),
     ];
 
     fn check_dir(dir: &std::path::Path) {

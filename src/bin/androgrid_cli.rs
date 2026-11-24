@@ -665,7 +665,7 @@ enum CertIssueCommands {
 /// Parses KEY=VALUE command-line strings into pairs.
 fn parse_key_val(s: &str) -> Result<(String, String), String> {
     s.split_once('=')
-        .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+        .map(|(k, v)| (k.trim().to_string(), v.to_string()))
         .ok_or_else(|| format!("Invalid environment variable format '{s}': expected KEY=VALUE"))
 }
 
@@ -1273,6 +1273,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let meta = WasiValidator::validate(&bytecode, &entrypoint)
                         .map_err(|e| format!("WASI validation failed: {e}"))?;
 
+                    // Validate egress policy before artifact upload
+                    WasiValidator::validate_egress_policy(&meta, egress_policy_val)
+                        .map_err(|e| format!("Network egress policy validation failed: {e}"))?;
+
+                    if egress_policy_val != NetworkEgressPolicy::Allowlist as i32
+                        && (!allowed_hostnames.is_empty() || max_egress_bytes > 0)
+                    {
+                        return Err(
+                            "Cannot specify --allowed-hostnames or --max-egress-bytes unless --egress-policy is allowlist".into(),
+                        );
+                    }
+
                     let sha256_hex = meta.artifact_sha256;
 
                     // External HTTP artifact_url is deprecated; workers resolve artifacts via mTLS FetchArtifact
@@ -1815,6 +1827,19 @@ async fn resolve_group_template(
         })?;
         let meta = WasiValidator::validate(&bytecode, &entrypoint)
             .map_err(|e| format!("WASI validation failed: {e}"))?;
+
+        // Validate egress policy before artifact upload
+        WasiValidator::validate_egress_policy(&meta, egress_policy)
+            .map_err(|e| format!("Network egress policy validation failed: {e}"))?;
+
+        if egress_policy != NetworkEgressPolicy::Allowlist as i32
+            && (!allowed_hostnames.is_empty() || max_egress_bytes > 0)
+        {
+            return Err(
+                "Cannot specify --allowed-hostnames or --max-egress-bytes unless --egress-policy is allowlist".into(),
+            );
+        }
+
         let sha256_hex = meta.artifact_sha256;
         upload_wasm_artifact_cli(
             client,
@@ -2358,7 +2383,7 @@ mod tests {
 
         let (k2, v2) = parse_key_val("SPACED_KEY = SPACED_VAL").unwrap();
         assert_eq!(k2, "SPACED_KEY");
-        assert_eq!(v2, "SPACED_VAL");
+        assert_eq!(v2, " SPACED_VAL");
     }
 
     #[test]
