@@ -253,6 +253,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ca_fingerprint: ca_fingerprint.clone(),
             cluster_endpoint: cluster_endpoint.clone(),
             apk_download_url: config.apk_download_url.clone(),
+            pairing_token_ttl_seconds: config.pairing_token_ttl_seconds,
         };
         let web_app = web_ui_router(web_state);
         info!(

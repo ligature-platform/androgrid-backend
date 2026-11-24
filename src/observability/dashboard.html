@@ -1042,7 +1042,7 @@
       }
     }
 
-    async function fetchPairingInfo(method = 'GET') {
+    async function fetchPairingInfo(method = 'POST') {
       try {
         const resp = await fetch('/api/pair', { method });
         if (!resp.ok) throw new Error('HTTP ' + resp.status);

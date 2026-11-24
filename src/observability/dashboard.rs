@@ -41,6 +41,8 @@ pub struct WebUiState {
     pub cluster_endpoint: String,
     /// URL for downloading the worker APK package from GitHub Releases or mirror.
     pub apk_download_url: String,
+    /// Configured pairing token TTL in seconds (default: 300).
+    pub pairing_token_ttl_seconds: u32,
 }
 
 /// JSON payload containing pairing parameters and QR representation.
@@ -163,7 +165,13 @@ fn build_pairing_response(
         "Pairing token store is not configured or pairing is disabled",
     ))?;
 
-    let record = token_store.generate_token(None, Some(300)).map_err(|_| {
+    let ttl = if state.pairing_token_ttl_seconds > 0 {
+        Some(state.pairing_token_ttl_seconds)
+    } else {
+        Some(300)
+    };
+
+    let record = token_store.generate_token(None, ttl).map_err(|_| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             "Failed to generate pairing token",
@@ -203,7 +211,8 @@ fn build_pairing_response(
     })
 }
 
-/// GET /api/pair: Generates or retrieves an ephemeral device pairing token with QR representation.
+/// GET /api/pair: Deprecated idempotency alias returning fresh pairing token with QR representation.
+/// Deprecated in favor of explicit POST /api/pair to prevent pre-fetchers from creating tokens.
 ///
 /// Traces to: [REQ-OP-001], [INV-002]
 async fn handle_get_pairing(
@@ -223,14 +232,41 @@ async fn handle_post_pairing(
     Ok(Json(resp))
 }
 
+/// Query parameters for /api/pair/qr.png
+#[derive(Debug, Deserialize)]
+pub struct PairingQrQuery {
+    pub token: Option<String>,
+}
+
 /// GET /api/pair/qr.png: Serves direct binary PNG image of the pairing QR code.
+/// If `?token=<token>` is supplied, renders the QR code for that existing token.
+/// Otherwise generates a fresh token.
 ///
 /// Traces to: [REQ-OP-001], [INV-002]
 async fn handle_pairing_qr_png(
     State(state): State<WebUiState>,
+    axum::extract::Query(query): axum::extract::Query<PairingQrQuery>,
 ) -> Result<Response, (StatusCode, &'static str)> {
-    let resp = build_pairing_response(&state)?;
-    let png_bytes = render_png_bytes(&resp.pairing_payload_json).map_err(|_| {
+    let payload_json = if let Some(ref tok) = query.token {
+        let payload = PairingPayload {
+            cluster_endpoint: state.cluster_endpoint.clone(),
+            ca_fingerprint: state.ca_fingerprint.clone(),
+            pairing_token: tok.clone(),
+            node_id: None,
+            expires_at_epoch_s: 0,
+        };
+        payload.to_compact_json().map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to serialize pairing payload",
+            )
+        })?
+    } else {
+        let resp = build_pairing_response(&state)?;
+        resp.pairing_payload_json
+    };
+
+    let png_bytes = render_png_bytes(&payload_json).map_err(|_| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             "Failed to render PNG QR code",
@@ -309,6 +345,7 @@ mod tests {
                 .to_string(),
             cluster_endpoint: "192.168.1.100:50051".to_string(),
             apk_download_url: "https://example.com/worker.apk".to_string(),
+            pairing_token_ttl_seconds: 300,
         };
 
         let app = web_ui_router(state);
@@ -338,13 +375,14 @@ mod tests {
                 .to_string(),
             cluster_endpoint: "192.168.1.100:50051".to_string(),
             apk_download_url: "https://example.com/worker.apk".to_string(),
+            pairing_token_ttl_seconds: 300,
         };
 
         let app = web_ui_router(state);
 
         let req = Request::builder()
             .uri("/api/pair")
-            .method("GET")
+            .method("POST")
             .body(Body::empty())
             .unwrap();
 
@@ -374,6 +412,7 @@ mod tests {
                 .to_string(),
             cluster_endpoint: "192.168.1.100:50051".to_string(),
             apk_download_url: "https://example.com/worker.apk".to_string(),
+            pairing_token_ttl_seconds: 300,
         };
 
         let app = web_ui_router(state);
@@ -405,6 +444,7 @@ mod tests {
                 .to_string(),
             cluster_endpoint: "192.168.1.100:50051".to_string(),
             apk_download_url: "https://example.com/worker.apk".to_string(),
+            pairing_token_ttl_seconds: 300,
         };
 
         let app = web_ui_router(state);
