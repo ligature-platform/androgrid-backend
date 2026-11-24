@@ -175,7 +175,7 @@ async fn test_web_ui_dashboard_and_pairing_endpoints() {
         .starts_with("data:image/png;base64,"));
     assert_eq!(pair_data.apk_download_url, apk_url);
 
-    // 2.3 GET /api/pair/qr.png serves valid PNG image bytes for the specific token
+    // 2.3 GET /api/pair/qr.png serves valid PNG image bytes for the specific active token
     let qr_png_resp = client
         .get(format!(
             "http://{addr}/api/pair/qr.png?token={}",
@@ -192,6 +192,17 @@ async fn test_web_ui_dashboard_and_pairing_endpoints() {
     let png_bytes = qr_png_resp.bytes().await.unwrap();
     // PNG file header magic: 0x89 'P' 'N' 'G'
     assert_eq!(&png_bytes[..4], &[0x89, 0x50, 0x4E, 0x47]);
+
+    // 2.3b Negative validation: non-existent token must yield 404 Not Found
+    let fake_token = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    let bad_qr_resp = client
+        .get(format!(
+            "http://{addr}/api/pair/qr.png?token={fake_token}"
+        ))
+        .send()
+        .await
+        .expect("GET /api/pair/qr.png with invalid token must receive response");
+    assert_eq!(bad_qr_resp.status(), reqwest::StatusCode::NOT_FOUND);
 
     // 2.4 GET /api/apk-info returns APK download metadata
     let apk_resp = client
