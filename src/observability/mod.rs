@@ -16,3 +16,6 @@ pub use dashboard::*;
 
 pub mod tui;
 pub use tui::*;
+
+pub mod mdns;
+pub use mdns::*;

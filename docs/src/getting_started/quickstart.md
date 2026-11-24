@@ -1,12 +1,48 @@
 # Quickstart Guide: Local Cluster Deployment
 
-This guide provides a comprehensive, step-by-step walkthrough to deploy and verify an AndroGrid control plane cluster locally using **Podman** for rootless container orchestration.
+This guide provides a comprehensive, step-by-step walkthrough to deploy and verify an AndroGrid control plane cluster.
 
-Traceability: `[REQ-OP-001]`, `[REQ-OP-004]`, `[INV-002]`, `[ANTI-002]`, `[NFR-SEC-001]`.
+Traceability: `[REQ-OP-001]`, `[REQ-OP-004]`, `[INV-001]`, `[INV-002]`, `[ANTI-002]`, `[NFR-SEC-001]`.
 
 ---
 
-## Architectural Rationale: Why Podman?
+## Deployment Pathways
+
+AndroGrid supports two deployment pathways:
+- **Option 1: Turnkey All-In-One Container (Recommended):** Instant zero-configuration deployment. Boots in seconds with auto-detected host IP, automated PKI, mDNS discovery, and embedded Web UI.
+- **Option 2: Advanced Manual Deployment (Podman Compose & Custom PKI):** Modular multi-container architecture with custom PKI management and Cloudflare Anycast ingress.
+
+---
+
+## Option 1: Turnkey All-In-One Container (Instant Zero-Config)
+
+Operators can launch the entire control plane with a single container run command:
+
+```bash
+# Launch with Docker (host networking required for mDNS 5353/UDP & host LAN detection)
+docker run -d --net=host -v androgrid-data:/data ghcr.io/ligature-platform/androgrid-backend:latest
+
+# Or launch with Podman (rootless)
+podman run -d --net=host -v androgrid-data:/data:Z ghcr.io/ligature-platform/androgrid-backend:latest
+```
+
+> [!WARNING]
+> **Network Security Scope:** The turnkey container is scoped strictly to trusted local LANs. Do not run with `--net=host` on public-IP hosts without setting `ANDROGRID_WEB_LISTEN_ADDR=127.0.0.1:8080` or `ANDROGRID_ALLOW_PAIRING=false` to prevent unauthenticated onboarding over the Internet.
+
+### Automated Turnkey Capabilities:
+1. **Primary LAN IP Detection:** The container inspects host routing tables to resolve the primary LAN IP.
+2. **Auto-PKI Initialization:** If `/data/pki/` is empty, it runs `androgrid-cli cert init --san <host_ip>` generating NIST P-256 ECDSA certificates with valid SAN attributes for mobile verification (`[NFR-SEC-001]`, ADR-001).
+3. **mDNS Service Advertisement:** The orchestrator advertises `_androgrid._tcp.local.` on port 50051 via UDP 5353. Android devices on the local Wi-Fi detect the cluster automatically without entering IP addresses.
+4. **Embedded Operator Web UI (Port 8080):** Open `http://<host_ip>:8080` in any web browser to:
+   - View the live pairing QR code to enroll Android devices with a single camera scan.
+   - Monitor connected worker nodes in real time (SoC / ABI, RAM, Battery %, OS version, active tasks).
+   - Download the worker APK directly to the device or scan the APK download QR code.
+
+---
+
+## Option 2: Advanced Manual Deployment (Podman Compose)
+
+### Architectural Rationale: Why Podman?
 
 AndroGrid standardizes on **Podman** (`podman compose`) over traditional Docker for all containerized control plane deployments.
 
