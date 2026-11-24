@@ -196,9 +196,7 @@ async fn test_web_ui_dashboard_and_pairing_endpoints() {
     // 2.3b Negative validation: non-existent token must yield 404 Not Found
     let fake_token = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     let bad_qr_resp = client
-        .get(format!(
-            "http://{addr}/api/pair/qr.png?token={fake_token}"
-        ))
+        .get(format!("http://{addr}/api/pair/qr.png?token={fake_token}"))
         .send()
         .await
         .expect("GET /api/pair/qr.png with invalid token must receive response");
