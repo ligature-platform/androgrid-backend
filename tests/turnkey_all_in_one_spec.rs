@@ -37,7 +37,7 @@ use rcgen::{CertificateParams, DnType, KeyPair};
 use x509_parser::prelude::*;
 
 /// 1. Verifies that Day-0 automated PKI generation produces NIST P-256 ECDSA certificates
-/// with the detected host LAN IP successfully injected into Subject Alternative Names (SANs).
+///    with the detected host LAN IP successfully injected into Subject Alternative Names (SANs).
 ///
 /// Traces to: ADR-001, [INV-002], [NFR-SEC-001], [REQ-OP-001]
 #[test]
@@ -51,7 +51,10 @@ fn test_auto_pki_generation_and_host_san_injection() {
 
     let init_config = PkiInitConfig {
         out_dir: pki_out.clone(),
-        extra_sans: vec![host_lan_ip.to_string(), "edge.androgrid.internal".to_string()],
+        extra_sans: vec![
+            host_lan_ip.to_string(),
+            "edge.androgrid.internal".to_string(),
+        ],
         no_default_sans: false,
         ca_days: 1825,
         days: 365,
@@ -87,7 +90,10 @@ fn test_auto_pki_generation_and_host_san_injection() {
                 if let GeneralName::IPAddress(ip_bytes) = name {
                     if ip_bytes.len() == 4 {
                         let ip = std::net::Ipv4Addr::new(
-                            ip_bytes[0], ip_bytes[1], ip_bytes[2], ip_bytes[3],
+                            ip_bytes[0],
+                            ip_bytes[1],
+                            ip_bytes[2],
+                            ip_bytes[3],
                         );
                         if ip.to_string() == host_lan_ip {
                             found_lan_ip = true;
@@ -113,7 +119,8 @@ fn test_auto_pki_generation_and_host_san_injection() {
 async fn test_web_ui_dashboard_and_pairing_endpoints() {
     let scheduler = Arc::new(ClusterScheduler::new());
     let token_store = Arc::new(PairingTokenStore::default());
-    let ca_fingerprint = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_string();
+    let ca_fingerprint =
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_string();
     let cluster_endpoint = "192.168.1.185:50051".to_string();
     let apk_url = "https://github.com/ligature-platform/androgrid-android/releases/latest/download/androgrid-worker.apk".to_string();
 
@@ -162,7 +169,9 @@ async fn test_web_ui_dashboard_and_pairing_endpoints() {
     assert_eq!(pair_data.cluster_endpoint, cluster_endpoint);
     assert_eq!(pair_data.ca_fingerprint, ca_fingerprint);
     assert_eq!(pair_data.pairing_token.len(), 64);
-    assert!(pair_data.qr_png_data_url.starts_with("data:image/png;base64,"));
+    assert!(pair_data
+        .qr_png_data_url
+        .starts_with("data:image/png;base64,"));
     assert_eq!(pair_data.apk_download_url, apk_url);
 
     // 2.3 GET /api/pair/qr.png serves valid PNG image bytes
@@ -189,7 +198,9 @@ async fn test_web_ui_dashboard_and_pairing_endpoints() {
     assert_eq!(apk_resp.status(), reqwest::StatusCode::OK);
     let apk_data: ApkInfoResponse = apk_resp.json().await.unwrap();
     assert_eq!(apk_data.apk_download_url, apk_url);
-    assert!(apk_data.qr_png_data_url.starts_with("data:image/png;base64,"));
+    assert!(apk_data
+        .qr_png_data_url
+        .starts_with("data:image/png;base64,"));
 }
 
 /// 3. End-to-end integration test: An Android worker parses the Web UI pairing QR code,
@@ -258,12 +269,10 @@ async fn test_end_to_end_worker_pairing_from_web_qr_code() {
             .tls_config(server_tls)
             .expect("TLS config")
             .add_service(EnrollmentServiceServer::new(enrollment_service))
-            .add_service(
-                tonic::codegen::InterceptedService::new(
-                    AndroGridServiceServer::new(androgrid_service),
-                    require_client_mtls_interceptor,
-                ),
-            )
+            .add_service(tonic::codegen::InterceptedService::new(
+                AndroGridServiceServer::new(androgrid_service),
+                require_client_mtls_interceptor,
+            ))
             .serve_with_incoming(TcpListenerStream::new(grpc_listener))
             .await
             .expect("gRPC server run");
@@ -308,21 +317,28 @@ async fn test_end_to_end_worker_pairing_from_web_qr_code() {
     let worker_node_id = "worker-pixel8-e2e";
     let worker_key = KeyPair::generate().expect("Generate worker key");
     let mut csr_params = CertificateParams::default();
-    csr_params.distinguished_name.push(DnType::CommonName, worker_node_id);
-    let worker_csr_pem = csr_params.serialize_request(&worker_key).unwrap().pem().unwrap();
+    csr_params
+        .distinguished_name
+        .push(DnType::CommonName, worker_node_id);
+    let worker_csr_pem = csr_params
+        .serialize_request(&worker_key)
+        .unwrap()
+        .pem()
+        .unwrap();
 
     // 7. Worker connects to EnrollmentService over bootstrap TLS (server auth only)
-    let bootstrap_channel = tonic::transport::Channel::from_shared(format!("https://{}", payload.cluster_endpoint))
-        .unwrap()
-        .tls_config(
-            tonic::transport::ClientTlsConfig::new()
-                .ca_certificate(tonic::transport::Certificate::from_pem(&ca_cert_pem))
-                .domain_name("localhost"),
-        )
-        .unwrap()
-        .connect()
-        .await
-        .expect("Connect to enrollment service");
+    let bootstrap_channel =
+        tonic::transport::Channel::from_shared(format!("https://{}", payload.cluster_endpoint))
+            .unwrap()
+            .tls_config(
+                tonic::transport::ClientTlsConfig::new()
+                    .ca_certificate(tonic::transport::Certificate::from_pem(&ca_cert_pem))
+                    .domain_name("localhost"),
+            )
+            .unwrap()
+            .connect()
+            .await
+            .expect("Connect to enrollment service");
 
     let mut enroll_client = EnrollmentServiceClient::new(bootstrap_channel);
     let enroll_res = enroll_client
@@ -347,13 +363,14 @@ async fn test_end_to_end_worker_pairing_from_web_qr_code() {
         "localhost",
     );
 
-    let mtls_channel = tonic::transport::Channel::from_shared(format!("https://{}", payload.cluster_endpoint))
-        .unwrap()
-        .tls_config(mtls_tls_config)
-        .unwrap()
-        .connect()
-        .await
-        .expect("Connect via mTLS 1.3");
+    let mtls_channel =
+        tonic::transport::Channel::from_shared(format!("https://{}", payload.cluster_endpoint))
+            .unwrap()
+            .tls_config(mtls_tls_config)
+            .unwrap()
+            .connect()
+            .await
+            .expect("Connect via mTLS 1.3");
 
     let mut worker_client = AndroGridServiceClient::new(mtls_channel);
 
@@ -394,7 +411,7 @@ async fn test_end_to_end_worker_pairing_from_web_qr_code() {
 }
 
 /// 4. Verifies the Multicast DNS (mDNS) responder lifecycle: advertising service type
-/// `_androgrid._tcp.local.` and updating TXT records when node count changes.
+///    `_androgrid._tcp.local.` and updating TXT records when node count changes.
 ///
 /// Traces to: [REQ-OP-001], [INV-001]
 #[test]
@@ -404,12 +421,15 @@ fn test_mdns_responder_lifecycle_and_updates() {
         host_name: "turnkey.local.".to_string(),
         port: 50051,
         version: "0.0.1-alpha.5".to_string(),
-        ca_fingerprint: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_string(),
+        ca_fingerprint: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            .to_string(),
         ip: Some("127.0.0.1".to_string()),
     };
 
     let responder = MdnsResponder::start(mdns_config).expect("Start mDNS responder");
-    assert!(responder.full_service_name().contains("_androgrid._tcp.local."));
+    assert!(responder
+        .full_service_name()
+        .contains("_androgrid._tcp.local."));
 
     // Update node count dynamically
     assert!(responder.update_node_count(1).is_ok());

@@ -155,15 +155,20 @@ async fn handle_web_events(
 }
 
 /// Generates a fresh ephemeral pairing token and returns the full pairing response.
-fn build_pairing_response(state: &WebUiState) -> Result<PairingWebResponse, (StatusCode, &'static str)> {
+fn build_pairing_response(
+    state: &WebUiState,
+) -> Result<PairingWebResponse, (StatusCode, &'static str)> {
     let token_store = state.token_store.as_ref().ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
         "Pairing token store is not configured or pairing is disabled",
     ))?;
 
-    let record = token_store
-        .generate_token(None, Some(300))
-        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Failed to generate pairing token"))?;
+    let record = token_store.generate_token(None, Some(300)).map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to generate pairing token",
+        )
+    })?;
 
     let payload = PairingPayload {
         cluster_endpoint: state.cluster_endpoint.clone(),
@@ -173,12 +178,19 @@ fn build_pairing_response(state: &WebUiState) -> Result<PairingWebResponse, (Sta
         expires_at_epoch_s: record.expires_at_epoch_s,
     };
 
-    let payload_json = payload
-        .to_compact_json()
-        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Failed to serialize pairing payload"))?;
+    let payload_json = payload.to_compact_json().map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to serialize pairing payload",
+        )
+    })?;
 
-    let qr_png_data_url = render_png_data_url(&payload_json)
-        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Failed to render QR code matrix"))?;
+    let qr_png_data_url = render_png_data_url(&payload_json).map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to render QR code matrix",
+        )
+    })?;
 
     Ok(PairingWebResponse {
         pairing_token: record.token,
@@ -218,8 +230,12 @@ async fn handle_pairing_qr_png(
     State(state): State<WebUiState>,
 ) -> Result<Response, (StatusCode, &'static str)> {
     let resp = build_pairing_response(&state)?;
-    let png_bytes = render_png_bytes(&resp.pairing_payload_json)
-        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Failed to render PNG QR code"))?;
+    let png_bytes = render_png_bytes(&resp.pairing_payload_json).map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to render PNG QR code",
+        )
+    })?;
 
     let mut headers = HeaderMap::new();
     headers.insert(CONTENT_TYPE, "image/png".parse().expect("Valid header"));
@@ -239,8 +255,12 @@ async fn handle_pairing_qr_png(
 async fn handle_apk_info(
     State(state): State<WebUiState>,
 ) -> Result<Json<ApkInfoResponse>, (StatusCode, &'static str)> {
-    let qr_png_data_url = render_png_data_url(&state.apk_download_url)
-        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Failed to render APK QR code"))?;
+    let qr_png_data_url = render_png_data_url(&state.apk_download_url).map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to render APK QR code",
+        )
+    })?;
 
     Ok(Json(ApkInfoResponse {
         apk_download_url: state.apk_download_url,
@@ -254,8 +274,12 @@ async fn handle_apk_info(
 async fn handle_apk_qr_png(
     State(state): State<WebUiState>,
 ) -> Result<Response, (StatusCode, &'static str)> {
-    let png_bytes = render_png_bytes(&state.apk_download_url)
-        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Failed to render APK PNG QR code"))?;
+    let png_bytes = render_png_bytes(&state.apk_download_url).map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to render APK PNG QR code",
+        )
+    })?;
 
     let mut headers = HeaderMap::new();
     headers.insert(CONTENT_TYPE, "image/png".parse().expect("Valid header"));
@@ -281,7 +305,8 @@ mod tests {
         let state = WebUiState {
             scheduler,
             token_store: Some(token_store),
-            ca_fingerprint: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_string(),
+            ca_fingerprint: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                .to_string(),
             cluster_endpoint: "192.168.1.100:50051".to_string(),
             apk_download_url: "https://example.com/worker.apk".to_string(),
         };
@@ -309,7 +334,8 @@ mod tests {
         let state = WebUiState {
             scheduler,
             token_store: Some(token_store),
-            ca_fingerprint: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_string(),
+            ca_fingerprint: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                .to_string(),
             cluster_endpoint: "192.168.1.100:50051".to_string(),
             apk_download_url: "https://example.com/worker.apk".to_string(),
         };
@@ -325,11 +351,15 @@ mod tests {
         let resp = app.clone().oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
 
-        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let payload: PairingWebResponse = serde_json::from_slice(&body_bytes).unwrap();
         assert_eq!(payload.cluster_endpoint, "192.168.1.100:50051");
         assert_eq!(payload.pairing_token.len(), 64);
-        assert!(payload.qr_png_data_url.starts_with("data:image/png;base64,"));
+        assert!(payload
+            .qr_png_data_url
+            .starts_with("data:image/png;base64,"));
         assert_eq!(payload.apk_download_url, "https://example.com/worker.apk");
     }
 
@@ -340,7 +370,8 @@ mod tests {
         let state = WebUiState {
             scheduler,
             token_store: Some(token_store),
-            ca_fingerprint: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_string(),
+            ca_fingerprint: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                .to_string(),
             cluster_endpoint: "192.168.1.100:50051".to_string(),
             apk_download_url: "https://example.com/worker.apk".to_string(),
         };
@@ -357,7 +388,9 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(resp.headers().get(CONTENT_TYPE).unwrap(), "image/png");
 
-        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         assert_eq!(&body_bytes[..4], &[0x89, 0x50, 0x4E, 0x47]);
     }
 
@@ -368,7 +401,8 @@ mod tests {
         let state = WebUiState {
             scheduler,
             token_store: Some(token_store),
-            ca_fingerprint: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_string(),
+            ca_fingerprint: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                .to_string(),
             cluster_endpoint: "192.168.1.100:50051".to_string(),
             apk_download_url: "https://example.com/worker.apk".to_string(),
         };
@@ -384,9 +418,13 @@ mod tests {
         let resp = app.clone().oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
 
-        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let payload: ApkInfoResponse = serde_json::from_slice(&body_bytes).unwrap();
         assert_eq!(payload.apk_download_url, "https://example.com/worker.apk");
-        assert!(payload.qr_png_data_url.starts_with("data:image/png;base64,"));
+        assert!(payload
+            .qr_png_data_url
+            .starts_with("data:image/png;base64,"));
     }
 }

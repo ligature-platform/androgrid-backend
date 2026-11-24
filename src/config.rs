@@ -305,11 +305,10 @@ impl ClusterConfig {
         }
 
         if let Ok(val) = std::env::var("ANDROGRID_WEB_LISTEN_ADDR") {
-            config.web_listen_addr =
-                val.parse().map_err(|_| ConfigError::InvalidSocketAddr {
-                    var: "ANDROGRID_WEB_LISTEN_ADDR",
-                    val,
-                })?;
+            config.web_listen_addr = val.parse().map_err(|_| ConfigError::InvalidSocketAddr {
+                var: "ANDROGRID_WEB_LISTEN_ADDR",
+                val,
+            })?;
         }
 
         if let Ok(val) = std::env::var("ANDROGRID_ENABLE_WEB_UI") {
@@ -536,6 +535,9 @@ mod tests {
 
         // Explicit cluster_endpoint override takes precedence
         config.cluster_endpoint = Some("https://node.edge.androgrid:50051/".to_string());
-        assert_eq!(config.resolve_cluster_endpoint(), "node.edge.androgrid:50051");
+        assert_eq!(
+            config.resolve_cluster_endpoint(),
+            "node.edge.androgrid:50051"
+        );
     }
 }

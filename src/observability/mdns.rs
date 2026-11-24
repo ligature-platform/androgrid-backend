@@ -61,7 +61,8 @@ impl MdnsResponder {
     ///
     /// Traces to: [REQ-OP-001], [INV-001]
     pub fn start(config: MdnsConfig) -> Result<Self, String> {
-        let daemon = ServiceDaemon::new().map_err(|e| format!("Failed to create mDNS daemon: {e}"))?;
+        let daemon =
+            ServiceDaemon::new().map_err(|e| format!("Failed to create mDNS daemon: {e}"))?;
         let connected_nodes = Arc::new(AtomicUsize::new(0));
 
         let mut properties = HashMap::new();
@@ -123,7 +124,10 @@ impl MdnsResponder {
         properties.insert("name".to_string(), self.config.instance_name.clone());
         properties.insert("tls".to_string(), "1.3".to_string());
         if !self.config.ca_fingerprint.is_empty() {
-            properties.insert("ca_fingerprint".to_string(), self.config.ca_fingerprint.clone());
+            properties.insert(
+                "ca_fingerprint".to_string(),
+                self.config.ca_fingerprint.clone(),
+            );
         }
 
         let ip = self.config.ip.as_deref().unwrap_or("");
@@ -197,12 +201,15 @@ mod tests {
             host_name: "test.local.".to_string(),
             port: 59999,
             version: "0.0.1-test".to_string(),
-            ca_fingerprint: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_string(),
+            ca_fingerprint: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                .to_string(),
             ip: Some("127.0.0.1".to_string()),
         };
 
         let responder = MdnsResponder::start(config).expect("mDNS start should succeed");
-        assert!(responder.full_service_name().contains("_androgrid._tcp.local."));
+        assert!(responder
+            .full_service_name()
+            .contains("_androgrid._tcp.local."));
 
         let update_res = responder.update_node_count(3);
         assert!(update_res.is_ok(), "Updating node count should succeed");
