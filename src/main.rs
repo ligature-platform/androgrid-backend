@@ -332,10 +332,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let shutdown_signal = async move {
-        signal::ctrl_c()
-            .await
-            .expect("Failed to install Ctrl+C signal handler");
-        info!("Received shutdown signal. Draining connections and terminating server...");
+        #[cfg(unix)]
+        let terminate_signal = async {
+            match signal::unix::signal(signal::unix::SignalKind::terminate()) {
+                Ok(mut stream) => {
+                    stream.recv().await;
+                }
+                Err(e) => {
+                    error!(error = %e, "Failed to install SIGTERM signal handler");
+                    std::future::pending::<()>().await;
+                }
+            }
+        };
+
+        #[cfg(not(unix))]
+        let terminate_signal = std::future::pending::<()>();
+
+        tokio::select! {
+            ctrl_c_res = signal::ctrl_c() => {
+                if let Err(e) = ctrl_c_res {
+                    error!(error = %e, "Failed to install Ctrl+C signal handler");
+                }
+                info!("Received SIGINT (Ctrl+C). Draining connections and terminating server...");
+            }
+            _ = terminate_signal => {
+                info!("Received SIGTERM. Draining connections and terminating server...");
+            }
+        }
+
         let _ = artifact_shutdown_tx.send(());
         let _ = web_shutdown_tx.send(());
         if let Some(resp) = mdns_responder {
