@@ -8,7 +8,7 @@ services:
     build:
       context: ../..
       dockerfile: deploy/all-in-one/Containerfile
-    image: androgrid/orchestrator:latest
+    image: ghcr.io/ligature-platform/androgrid-backend:latest
     container_name: androgrid-all-in-one
     restart: unless-stopped
     # Host networking enables direct LAN mDNS advertisement (5353/UDP) and auto host-IP detection
