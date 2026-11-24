@@ -114,6 +114,9 @@ docker run -d --net=host -v androgrid-data:/data ghcr.io/ligature-platform/andro
 podman run -d --net=host -v androgrid-data:/data:Z ghcr.io/ligature-platform/androgrid-backend:latest
 ```
 
+> [!WARNING]
+> **Network Security Scope:** The turnkey container is scoped strictly to trusted local LANs. Do not run with `--net=host` on public-IP hosts without setting `ANDROGRID_WEB_LISTEN_ADDR=127.0.0.1:8080` or `ANDROGRID_ALLOW_PAIRING=false` to prevent unauthenticated onboarding over the Internet.
+
 #### Turnkey Stack Capabilities:
 - **Automatic PKI Initialization:** Detects the primary host LAN IP from kernel routing tables and automatically generates a NIST P-256 ECDSA TLS 1.3 Root CA and server fullchain (`[NFR-SEC-001]`, ADR-001) with the host LAN IP injected into Subject Alternative Names (SANs).
 - **mDNS Zero-Config Discovery:** Automatically broadcasts DNS Service Discovery (`_androgrid._tcp.local.`) on port 50051 (5353/UDP), enabling Android worker nodes on the local Wi-Fi to automatically discover the orchestrator.

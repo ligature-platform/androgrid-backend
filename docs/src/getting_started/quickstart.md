@@ -26,6 +26,9 @@ docker run -d --net=host -v androgrid-data:/data ghcr.io/ligature-platform/andro
 podman run -d --net=host -v androgrid-data:/data:Z ghcr.io/ligature-platform/androgrid-backend:latest
 ```
 
+> [!WARNING]
+> **Network Security Scope:** The turnkey container is scoped strictly to trusted local LANs. Do not run with `--net=host` on public-IP hosts without setting `ANDROGRID_WEB_LISTEN_ADDR=127.0.0.1:8080` or `ANDROGRID_ALLOW_PAIRING=false` to prevent unauthenticated onboarding over the Internet.
+
 ### Automated Turnkey Capabilities:
 1. **Primary LAN IP Detection:** The container inspects host routing tables to resolve the primary LAN IP.
 2. **Auto-PKI Initialization:** If `/data/pki/` is empty, it runs `androgrid-cli cert init --san <host_ip>` generating NIST P-256 ECDSA certificates with valid SAN attributes for mobile verification (`[NFR-SEC-001]`, ADR-001).
