@@ -15,27 +15,31 @@ echo " [REQ-OP-001] [INV-001] [INV-002] [NFR-SEC-001]"
 echo "================================================================================"
 
 # Step 1: Detect primary host LAN IP from kernel routing table or interface list
-HOST_IP=""
+HOST_IP="${ANDROGRID_HOST_IP:-}"
 
-# Method A: Query routing table for outbound interface source IP towards gateway
-if command -v ip >/dev/null 2>&1; then
-    HOST_IP=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") {print $(i+1); exit}}') || true
-    if [ -z "$HOST_IP" ]; then
-        HOST_IP=$(ip -4 route get 8.8.8.8 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") {print $(i+1); exit}}') || true
-    fi
-fi
-
-# Method B: Fallback to hostname -I
-if [ -z "$HOST_IP" ] && command -v hostname >/dev/null 2>&1; then
-    HOST_IP=$(hostname -I 2>/dev/null | awk '{print $1}') || true
-fi
-
-# Method C: Fallback to loopback
 if [ -z "$HOST_IP" ]; then
-    HOST_IP="127.0.0.1"
-    echo "(!) Warning: Could not detect host LAN IP from routing tables. Defaulting to 127.0.0.1."
+    # Method A: Query routing table for outbound interface source IP towards gateway
+    if command -v ip >/dev/null 2>&1; then
+        HOST_IP=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") {print $(i+1); exit}}') || true
+        if [ -z "$HOST_IP" ]; then
+            HOST_IP=$(ip -4 route get 8.8.8.8 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") {print $(i+1); exit}}') || true
+        fi
+    fi
+
+    # Method B: Fallback to hostname -I
+    if [ -z "$HOST_IP" ] && command -v hostname >/dev/null 2>&1; then
+        HOST_IP=$(hostname -I 2>/dev/null | awk '{print $1}') || true
+    fi
+
+    # Method C: Fallback to loopback
+    if [ -z "$HOST_IP" ]; then
+        HOST_IP="127.0.0.1"
+        echo "(!) Warning: Could not detect host LAN IP from routing tables. Defaulting to 127.0.0.1."
+    else
+        echo "==> Detected primary host LAN IP: ${HOST_IP}"
+    fi
 else
-    echo "==> Detected primary host LAN IP: ${HOST_IP}"
+    echo "==> Using operator-provided host LAN IP: ${HOST_IP}"
 fi
 
 # Step 2: Ensure persistent storage directories exist
@@ -74,12 +78,19 @@ else
 fi
 
 # Step 4: Seed pre-packaged workloads to artifact store if empty
+# Stores workloads under both original name and content-addressed sha256 hash (<hash>.wasm)
 if [ -d "/opt/androgrid/workloads" ]; then
     for wasm_file in /opt/androgrid/workloads/*.wasm; do
         if [ -f "$wasm_file" ]; then
             wasm_base=$(basename "$wasm_file")
             if [ ! -f "${ARTIFACTS_DIR}/${wasm_base}" ]; then
                 cp "$wasm_file" "${ARTIFACTS_DIR}/" 2>/dev/null || true
+            fi
+            if command -v sha256sum >/dev/null 2>&1; then
+                wasm_hash=$(sha256sum "$wasm_file" | awk '{print $1}')
+                if [ -n "$wasm_hash" ] && [ ! -f "${ARTIFACTS_DIR}/${wasm_hash}.wasm" ]; then
+                    cp "$wasm_file" "${ARTIFACTS_DIR}/${wasm_hash}.wasm" 2>/dev/null || true
+                fi
             fi
         fi
     done
@@ -96,8 +107,8 @@ export ANDROGRID_CA_KEY_PATH="${CA_KEY_PATH}"
 export ANDROGRID_HOST_IP="${HOST_IP}"
 export ANDROGRID_CLUSTER_ENDPOINT="${ANDROGRID_CLUSTER_ENDPOINT:-${HOST_IP}:50051}"
 export ANDROGRID_ARTIFACT_DIR="${ARTIFACTS_DIR}"
-export ANDROGRID_ALLOW_PAIRING="true"
-export ANDROGRID_ENABLE_WEB_UI="true"
+export ANDROGRID_ALLOW_PAIRING="${ANDROGRID_ALLOW_PAIRING:-true}"
+export ANDROGRID_ENABLE_WEB_UI="${ANDROGRID_ENABLE_WEB_UI:-true}"
 export ANDROGRID_ENABLE_MDNS="${ANDROGRID_ENABLE_MDNS:-true}"
 export RUST_LOG="${RUST_LOG:-info}"
 
