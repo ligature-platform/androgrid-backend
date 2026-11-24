@@ -37,14 +37,13 @@ jobs:
       - name: Static Analysis (Clippy)
         run: cargo clippy --all-targets -- -D warnings
 
-      - name: Execute Unit and Property Tests
-        run: cargo test --all-targets
-
-      - name: Verify HTTP Benchmark WASM Workload
+      - name: Build and Verify HTTP Benchmark WASM Workload
         run: |
           cargo test --manifest-path workloads/http-benchmark/Cargo.toml
           cargo build --manifest-path workloads/http-benchmark/Cargo.toml --target wasm32-wasip1 --release
-          cp workloads/http-benchmark/target/wasm32-wasip1/release/http_benchmark.wasm tests/fixtures/wasm/http_benchmark.wasm
+
+      - name: Execute Unit and Property Tests
+        run: cargo test --all-targets
 
       - name: Verify Section 8 Gherkin BDD Acceptance Suite
         run: cargo test --test bdd_acceptance_spec

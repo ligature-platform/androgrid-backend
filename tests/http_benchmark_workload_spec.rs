@@ -138,24 +138,13 @@ fn build_mtls_channel(addr: SocketAddr, pki: &TestPki) -> Channel {
 }
 
 fn get_workload_wasm_path() -> PathBuf {
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let target_path = manifest_dir
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("workloads")
         .join("http-benchmark")
         .join("target")
         .join("wasm32-wasip1")
         .join("release")
-        .join("http_benchmark.wasm");
-
-    if target_path.exists() {
-        target_path
-    } else {
-        manifest_dir
-            .join("tests")
-            .join("fixtures")
-            .join("wasm")
-            .join("http_benchmark.wasm")
-    }
+        .join("http_benchmark.wasm")
 }
 
 #[tokio::test]
@@ -509,5 +498,126 @@ fn test_scheduler_rejects_hex_and_non_alphabetic_tld_egress() {
     assert!(
         valid_res.is_ok(),
         "Valid alphabetic and punycode hostnames must be accepted"
+    );
+}
+
+#[test]
+fn test_allowlist_task_single_attempt_finality_and_no_requeue() {
+    use androgrid_backend::scheduler::engine::ClusterScheduler;
+    use androgrid_backend::{
+        ExecutionEngine, NetworkEgressPolicy, NetworkTransportType, NodeCapabilities,
+        TaskExecutionReport, TaskSpec, TaskState,
+    };
+    use std::collections::HashMap;
+
+    let scheduler = ClusterScheduler::new();
+
+    let worker_caps = NodeCapabilities {
+        is_rooted: false,
+        supported_engines: vec![ExecutionEngine::WasmWasi as i32],
+        cpu_cores: 4,
+        total_ram_bytes: 4 * 1024 * 1024 * 1024,
+        os_version: "14".to_string(),
+        abi: "arm64-v8a".to_string(),
+        is_metered: false,
+        current_transport: NetworkTransportType::NetworkTransportWifiLan as i32,
+        max_cellular_task_duration_seconds: 180,
+        battery_temperature_celsius: 25,
+        thermal_status: 0,
+    };
+
+    // 1. Register Wi-Fi worker node
+    let reg_res = scheduler
+        .register_node(
+            "wifi-node-1".to_string(),
+            worker_caps.clone(),
+            "0.0.1-alpha.5".to_string(),
+            1000,
+        )
+        .expect("Registration succeeds");
+
+    // 2. Submit an Allowlist task
+    let task_id = "task-allowlist-finality-001".to_string();
+    let wasm_bytes = std::fs::read(get_workload_wasm_path()).expect("Valid WASM payload");
+    let spec = TaskSpec {
+        task_id: task_id.clone(),
+        run_attempt: 0,
+        engine: ExecutionEngine::WasmWasi as i32,
+        timeout_seconds: 60,
+        entrypoint: "_start".to_string(),
+        env_vars: HashMap::new(),
+        wasm_bytecode: wasm_bytes,
+        shell_command: String::new(),
+        artifact_sha256: String::new(),
+        requires_unmetered: true,
+        artifact_url: String::new(),
+        group_id: String::new(),
+        group_epoch: 0,
+        node_group_affinity: String::new(),
+        egress_policy: NetworkEgressPolicy::Allowlist as i32,
+        allowed_hostnames: vec!["api.example.com".to_string()],
+        max_egress_bytes: 1024 * 1024,
+    };
+    scheduler
+        .submit_task(spec)
+        .expect("Task submission succeeds");
+
+    assert_eq!(scheduler.get_task_state(&task_id), Some(TaskState::Pending));
+    assert_eq!(scheduler.get_active_attempt(&task_id), Some(0));
+
+    // 3. Dispatch task to wifi-node-1 via sync_node_state -> LEASED (attempt = 1)
+    let sync_res1 = scheduler
+        .sync_node_state("wifi-node-1", &reg_res.session_token, &[], 1001)
+        .expect("sync_node_state succeeds");
+    assert_eq!(sync_res1.desired_tasks.len(), 1);
+    assert_eq!(sync_res1.desired_tasks[0].task_id, task_id);
+    assert_eq!(sync_res1.desired_tasks[0].run_attempt, 1);
+    assert_eq!(scheduler.get_task_state(&task_id), Some(TaskState::Leased));
+    assert_eq!(scheduler.get_active_attempt(&task_id), Some(1));
+
+    // 4. Report task failure from the worker (exit_code = 1)
+    let failure_report = TaskExecutionReport {
+        task_id: task_id.clone(),
+        run_attempt: 1,
+        state: TaskState::Failed as i32,
+        exit_code: 1,
+        stdout_bytes: vec![],
+        stderr_bytes: b"Connection refused".to_vec(),
+        error_code: "ERR_IO_FAILURE".to_string(),
+        execution_time_ms: 150,
+    };
+    let sync_res2 = scheduler
+        .sync_node_state(
+            "wifi-node-1",
+            &reg_res.session_token,
+            &[failure_report],
+            1002,
+        )
+        .expect("sync_node_state succeeds");
+    assert_eq!(sync_res2.acknowledged_task_ids, vec![task_id.clone()]);
+    assert_eq!(scheduler.get_task_state(&task_id), Some(TaskState::Failed));
+
+    // 5. Invariant Assertion: The task MUST NOT re-queue back to PENDING
+    // When a second idle Wi-Fi worker syncs, desired_tasks must be empty
+    let reg_res2 = scheduler
+        .register_node(
+            "wifi-node-2".to_string(),
+            worker_caps,
+            "0.0.1-alpha.5".to_string(),
+            1003,
+        )
+        .expect("Registration succeeds");
+
+    let sync_res3 = scheduler
+        .sync_node_state("wifi-node-2", &reg_res2.session_token, &[], 1004)
+        .expect("sync_node_state succeeds");
+    assert!(
+        sync_res3.desired_tasks.is_empty(),
+        "Allowlist task must NOT be re-queued or dispatched again after attempt 1 failure"
+    );
+    assert_eq!(
+        scheduler.get_task_state(&task_id),
+        Some(TaskState::Failed),
+        "Allowlist task state must remain terminal Failed"
     );
 }
