@@ -79,7 +79,50 @@
     .header-actions {
       display: flex;
       align-items: center;
-      gap: 16px;
+      gap: 12px;
+    }
+
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 7px 14px;
+      border-radius: 6px;
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+      text-decoration: none;
+      transition: all 0.2s ease;
+      border: 1px solid var(--border-color);
+      background-color: var(--bg-secondary);
+      color: var(--text-primary);
+    }
+
+    .btn:hover {
+      background-color: var(--bg-tertiary);
+      border-color: var(--accent-cyan);
+      color: #ffffff;
+    }
+
+    .btn-primary {
+      background-color: #238636;
+      border-color: rgba(240, 246, 252, 0.1);
+      color: #ffffff;
+    }
+
+    .btn-primary:hover {
+      background-color: #2ea043;
+      border-color: rgba(240, 246, 252, 0.2);
+    }
+
+    .btn-outline-cyan {
+      border-color: var(--accent-cyan);
+      color: var(--accent-cyan);
+    }
+
+    .btn-outline-cyan:hover {
+      background-color: rgba(88, 166, 255, 0.15);
+      color: #ffffff;
     }
 
     .connection-status {
@@ -107,6 +150,118 @@
       box-shadow: 0 0 8px var(--accent-red);
     }
 
+    /* Quickstart & Pairing Card */
+    .pairing-card {
+      background-color: var(--bg-secondary);
+      border: 1px solid var(--border-color);
+      border-radius: 8px;
+      padding: 20px;
+      margin-bottom: 24px;
+    }
+
+    .pairing-card-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 16px;
+      border-bottom: 1px solid var(--border-color);
+      padding-bottom: 12px;
+    }
+
+    .pairing-card-title {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-size: 16px;
+      font-weight: 700;
+      color: #ffffff;
+    }
+
+    .pairing-grid {
+      display: grid;
+      grid-template-columns: auto 1fr;
+      gap: 24px;
+      align-items: start;
+    }
+
+    @media (max-width: 860px) {
+      .pairing-grid {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    .qr-container {
+      background-color: #ffffff;
+      padding: 12px;
+      border-radius: 8px;
+      display: inline-flex;
+      flex-direction: column;
+      align-items: center;
+      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+    }
+
+    .qr-container img {
+      width: 190px;
+      height: 190px;
+      display: block;
+      image-rendering: pixelated;
+    }
+
+    .qr-caption {
+      margin-top: 8px;
+      font-size: 11px;
+      font-weight: 600;
+      color: #24292f;
+      text-align: center;
+    }
+
+    .pairing-details {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+
+    .pairing-property-row {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+
+    .pairing-property-label {
+      font-size: 11px;
+      text-transform: uppercase;
+      font-weight: 700;
+      color: var(--text-muted);
+      letter-spacing: 0.5px;
+    }
+
+    .pairing-property-value {
+      font-family: var(--font-mono);
+      font-size: 12px;
+      background-color: var(--bg-tertiary);
+      border: 1px solid var(--border-color);
+      padding: 6px 10px;
+      border-radius: 4px;
+      color: var(--accent-cyan);
+      word-break: break-all;
+    }
+
+    .pairing-actions {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-top: 8px;
+    }
+
+    .countdown-badge {
+      font-size: 11px;
+      font-weight: 600;
+      color: var(--accent-yellow);
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+    }
+
     .metrics-bar {
       display: grid;
       grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
@@ -119,15 +274,12 @@
       border: 1px solid var(--border-color);
       border-radius: 8px;
       padding: 16px;
-      display: flex;
-      flex-direction: column;
     }
 
     .metric-title {
       font-size: 12px;
       font-weight: 600;
       text-transform: uppercase;
-      letter-spacing: 0.5px;
       color: var(--text-muted);
       margin-bottom: 6px;
     }
@@ -136,18 +288,20 @@
       font-size: 28px;
       font-weight: 700;
       color: #ffffff;
-      font-family: var(--font-mono);
     }
 
     .main-grid {
       display: grid;
       grid-template-columns: 1fr 1fr;
       gap: 24px;
+      height: calc(100vh - 430px);
+      min-height: 480px;
     }
 
     @media (max-width: 1024px) {
       .main-grid {
         grid-template-columns: 1fr;
+        height: auto;
       }
     }
 
@@ -158,7 +312,7 @@
       padding: 20px;
       display: flex;
       flex-direction: column;
-      height: 600px;
+      overflow: hidden;
     }
 
     .panel-header {
@@ -166,13 +320,13 @@
       justify-content: space-between;
       align-items: center;
       margin-bottom: 16px;
-      padding-bottom: 12px;
       border-bottom: 1px solid var(--border-color);
+      padding-bottom: 12px;
     }
 
     .panel-title {
       font-size: 16px;
-      font-weight: 600;
+      font-weight: 700;
       color: #ffffff;
       display: flex;
       align-items: center;
@@ -182,19 +336,41 @@
     .badge-count {
       background-color: var(--bg-tertiary);
       border: 1px solid var(--border-color);
-      border-radius: 12px;
-      padding: 2px 8px;
+      color: var(--text-primary);
       font-size: 11px;
+      padding: 2px 8px;
+      border-radius: 12px;
+      font-weight: 600;
+    }
+
+    .view-toggle {
+      display: flex;
+      gap: 4px;
+    }
+
+    .toggle-btn {
+      background: none;
+      border: 1px solid var(--border-color);
+      color: var(--text-muted);
+      padding: 3px 8px;
+      border-radius: 4px;
+      font-size: 11px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+
+    .toggle-btn.active {
+      background-color: var(--bg-tertiary);
       color: var(--accent-cyan);
-      font-family: var(--font-mono);
+      border-color: var(--accent-cyan);
     }
 
     .node-list {
       overflow-y: auto;
       display: flex;
       flex-direction: column;
-      gap: 14px;
-      padding-right: 4px;
+      gap: 12px;
+      flex: 1;
     }
 
     .node-card {
@@ -226,72 +402,77 @@
     .badges {
       display: flex;
       gap: 6px;
-      flex-wrap: wrap;
     }
 
     .badge {
       font-size: 11px;
       font-weight: 600;
-      padding: 2px 7px;
+      padding: 2px 8px;
       border-radius: 4px;
       text-transform: uppercase;
     }
 
-    .badge-wifi {
-      background-color: rgba(88, 166, 255, 0.15);
-      color: var(--accent-cyan);
-      border: 1px solid rgba(88, 166, 255, 0.3);
+    .badge-wifi { background-color: rgba(63, 185, 80, 0.15); color: var(--accent-green); border: 1px solid var(--accent-green); }
+    .badge-cellular { background-color: rgba(210, 153, 34, 0.15); color: var(--accent-yellow); border: 1px solid var(--accent-yellow); }
+    .badge-rooted { background-color: rgba(248, 81, 73, 0.15); color: var(--accent-red); border: 1px solid var(--accent-red); }
+    .badge-sandbox { background-color: rgba(88, 166, 255, 0.15); color: var(--accent-cyan); border: 1px solid var(--accent-cyan); }
+
+    .badge-thermal-nominal { background-color: rgba(63, 185, 80, 0.15); color: var(--accent-green); }
+    .badge-thermal-moderate { background-color: rgba(210, 153, 34, 0.15); color: var(--accent-yellow); }
+    .badge-thermal-severe { background-color: rgba(248, 81, 73, 0.15); color: var(--accent-red); }
+
+    /* Node Table View */
+    .node-table-container {
+      overflow-x: auto;
+      overflow-y: auto;
+      flex: 1;
     }
 
-    .badge-cellular {
-      background-color: rgba(210, 153, 34, 0.15);
-      color: var(--accent-yellow);
-      border: 1px solid rgba(210, 153, 34, 0.3);
+    .node-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 12px;
+      text-align: left;
     }
 
-    .badge-rooted {
-      background-color: rgba(188, 140, 255, 0.15);
-      color: var(--accent-purple);
-      border: 1px solid rgba(188, 140, 255, 0.3);
+    .node-table th {
+      padding: 8px 10px;
+      background-color: var(--bg-tertiary);
+      border-bottom: 1px solid var(--border-color);
+      color: var(--text-muted);
+      font-weight: 600;
+      text-transform: uppercase;
+      font-size: 11px;
+      white-space: nowrap;
     }
 
-    .badge-sandbox {
-      background-color: rgba(63, 185, 80, 0.15);
-      color: var(--accent-green);
-      border: 1px solid rgba(63, 185, 80, 0.3);
+    .node-table td {
+      padding: 8px 10px;
+      border-bottom: 1px solid var(--border-color);
+      color: var(--text-primary);
+      white-space: nowrap;
     }
 
-    .badge-thermal-nominal {
-      background-color: rgba(63, 185, 80, 0.15);
-      color: var(--accent-green);
-    }
-
-    .badge-thermal-moderate {
-      background-color: rgba(210, 153, 34, 0.15);
-      color: var(--accent-yellow);
-    }
-
-    .badge-thermal-severe {
-      background-color: rgba(248, 81, 73, 0.15);
-      color: var(--accent-red);
+    .node-table tr:hover td {
+      background-color: rgba(255, 255, 255, 0.02);
     }
 
     .battery-container {
-      margin-top: 10px;
+      margin-top: 6px;
     }
 
     .battery-header {
       display: flex;
       justify-content: space-between;
-      font-size: 12px;
+      font-size: 11px;
       color: var(--text-muted);
       margin-bottom: 4px;
     }
 
     .battery-bar-bg {
       background-color: var(--bg-primary);
-      border-radius: 4px;
-      height: 7px;
+      height: 6px;
+      border-radius: 3px;
       overflow: hidden;
       border: 1px solid var(--border-color);
     }
@@ -303,13 +484,8 @@
       transition: width 0.3s ease;
     }
 
-    .battery-bar-fill.warn {
-      background-color: var(--accent-yellow);
-    }
-
-    .battery-bar-fill.danger {
-      background-color: var(--accent-red);
-    }
+    .battery-bar-fill.warn { background-color: var(--accent-yellow); }
+    .battery-bar-fill.danger { background-color: var(--accent-red); }
 
     .node-meta {
       display: flex;
@@ -317,6 +493,7 @@
       margin-top: 10px;
       font-size: 12px;
       color: var(--text-muted);
+      flex-wrap: wrap;
     }
 
     .node-meta span strong {
@@ -326,7 +503,6 @@
     .right-tabs {
       display: flex;
       gap: 10px;
-      margin-bottom: 14px;
     }
 
     .tab-btn {
@@ -398,28 +574,31 @@
       gap: 16px;
       font-size: 12px;
       color: var(--text-muted);
+      flex-wrap: wrap;
     }
 
-    .terminal-log {
-      background-color: var(--bg-primary);
-      border: 1px solid var(--border-color);
-      border-radius: 6px;
-      padding: 12px;
-      font-family: var(--font-mono);
-      font-size: 12px;
+    .task-details span strong {
+      color: var(--text-primary);
+    }
+
+    .logs-container {
       overflow-y: auto;
       flex: 1;
       display: flex;
       flex-direction: column;
       gap: 6px;
+      font-family: var(--font-mono);
+      font-size: 12px;
     }
 
     .log-entry {
+      background-color: var(--bg-tertiary);
+      border: 1px solid var(--border-color);
+      border-radius: 4px;
+      padding: 6px 10px;
       display: flex;
-      gap: 10px;
+      gap: 12px;
       line-height: 1.4;
-      border-bottom: 1px solid rgba(48, 54, 61, 0.4);
-      padding-bottom: 4px;
     }
 
     .log-time {
@@ -465,12 +644,59 @@
       </div>
     </div>
     <div class="header-actions">
+      <button class="btn btn-outline-cyan" onclick="togglePairingSection()">Pair Worker Device</button>
+      <a class="btn btn-primary" id="btnApkDirectDownload" href="https://github.com/ligature-platform/androgrid-android/releases/latest/download/androgrid-worker.apk" target="_blank" rel="noopener noreferrer">Download Worker APK</a>
       <div class="connection-status" id="connStatus">
         <div class="status-dot" id="statusDot"></div>
         <span id="statusText">CONNECTING...</span>
       </div>
     </div>
   </header>
+
+  <!-- Device Pairing & Worker APK Quickstart Panel -->
+  <section class="pairing-card" id="pairingSection">
+    <div class="pairing-card-header">
+      <div class="pairing-card-title">
+        <span>Device Pairing &amp; Zero-Config Onboarding [INV-001, INV-002]</span>
+      </div>
+      <div class="pairing-actions">
+        <span class="countdown-badge" id="pairCountdown">Expires in: 300s</span>
+        <button class="btn btn-primary" onclick="fetchNewPairingToken()">New Pairing Code</button>
+      </div>
+    </div>
+    <div class="pairing-grid">
+      <div style="display: flex; gap: 20px; flex-wrap: wrap;">
+        <div class="qr-container">
+          <img id="pairingQrImg" src="/api/pair/qr.png" alt="Device Pairing QR Code" />
+          <div class="qr-caption">Scan with AndroGrid App</div>
+        </div>
+        <div class="qr-container">
+          <img id="apkQrImg" src="/api/apk/qr.png" alt="Worker APK Download QR Code" />
+          <div class="qr-caption">Scan to Download APK</div>
+        </div>
+      </div>
+      <div class="pairing-details">
+        <div class="pairing-property-row">
+          <span class="pairing-property-label">Cluster Endpoint (gRPC TLS 1.3)</span>
+          <span class="pairing-property-value" id="valEndpoint">Resolving...</span>
+        </div>
+        <div class="pairing-property-row">
+          <span class="pairing-property-label">Root CA SHA-256 Fingerprint</span>
+          <span class="pairing-property-value" id="valFingerprint">Resolving...</span>
+        </div>
+        <div class="pairing-property-row">
+          <span class="pairing-property-label">Ephemeral Pairing Token</span>
+          <span class="pairing-property-value" id="valToken">Generating...</span>
+        </div>
+        <div style="font-size: 12px; color: var(--text-muted); margin-top: 6px;">
+          <strong>Pairing Instructions:</strong>
+          1. Install <code>androgrid-worker.apk</code> on your Android device (Android 14+, API 34+).<br />
+          2. Open the app, tap <em>Scan QR to Pair</em>, and point the camera at the left QR code.<br />
+          3. Mutual TLS 1.3 certificate is issued automatically without manual terminal commands.
+        </div>
+      </div>
+    </div>
+  </section>
 
   <section class="metrics-bar">
     <div class="metric-card">
@@ -507,9 +733,34 @@
           <span>Worker Nodes</span>
           <span class="badge-count" id="badgeNodeCount">0</span>
         </div>
+        <div class="view-toggle">
+          <button class="toggle-btn active" id="btnViewCards" onclick="setNodeView('cards')">Cards</button>
+          <button class="toggle-btn" id="btnViewTable" onclick="setNodeView('table')">Table</button>
+        </div>
       </div>
       <div class="node-list" id="nodeList">
         <div class="empty-state">No Android worker nodes connected</div>
+      </div>
+      <div class="node-table-container" id="nodeTableContainer" style="display: none;">
+        <table class="node-table">
+          <thead>
+            <tr>
+              <th>Node ID</th>
+              <th>SoC / ABI</th>
+              <th>Cores</th>
+              <th>RAM</th>
+              <th>Battery %</th>
+              <th>OS Version</th>
+              <th>Active Tasks</th>
+              <th>Transport</th>
+            </tr>
+          </thead>
+          <tbody id="nodeTableBody">
+            <tr>
+              <td colspan="8" style="text-align: center; color: var(--text-muted); padding: 24px;">No Android worker nodes connected</td>
+            </tr>
+          </tbody>
+        </table>
       </div>
     </div>
 
@@ -518,82 +769,87 @@
       <div class="panel-header">
         <div class="right-tabs">
           <button class="tab-btn active" id="tabTasksBtn" onclick="switchTab('tasks')">Task Execution Pipeline</button>
-          <button class="tab-btn" id="tabEventsBtn" onclick="switchTab('events')">Live Event Stream</button>
+          <button class="tab-btn" id="tabLogsBtn" onclick="switchTab('logs')">Live Cluster Events</button>
         </div>
         <span class="badge-count" id="badgeTaskOrEventCount">0</span>
       </div>
 
+      <!-- Tab: Tasks View -->
       <div class="tab-content" id="tasksTab">
         <div class="empty-state">No active or completed compute tasks</div>
       </div>
 
-      <div class="terminal-log" id="eventsTab" style="display: none;">
-        <!-- Streaming SSE log entries will be appended here -->
+      <!-- Tab: Event Log View -->
+      <div class="tab-content logs-container" id="logsTab" style="display: none;">
+        <!-- Streaming events prepended here -->
       </div>
     </div>
   </main>
 
   <script>
     let activeTab = 'tasks';
+    let nodeViewMode = 'cards';
     let nodesMap = new Map();
     let tasksMap = new Map();
     let logEntriesCount = 0;
+    let pairingExpiresAtEpochS = 0;
+    let pairingTimerInterval = null;
+
+    function togglePairingSection() {
+      const el = document.getElementById('pairingSection');
+      el.style.display = (el.style.display === 'none') ? 'block' : 'none';
+    }
+
+    function setNodeView(mode) {
+      nodeViewMode = mode;
+      document.getElementById('btnViewCards').className = mode === 'cards' ? 'toggle-btn active' : 'toggle-btn';
+      document.getElementById('btnViewTable').className = mode === 'table' ? 'toggle-btn active' : 'toggle-btn';
+      document.getElementById('nodeList').style.display = mode === 'cards' ? 'flex' : 'none';
+      document.getElementById('nodeTableContainer').style.display = mode === 'table' ? 'block' : 'none';
+      renderNodes();
+    }
 
     function switchTab(tab) {
       activeTab = tab;
       const tasksTab = document.getElementById('tasksTab');
-      const eventsTab = document.getElementById('eventsTab');
+      const logsTab = document.getElementById('logsTab');
       const tabTasksBtn = document.getElementById('tabTasksBtn');
-      const tabEventsBtn = document.getElementById('tabEventsBtn');
+      const tabLogsBtn = document.getElementById('tabLogsBtn');
+      const badgeCount = document.getElementById('badgeTaskOrEventCount');
 
       if (tab === 'tasks') {
         tasksTab.style.display = 'flex';
-        eventsTab.style.display = 'none';
-        tabTasksBtn.classList.add('active');
-        tabEventsBtn.classList.remove('active');
-        document.getElementById('badgeTaskOrEventCount').innerText = tasksMap.size;
+        logsTab.style.display = 'none';
+        tabTasksBtn.className = 'tab-btn active';
+        tabLogsBtn.className = 'tab-btn';
+        badgeCount.innerText = tasksMap.size;
       } else {
         tasksTab.style.display = 'none';
-        eventsTab.style.display = 'flex';
-        tabTasksBtn.classList.remove('active');
-        tabEventsBtn.classList.add('active');
-        document.getElementById('badgeTaskOrEventCount').innerText = logEntriesCount;
+        logsTab.style.display = 'flex';
+        tabTasksBtn.className = 'tab-btn';
+        tabLogsBtn.className = 'tab-btn active';
+        badgeCount.innerText = logEntriesCount;
       }
     }
 
-    function formatTime(epochMs) {
-      const d = epochMs ? new Date(epochMs) : new Date();
-      return d.toTimeString().split(' ')[0] + '.' + String(d.getMilliseconds()).padStart(3, '0');
+    function escapeHtml(str) {
+      if (!str) return '';
+      return String(str)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
     }
 
-    function addLogEntry(tag, text, tagClass) {
-      logEntriesCount++;
-      const eventsTab = document.getElementById('eventsTab');
-      const row = document.createElement('div');
-      row.className = 'log-entry';
-
-      const timeSpan = document.createElement('span');
-      timeSpan.className = 'log-time';
-      timeSpan.innerText = formatTime();
-
-      const tagSpan = document.createElement('span');
-      tagSpan.className = 'log-tag ' + (tagClass || '');
-      tagSpan.innerText = '[' + tag + ']';
-
-      const textSpan = document.createElement('span');
-      textSpan.className = 'log-text';
-      textSpan.innerText = text;
-
-      row.appendChild(timeSpan);
-      row.appendChild(tagSpan);
-      row.appendChild(textSpan);
-
-      eventsTab.appendChild(row);
-      eventsTab.scrollTop = eventsTab.scrollHeight;
-
-      if (activeTab === 'events') {
-        document.getElementById('badgeTaskOrEventCount').innerText = logEntriesCount;
-      }
+    function getActiveTasksCountForNode(nodeId) {
+      let count = 0;
+      tasksMap.forEach(t => {
+        if ((t.assigned_node_id === nodeId || t.speculative_node_id === nodeId) && (t.state === 'Leased' || t.state === 'Running' || t.state === 'Preempted')) {
+          count++;
+        }
+      });
+      return count;
     }
 
     function renderMetrics(metrics) {
@@ -605,6 +861,7 @@
       document.getElementById('valLeasedTasks').innerText = metrics.leased_tasks;
       document.getElementById('valPreemptedTasks').innerText = metrics.preempted_tasks;
       document.getElementById('badgeNodeCount').innerText = metrics.total_nodes;
+
       if (activeTab === 'tasks') {
         document.getElementById('badgeTaskOrEventCount').innerText = metrics.total_tasks;
       }
@@ -612,16 +869,19 @@
 
     function renderNodes() {
       const container = document.getElementById('nodeList');
+      const tableBody = document.getElementById('nodeTableBody');
+
       if (nodesMap.size === 0) {
         container.innerHTML = '<div class="empty-state">No Android worker nodes connected</div>';
+        tableBody.innerHTML = '<tr><td colspan="8" style="text-align: center; color: var(--text-muted); padding: 24px;">No Android worker nodes connected</td></tr>';
         return;
       }
 
+      // Render Cards View
       container.innerHTML = '';
-      nodesMap.forEach(node => {
-        const card = document.createElement('div');
-        card.className = 'node-card';
+      tableBody.innerHTML = '';
 
+      nodesMap.forEach(node => {
         const isWifi = node.transport && node.transport.includes('Wi-Fi');
         const transClass = isWifi ? 'badge-wifi' : 'badge-cellular';
         const rootBadge = node.is_rooted ? '<span class="badge badge-rooted">ROOTED</span>' : '<span class="badge badge-sandbox">WASM SANDBOX</span>';
@@ -634,8 +894,11 @@
         if (node.battery_level_pct <= 20) batteryFillClass = 'danger';
         else if (node.battery_level_pct <= 50) batteryFillClass = 'warn';
 
-        const chargingIcon = node.is_charging ? '⚡ ' : '';
+        const chargingIcon = node.is_charging ? '&#9889; ' : '';
+        const activeTasks = getActiveTasksCountForNode(node.node_id);
 
+        const card = document.createElement('div');
+        card.className = 'node-card';
         card.innerHTML = `
           <div class="node-card-header">
             <span class="node-id">${escapeHtml(node.node_id)}</span>
@@ -655,13 +918,28 @@
             </div>
           </div>
           <div class="node-meta">
+            <span>SoC/ABI: <strong>${escapeHtml(node.abi || 'arm64-v8a')}</strong></span>
             <span>CPU: <strong>${node.cpu_cores} Cores</strong></span>
             <span>RAM: <strong>${node.ram_mb} MB</strong></span>
             <span>OS: <strong>Android ${escapeHtml(node.os_version)}</strong></span>
-            <span>ABI: <strong>${escapeHtml(node.abi)}</strong></span>
+            <span>Active Tasks: <strong>${activeTasks}</strong></span>
           </div>
         `;
         container.appendChild(card);
+
+        // Render Table Row
+        const tr = document.createElement('tr');
+        tr.innerHTML = `
+          <td style="font-family: var(--font-mono); font-weight: 600; color: #ffffff;">${escapeHtml(node.node_id)}</td>
+          <td>${escapeHtml(node.abi || 'arm64-v8a')}</td>
+          <td>${node.cpu_cores}</td>
+          <td>${node.ram_mb} MB</td>
+          <td>${chargingIcon}${node.battery_level_pct}%</td>
+          <td>Android ${escapeHtml(node.os_version)}</td>
+          <td><strong style="color: ${activeTasks > 0 ? 'var(--accent-cyan)' : 'var(--text-muted)'}">${activeTasks}</strong></td>
+          <td><span class="badge ${transClass}">${escapeHtml(node.transport)}</span></td>
+        `;
+        tableBody.appendChild(tr);
       });
     }
 
@@ -688,8 +966,17 @@
         if (task.exit_code !== null && task.exit_code !== undefined) {
           extraMeta += `<span>Exit Code: <strong>${task.exit_code}</strong></span>`;
         }
+        if (task.error_message) {
+          extraMeta += `<span style="color: var(--accent-red)">Error: <strong>${escapeHtml(task.error_message)}</strong></span>`;
+        }
 
-        const preemptBadge = stateStr === 'Preempted' ? ' <span style="color:var(--accent-purple);">[INV-005 Speculative Spot]</span>' : '';
+        let assignedInfo = 'Unassigned';
+        if (task.assigned_node_id) {
+          assignedInfo = `Worker: <strong style="font-family: var(--font-mono)">${escapeHtml(task.assigned_node_id)}</strong>`;
+        }
+        if (task.speculative_node_id) {
+          assignedInfo += ` &rarr; Speculative: <strong style="font-family: var(--font-mono); color: var(--accent-purple)">${escapeHtml(task.speculative_node_id)}</strong>`;
+        }
 
         card.innerHTML = `
           <div class="task-card-header">
@@ -697,9 +984,10 @@
             <span class="task-state ${stateClass}">${escapeHtml(stateStr)}</span>
           </div>
           <div class="task-details">
-            <span>Engine: <strong>${escapeHtml(task.engine || 'WasmWasi')}</strong></span>
-            <span>Attempt: <strong>#${task.run_attempt}</strong></span>
-            <span>Worker: <strong>${escapeHtml(task.assigned_node_id || 'unassigned')}</strong></span>
+            <span>Engine: <strong>${escapeHtml(task.engine || 'WASM')}</strong></span>
+            <span>Attempt: <strong>#${task.run_attempt || 0}</strong></span>
+            <span>${assignedInfo}</span>
+            <span>Timeout: <strong>${task.timeout_seconds || 30}s</strong></span>
             ${extraMeta}
           </div>
         `;
@@ -707,16 +995,37 @@
       });
     }
 
-    function escapeHtml(str) {
-      if (!str) return '';
-      return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    function addLogEntry(tag, text, tagClass) {
+      const container = document.getElementById('logsTab');
+      const entry = document.createElement('div');
+      entry.className = 'log-entry';
+
+      const now = new Date();
+      const timeStr = now.toTimeString().split(' ')[0] + '.' + String(now.getMilliseconds()).padStart(3, '0');
+
+      entry.innerHTML = `
+        <span class="log-time">${timeStr}</span>
+        <span class="log-tag ${tagClass || ''}">[${escapeHtml(tag)}]</span>
+        <span class="log-text">${escapeHtml(text)}</span>
+      `;
+
+      container.insertBefore(entry, container.firstChild);
+      logEntriesCount++;
+
+      if (activeTab === 'logs') {
+        document.getElementById('badgeTaskOrEventCount').innerText = logEntriesCount;
+      }
+
+      while (container.children.length > 250) {
+        container.removeChild(container.lastChild);
+      }
     }
 
     async function loadSnapshot() {
       try {
-        const res = await fetch('/api/snapshot');
-        if (!res.ok) throw new Error('HTTP ' + res.status);
-        const data = await res.json();
+        const resp = await fetch('/api/snapshot');
+        if (!resp.ok) throw new Error('HTTP ' + resp.status);
+        const data = await resp.json();
 
         nodesMap.clear();
         (data.nodes || []).forEach(n => nodesMap.set(n.node_id, n));
@@ -730,6 +1039,51 @@
         addLogEntry('SNAPSHOT', 'Loaded initial cluster state (' + nodesMap.size + ' nodes, ' + tasksMap.size + ' tasks)', 'tag-registered');
       } catch (err) {
         console.error('Failed to load snapshot:', err);
+      }
+    }
+
+    async function fetchPairingInfo(method = 'GET') {
+      try {
+        const resp = await fetch('/api/pair', { method });
+        if (!resp.ok) throw new Error('HTTP ' + resp.status);
+        const data = await resp.json();
+
+        document.getElementById('valEndpoint').innerText = data.cluster_endpoint || 'Unavailable';
+        document.getElementById('valFingerprint').innerText = data.ca_fingerprint || 'Unavailable';
+        document.getElementById('valToken').innerText = data.pairing_token || 'Unavailable';
+
+        if (data.qr_png_data_url) {
+          document.getElementById('pairingQrImg').src = data.qr_png_data_url;
+        }
+
+        if (data.apk_download_url) {
+          document.getElementById('btnApkDirectDownload').href = data.apk_download_url;
+        }
+
+        pairingExpiresAtEpochS = data.expires_at_epoch_s || 0;
+        updatePairingCountdown();
+
+        if (pairingTimerInterval) clearInterval(pairingTimerInterval);
+        pairingTimerInterval = setInterval(updatePairingCountdown, 1000);
+      } catch (err) {
+        console.warn('Pairing info unavailable:', err);
+      }
+    }
+
+    async function fetchNewPairingToken() {
+      await fetchPairingInfo('POST');
+    }
+
+    function updatePairingCountdown() {
+      const nowS = Math.floor(Date.now() / 1000);
+      const remaining = Math.max(0, pairingExpiresAtEpochS - nowS);
+      const el = document.getElementById('pairCountdown');
+      if (remaining > 0) {
+        el.innerText = `Expires in: ${remaining}s`;
+        el.style.color = remaining < 60 ? 'var(--accent-red)' : 'var(--accent-yellow)';
+      } else {
+        el.innerText = 'Token Expired (Click New)';
+        el.style.color = 'var(--accent-red)';
       }
     }
 
@@ -872,6 +1226,7 @@
 
     // Initialize on page load
     loadSnapshot().then(() => {
+      fetchPairingInfo();
       connectSSE();
     });
   </script>

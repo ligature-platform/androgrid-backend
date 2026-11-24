@@ -104,6 +104,30 @@ pub struct ClusterConfig {
     /// Default: false (permits staged mobile client rollout without breaking legacy clients).
     /// Traces to: [INV-002], [NFR-SEC-001]
     pub require_attestation_challenge: bool,
+
+    /// Socket address for Operator Web UI HTTP server binding (default: 127.0.0.1:8080).
+    /// Traces to: [REQ-OP-001], [INV-004], [INV-005]
+    pub web_listen_addr: SocketAddr,
+
+    /// Whether the Operator Web UI server is enabled (default: true).
+    /// Traces to: [REQ-OP-001], [INV-004]
+    pub enable_web_ui: bool,
+
+    /// Whether the mDNS DNS-SD responder is enabled (default: true).
+    /// Traces to: [REQ-OP-001], [INV-001]
+    pub enable_mdns: bool,
+
+    /// Instance name advertised via mDNS DNS-SD (default: "androgrid-orchestrator").
+    /// Traces to: [REQ-OP-001]
+    pub mdns_service_name: String,
+
+    /// URL for downloading the worker APK from GitHub Releases or custom mirror.
+    /// Traces to: [REQ-OP-001]
+    pub apk_download_url: String,
+
+    /// Optional explicit cluster endpoint (e.g. "192.168.1.100:50051").
+    /// Traces to: [REQ-OP-001], [INV-001]
+    pub cluster_endpoint: Option<String>,
 }
 
 impl Default for ClusterConfig {
@@ -135,6 +159,14 @@ impl Default for ClusterConfig {
             max_apk_bytes: 128 * 1024 * 1024,
             enforce_hardware_attestation: false,
             require_attestation_challenge: false,
+            web_listen_addr: "127.0.0.1:8080"
+                .parse()
+                .expect("Default web socket address must be valid"),
+            enable_web_ui: true,
+            enable_mdns: true,
+            mdns_service_name: "androgrid-orchestrator".to_string(),
+            apk_download_url: "https://github.com/ligature-platform/androgrid-android/releases/latest/download/androgrid-worker.apk".to_string(),
+            cluster_endpoint: None,
         }
     }
 }
@@ -272,6 +304,36 @@ impl ClusterConfig {
             config.require_attestation_challenge = val.eq_ignore_ascii_case("true") || val == "1";
         }
 
+        if let Ok(val) = std::env::var("ANDROGRID_WEB_LISTEN_ADDR") {
+            config.web_listen_addr =
+                val.parse().map_err(|_| ConfigError::InvalidSocketAddr {
+                    var: "ANDROGRID_WEB_LISTEN_ADDR",
+                    val,
+                })?;
+        }
+
+        if let Ok(val) = std::env::var("ANDROGRID_ENABLE_WEB_UI") {
+            config.enable_web_ui = val.eq_ignore_ascii_case("true") || val == "1";
+        }
+
+        if let Ok(val) = std::env::var("ANDROGRID_ENABLE_MDNS") {
+            config.enable_mdns = val.eq_ignore_ascii_case("true") || val == "1";
+        }
+
+        if let Ok(val) = std::env::var("ANDROGRID_MDNS_SERVICE_NAME") {
+            config.mdns_service_name = val;
+        }
+
+        if let Ok(val) = std::env::var("ANDROGRID_WORKER_APK_URL") {
+            config.apk_download_url = val;
+        }
+
+        if let Ok(val) = std::env::var("ANDROGRID_CLUSTER_ENDPOINT") {
+            config.cluster_endpoint = Some(val);
+        } else if let Ok(val) = std::env::var("ANDROGRID_PUBLIC_ENDPOINT") {
+            config.cluster_endpoint = Some(val);
+        }
+
         config.validate_renewal_policy()?;
         Ok(config)
     }
@@ -355,6 +417,46 @@ impl ClusterConfig {
             && self.tls_server_cert_path.is_some()
             && self.tls_server_key_path.is_some()
     }
+
+    /// Resolves the routable gRPC cluster endpoint (`host:port`) advertised to mobile workers.
+    ///
+    /// Prefers explicit `cluster_endpoint` (`ANDROGRID_CLUSTER_ENDPOINT`), followed by
+    /// `ANDROGRID_HOST_IP` if `listen_addr` uses an unspecified bind address (`0.0.0.0`, `::`),
+    /// falling back to loopback or bound address.
+    ///
+    /// Traces to: [REQ-OP-001], [INV-001], [INV-002]
+    pub fn resolve_cluster_endpoint(&self) -> String {
+        if let Some(ref ep) = self.cluster_endpoint {
+            let stripped = crate::pairing::strip_uri_scheme(ep);
+            if !stripped.is_empty() {
+                return stripped;
+            }
+        }
+
+        let port = self.listen_addr.port();
+        match self.listen_addr.ip() {
+            std::net::IpAddr::V4(ip) if ip.is_unspecified() => {
+                if let Ok(host_ip) = std::env::var("ANDROGRID_HOST_IP") {
+                    let trimmed = host_ip.trim();
+                    if !trimmed.is_empty() {
+                        return format!("{trimmed}:{port}");
+                    }
+                }
+                format!("127.0.0.1:{port}")
+            }
+            std::net::IpAddr::V6(ip) if ip.is_unspecified() => {
+                if let Ok(host_ip) = std::env::var("ANDROGRID_HOST_IP") {
+                    let trimmed = host_ip.trim();
+                    if !trimmed.is_empty() {
+                        return format!("{trimmed}:{port}");
+                    }
+                }
+                format!("[::1]:{port}")
+            }
+            std::net::IpAddr::V6(ip) => format!("[{ip}]:{port}"),
+            std::net::IpAddr::V4(ip) => format!("{ip}:{port}"),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -410,5 +512,30 @@ mod tests {
             config.resolve_mtls_blob_base_url(),
             "https://cluster.example.com/v1/blobs"
         );
+    }
+
+    #[test]
+    fn test_web_ui_and_mdns_config_defaults() {
+        let config = ClusterConfig::default();
+        assert_eq!(config.web_listen_addr.port(), 8080);
+        assert!(config.enable_web_ui);
+        assert!(config.enable_mdns);
+        assert_eq!(config.mdns_service_name, "androgrid-orchestrator");
+        assert!(config.apk_download_url.contains("androgrid-worker.apk"));
+        assert_eq!(config.resolve_cluster_endpoint(), "127.0.0.1:50051");
+    }
+
+    #[test]
+    fn test_resolve_cluster_endpoint_with_overrides() {
+        let mut config = ClusterConfig {
+            listen_addr: "0.0.0.0:50051".parse().unwrap(),
+            ..Default::default()
+        };
+        // Unspecified falls back to loopback when no host IP env var
+        assert_eq!(config.resolve_cluster_endpoint(), "127.0.0.1:50051");
+
+        // Explicit cluster_endpoint override takes precedence
+        config.cluster_endpoint = Some("https://node.edge.androgrid:50051/".to_string());
+        assert_eq!(config.resolve_cluster_endpoint(), "node.edge.androgrid:50051");
     }
 }

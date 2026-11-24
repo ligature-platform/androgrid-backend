@@ -190,6 +190,26 @@ pub fn render_ansi_qr(content: &str) -> Result<String, QrError> {
 /// * `Ok(())` on successful file write.
 /// * `Err(QrError)` on failure.
 pub fn export_png(content: &str, output_path: &Path) -> Result<(), QrError> {
+    let bytes = render_png_bytes(content)?;
+    std::fs::write(output_path, bytes).map_err(|e| QrError::ImageSave {
+        path: output_path.display().to_string(),
+        detail: e.to_string(),
+    })?;
+
+    Ok(())
+}
+
+/// Renders the QR code into an in-memory PNG byte buffer.
+///
+/// Traces to: [REQ-OP-001], [INV-002]
+///
+/// # Arguments
+/// * `content` - String to encode into the QR code matrix.
+///
+/// # Returns
+/// * `Ok(Vec<u8>)` containing encoded PNG image bytes.
+/// * `Err(QrError)` on failure.
+pub fn render_png_bytes(content: &str) -> Result<Vec<u8>, QrError> {
     let code =
         QrCode::new(content.as_bytes()).map_err(|e| QrError::MatrixConstruction(e.to_string()))?;
 
@@ -198,12 +218,29 @@ pub fn export_png(content: &str, output_path: &Path) -> Result<(), QrError> {
         .min_dimensions(300, 300)
         .build();
 
-    image.save(output_path).map_err(|e| QrError::ImageSave {
-        path: output_path.display().to_string(),
-        detail: e.to_string(),
-    })?;
+    let mut cursor = std::io::Cursor::new(Vec::new());
+    image
+        .write_to(&mut cursor, image::ImageFormat::Png)
+        .map_err(|e| QrError::MatrixConstruction(e.to_string()))?;
 
-    Ok(())
+    Ok(cursor.into_inner())
+}
+
+/// Renders the QR code into a Base64-encoded PNG data URL (`data:image/png;base64,...`).
+///
+/// Traces to: [REQ-OP-001], [INV-002]
+///
+/// # Arguments
+/// * `content` - String to encode into the QR code matrix.
+///
+/// # Returns
+/// * `Ok(String)` containing the Base64 data URL.
+/// * `Err(QrError)` on failure.
+pub fn render_png_data_url(content: &str) -> Result<String, QrError> {
+    use base64::Engine;
+    let bytes = render_png_bytes(content)?;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    Ok(format!("data:image/png;base64,{b64}"))
 }
 
 #[cfg(test)]
@@ -300,5 +337,17 @@ mod tests {
         assert!(normalize_cluster_endpoint("[::1]:badport", 50051).is_err());
         assert!(normalize_cluster_endpoint("[::1]:0", 50051).is_err());
         assert!(normalize_cluster_endpoint("127.0.0.1:0", 50051).is_err());
+    }
+
+    #[test]
+    fn test_render_png_bytes_and_data_url() {
+        let content = "androgrid-test-data-url";
+        let bytes = render_png_bytes(content).expect("render_png_bytes must succeed");
+        assert!(bytes.len() > 100);
+        assert_eq!(&bytes[..4], &[0x89, 0x50, 0x4E, 0x47]);
+
+        let data_url = render_png_data_url(content).expect("render_png_data_url must succeed");
+        assert!(data_url.starts_with("data:image/png;base64,"));
+        assert!(data_url.len() > 150);
     }
 }

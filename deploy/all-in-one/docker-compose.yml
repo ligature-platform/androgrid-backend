@@ -1,0 +1,26 @@
+# AndroGrid Turnkey All-In-One Container Compose Blueprint
+# Traces to: AG-SPEC-2026-V2 Section 2.2, Section 2.3, [REQ-OP-001], [INV-001], [INV-002], [NFR-SEC-001]
+
+version: "3.8"
+
+services:
+  orchestrator:
+    build:
+      context: ../..
+      dockerfile: deploy/all-in-one/Containerfile
+    image: androgrid/orchestrator:latest
+    container_name: androgrid-all-in-one
+    restart: unless-stopped
+    # Host networking enables direct LAN mDNS advertisement (5353/UDP) and auto host-IP detection
+    network_mode: "host"
+    volumes:
+      - androgrid-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://127.0.0.1:8080/api/snapshot || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  androgrid-data:
+    name: androgrid-data

@@ -18,10 +18,10 @@ use androgrid_backend::transport::tls::{
     build_bootstrap_rustls_server_config, serve_dual_plane_tls,
 };
 use androgrid_backend::{
-    require_client_mtls_interceptor, AdminServiceImpl, AndroGridServiceImpl, ArtifactServer,
-    ArtifactStore, CaSigner, CertRenewalManager, CertRenewalPolicy, ClusterConfig,
-    ClusterScheduler, EnrollmentContext, EnrollmentServiceImpl, PairingTokenStore, RolloutStore,
-    ThermalPolicy,
+    require_client_mtls_interceptor, web_ui_router, AdminServiceImpl, AndroGridServiceImpl,
+    ArtifactServer, ArtifactStore, CaSigner, CertRenewalManager, CertRenewalPolicy, ClusterConfig,
+    ClusterScheduler, EnrollmentContext, EnrollmentServiceImpl, MdnsConfig, MdnsResponder,
+    PairingTokenStore, RolloutStore, ThermalPolicy, WebUiState,
 };
 
 #[derive(Parser, Debug)]
@@ -198,7 +198,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         mtls_guard,
     );
 
-    let cluster_endpoint = config.listen_addr.to_string();
+    let cluster_endpoint = config.resolve_cluster_endpoint();
     let effective_artifact_base_url = if mtls_enabled {
         config.resolve_mtls_blob_base_url()
     } else {
@@ -209,8 +209,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Arc::clone(&artifact_store),
         effective_artifact_base_url,
         Arc::clone(&token_store),
-        ca_fingerprint,
-        cluster_endpoint,
+        ca_fingerprint.clone(),
+        cluster_endpoint.clone(),
     );
     let admin_server = tonic::codegen::InterceptedService::new(
         AdminServiceServer::new(admin_service)
@@ -223,7 +223,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let artifact_listener = tokio::net::TcpListener::bind(config.artifact_listen_addr).await?;
     info!(
         artifact_addr = %config.artifact_listen_addr,
-        "Starting embedded HTTP static artifact, pairing & real-time web dashboard server [NFR-PERF-001], [REQ-OP-001], [INV-004], [INV-005]"
+        "Starting embedded HTTP static artifact distribution server [NFR-PERF-001], [REQ-OP-003]"
     );
     let http_enrollment_ctx = if mtls_enabled {
         info!("mTLS enabled: plaintext HTTP /api/v1/enroll disabled (use gRPC over TLS 1.3)");
@@ -240,6 +240,92 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         artifact_shutdown_rx,
     );
 
+    let (web_shutdown_tx, web_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    if config.enable_web_ui {
+        let web_listener = tokio::net::TcpListener::bind(config.web_listen_addr).await?;
+        let web_state = WebUiState {
+            scheduler: Arc::clone(&scheduler),
+            token_store: if config.allow_pairing {
+                Some(Arc::clone(&token_store))
+            } else {
+                None
+            },
+            ca_fingerprint: ca_fingerprint.clone(),
+            cluster_endpoint: cluster_endpoint.clone(),
+            apk_download_url: config.apk_download_url.clone(),
+        };
+        let web_app = web_ui_router(web_state);
+        info!(
+            web_addr = %config.web_listen_addr,
+            "Starting dedicated Operator Web UI & Pairing Dashboard on port 8080 [REQ-OP-001], [INV-004], [INV-005]"
+        );
+        tokio::spawn(async move {
+            let server = axum::serve(web_listener, web_app.into_make_service());
+            tokio::select! {
+                res = server => {
+                    if let Err(e) = res {
+                        error!(error = %e, "Web UI server terminated with error");
+                    }
+                }
+                _ = web_shutdown_rx => {
+                    info!("Web UI server shutting down gracefully");
+                }
+            }
+        });
+    }
+
+    // Initialize mDNS DNS-SD service responder
+    let mdns_responder = if config.enable_mdns {
+        let mdns_cfg = MdnsConfig {
+            instance_name: config.mdns_service_name.clone(),
+            host_name: "androgrid.local.".to_string(),
+            port: config.listen_addr.port(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            ca_fingerprint: ca_fingerprint.clone(),
+            ip: if !config.listen_addr.ip().is_unspecified() {
+                Some(config.listen_addr.ip().to_string())
+            } else {
+                std::env::var("ANDROGRID_HOST_IP").ok()
+            },
+        };
+        match MdnsResponder::start(mdns_cfg) {
+            Ok(resp) => {
+                info!(
+                    service = resp.full_service_name(),
+                    "Multicast DNS zero-config responder active on port {} [REQ-OP-001]",
+                    config.listen_addr.port()
+                );
+                Some(Arc::new(resp))
+            }
+            Err(e) => {
+                warn!(error = %e, "Failed to start mDNS responder; continuing without LAN discovery");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    if let Some(ref responder) = mdns_responder {
+        let mdns_sync_resp = Arc::clone(responder);
+        let mdns_sync_scheduler = Arc::clone(&scheduler);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+            let mut last_count = 0;
+            loop {
+                interval.tick().await;
+                let current_nodes = mdns_sync_scheduler.get_snapshot().metrics.total_nodes;
+                if current_nodes != last_count {
+                    if let Err(e) = mdns_sync_resp.update_node_count(current_nodes) {
+                        warn!(error = %e, "Failed to update mDNS node count");
+                    } else {
+                        last_count = current_nodes;
+                    }
+                }
+            }
+        });
+    }
+
     info!(
         addr = %config.listen_addr,
         "Starting Control Plane service"
@@ -251,6 +337,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .expect("Failed to install Ctrl+C signal handler");
         info!("Received shutdown signal. Draining connections and terminating server...");
         let _ = artifact_shutdown_tx.send(());
+        let _ = web_shutdown_tx.send(());
+        if let Some(resp) = mdns_responder {
+            resp.shutdown();
+        }
     };
 
     if mtls_enabled {

@@ -102,7 +102,35 @@ See [workloads/wasi-starter](workloads/wasi-starter/README.md) for a complete st
 
 ## Getting Started
 
-### Prerequisites
+### Turnkey All-In-One Deployment (Zero-Config)
+
+Deploy the entire AndroGrid control plane stack with a single container command without manual PKI generation, firewall rules, or configuration files:
+
+```bash
+# Launch with Docker
+docker run -d --net=host -v androgrid-data:/data ghcr.io/ligature-platform/androgrid-backend:latest
+
+# Or launch with Podman (rootless)
+podman run -d --net=host -v androgrid-data:/data:Z ghcr.io/ligature-platform/androgrid-backend:latest
+```
+
+#### Turnkey Stack Capabilities:
+- **Automatic PKI Initialization:** Detects the primary host LAN IP from kernel routing tables and automatically generates a NIST P-256 ECDSA TLS 1.3 Root CA and server fullchain (`[NFR-SEC-001]`, ADR-001) with the host LAN IP injected into Subject Alternative Names (SANs).
+- **mDNS Zero-Config Discovery:** Automatically broadcasts DNS Service Discovery (`_androgrid._tcp.local.`) on port 50051 (5353/UDP), enabling Android worker nodes on the local Wi-Fi to automatically discover the orchestrator.
+- **Embedded Operator Web UI (Port 8080):** Serves a real-time web dashboard at `http://<host_ip>:8080` displaying:
+  - Real-time pairing QR code display (equivalent to `androgrid-cli pair`).
+  - Connected worker node table (Node ID, SoC / ABI, RAM, Battery %, OS version, active tasks).
+  - Direct download button and scannable QR code for the worker APK on GitHub Releases.
+  - Live task submission status viewer and real-time SSE cluster event feed.
+- **Port Allocation Boundaries:**
+  - `50051/tcp`: Primary gRPC TLS 1.3 mTLS control plane (`[INV-002]`)
+  - `50052/tcp`: Content-addressed HTTP artifact distribution (`[REQ-OP-003]`)
+  - `8080/tcp`: Operator Web UI and pairing dashboard (`[REQ-OP-001]`)
+  - `5353/udp`: Multicast DNS (mDNS) responder (`[REQ-OP-001]`)
+
+---
+
+### Prerequisites (Source Build)
 - **Rust Toolchain:** Version 1.82 or newer (`rustup default stable`)
 - **Protocol Buffers Compiler:** `protoc` 3.25+ or `buf` CLI
 

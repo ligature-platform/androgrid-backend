@@ -1,0 +1,81 @@
+# Multi-Stage Turnkey All-In-One Container for AndroGrid Control Plane
+# Supports multi-architecture builds: linux/amd64 and linux/arm64
+#
+# Traces to: AG-SPEC-2026-V2 Section 2.2, Section 2.3, ADR-001, [REQ-OP-001], [INV-001], [INV-002], [NFR-SEC-001]
+
+# ------------------------------------------------------------------------------
+# Stage 1: Build production Rust binaries
+# ------------------------------------------------------------------------------
+FROM rust:1-bookworm AS builder
+
+WORKDIR /usr/src/androgrid-backend
+
+# Install build dependencies for protobuf codegen
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    protobuf-compiler \
+    && rm -rf /var/lib/apt/lists/*
+
+# Add WebAssembly compilation target for edge workloads
+RUN rustup target add wasm32-wasip1
+
+# Copy project manifests
+COPY Cargo.toml Cargo.lock build.rs ./
+COPY proto ./proto
+COPY src ./src
+COPY workloads ./workloads
+
+# Compile production orchestrator binaries
+RUN cargo build --release --bin androgrid-backend --bin androgrid-cli
+
+# Compile edge WebAssembly workloads if present
+RUN if [ -f "workloads/http-benchmark/Cargo.toml" ]; then \
+        cargo build --release --target wasm32-wasip1 --manifest-path workloads/http-benchmark/Cargo.toml || true; \
+    fi
+
+# ------------------------------------------------------------------------------
+# Stage 2: Hardened, unprivileged runtime image
+# ------------------------------------------------------------------------------
+FROM debian:bookworm-slim AS runtime
+
+# Install runtime utilities for auto-PKI, network routing inspection, and health probes
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    iproute2 \
+    openssl \
+    procps \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create dedicated unprivileged system group and user (UID 10001)
+RUN groupadd -g 10001 androgrid && \
+    useradd -u 10001 -g androgrid -d /data -s /bin/sh -M androgrid
+
+# Setup directory hierarchy
+RUN mkdir -p /data/pki /data/artifacts /opt/androgrid/workloads /usr/local/bin
+
+# Copy compiled binaries from builder stage
+COPY --from=builder /usr/src/androgrid-backend/target/release/androgrid-backend /usr/local/bin/androgrid-backend
+COPY --from=builder /usr/src/androgrid-backend/target/release/androgrid-cli /usr/local/bin/androgrid-cli
+
+# Copy pre-packaged workloads
+COPY dist/*.wasm /opt/androgrid/workloads/
+COPY deploy/all-in-one/entrypoint.sh /usr/local/bin/entrypoint.sh
+
+# Ensure executability and correct non-root ownership
+RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/androgrid-backend /usr/local/bin/androgrid-cli && \
+    chown -R androgrid:androgrid /data /opt/androgrid
+
+# Declare standard service port boundaries
+# Port 50051 (TCP): Primary gRPC mTLS control plane [INV-002]
+# Port 50052 (TCP): Content-addressed artifact HTTP server [REQ-OP-003]
+# Port 8080 (TCP):  Operator Web UI and real-time pairing dashboard [REQ-OP-001]
+# Port 5353 (UDP):  Multicast DNS (mDNS) responder [REQ-OP-001]
+EXPOSE 50051/tcp 50052/tcp 8080/tcp 5353/udp
+
+# Durable data volume for PKI certificates and cached WASM artifacts
+VOLUME ["/data"]
+
+USER androgrid
+WORKDIR /data
+
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
