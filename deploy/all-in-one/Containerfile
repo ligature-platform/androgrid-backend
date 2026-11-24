@@ -27,9 +27,15 @@ COPY workloads ./workloads
 # Compile production orchestrator binaries
 RUN cargo build --release --bin androgrid-backend --bin androgrid-cli
 
-# Compile edge WebAssembly workloads if present
-RUN if [ -f "workloads/http-benchmark/Cargo.toml" ]; then \
-        cargo build --release --target wasm32-wasip1 --manifest-path workloads/http-benchmark/Cargo.toml || true; \
+# Compile edge WebAssembly workloads inside builder stage
+RUN mkdir -p /usr/src/androgrid-backend/built-workloads && \
+    if [ -f "workloads/http-benchmark/Cargo.toml" ]; then \
+        cargo build --release --target wasm32-wasip1 --manifest-path workloads/http-benchmark/Cargo.toml && \
+        cp workloads/http-benchmark/target/wasm32-wasip1/release/http_benchmark.wasm /usr/src/androgrid-backend/built-workloads/ 2>/dev/null || true; \
+    fi && \
+    if [ -f "workloads/image-processor/Cargo.toml" ]; then \
+        cargo build --release --target wasm32-wasip1 --manifest-path workloads/image-processor/Cargo.toml && \
+        cp workloads/image-processor/target/wasm32-wasip1/release/image_processor.wasm /usr/src/androgrid-backend/built-workloads/ 2>/dev/null || true; \
     fi
 
 # ------------------------------------------------------------------------------
@@ -56,9 +62,8 @@ RUN mkdir -p /data/pki /data/artifacts /opt/androgrid/workloads /usr/local/bin
 # Copy compiled binaries from builder stage
 COPY --from=builder /usr/src/androgrid-backend/target/release/androgrid-backend /usr/local/bin/androgrid-backend
 COPY --from=builder /usr/src/androgrid-backend/target/release/androgrid-cli /usr/local/bin/androgrid-cli
+COPY --from=builder /usr/src/androgrid-backend/built-workloads/*.wasm /opt/androgrid/workloads/
 
-# Copy pre-packaged workloads
-COPY dist/*.wasm /opt/androgrid/workloads/
 COPY deploy/all-in-one/entrypoint.sh /usr/local/bin/entrypoint.sh
 
 # Ensure executability and correct non-root ownership
