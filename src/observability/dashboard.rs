@@ -239,8 +239,9 @@ pub struct PairingQrQuery {
 }
 
 /// GET /api/pair/qr.png: Serves direct binary PNG image of the pairing QR code.
-/// If `?token=<token>` is supplied, renders the QR code for that existing token.
-/// Otherwise generates a fresh token.
+/// If `?token=<token>` is supplied, validates that the token exists and is active,
+/// rendering the QR code with the real expiration timestamp.
+/// If `?token=` is omitted, generates a fresh token.
 ///
 /// Traces to: [REQ-OP-001], [INV-002]
 async fn handle_pairing_qr_png(
@@ -248,12 +249,34 @@ async fn handle_pairing_qr_png(
     axum::extract::Query(query): axum::extract::Query<PairingQrQuery>,
 ) -> Result<Response, (StatusCode, &'static str)> {
     let payload_json = if let Some(ref tok) = query.token {
+        let token_store = state.token_store.as_ref().ok_or((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Pairing token store is not configured or pairing is disabled",
+        ))?;
+
+        let record = token_store.get_token(tok).ok_or((
+            StatusCode::NOT_FOUND,
+            "Specified pairing token not found or already purged",
+        ))?;
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or(std::time::Duration::ZERO)
+            .as_secs();
+
+        if record.expires_at_epoch_s < now || record.is_redeemed {
+            return Err((
+                StatusCode::GONE,
+                "Specified pairing token has expired or has already been redeemed",
+            ));
+        }
+
         let payload = PairingPayload {
             cluster_endpoint: state.cluster_endpoint.clone(),
             ca_fingerprint: state.ca_fingerprint.clone(),
-            pairing_token: tok.clone(),
-            node_id: None,
-            expires_at_epoch_s: 0,
+            pairing_token: record.token,
+            node_id: record.target_node_id,
+            expires_at_epoch_s: record.expires_at_epoch_s,
         };
         payload.to_compact_json().map_err(|_| {
             (
