@@ -30,11 +30,11 @@ pub use config::*;
 
 pub mod pairing;
 pub use pairing::{
-    cert_init, cert_issue_admin, cert_issue_csr, cert_issue_server, export_png, render_ansi_qr,
+    cert_init, cert_issue_admin, cert_issue_csr, cert_issue_server, cert_worker, export_png, render_ansi_qr,
     AttestationError, AttestationSecurityLevel, CaSigner, CaSource, EnrollmentContext,
     EnrollmentServiceImpl, HardwareAttestationVerifier, HttpEnrollRequest, HttpEnrollResponse,
     KeyDescription, PairingError, PairingPayload, PairingTokenRecord, PairingTokenStore, PkiError,
-    PkiInitConfig, PkiIssueAdminConfig, PkiIssueCsrConfig, PkiIssueServerConfig,
+    PkiInitConfig, PkiIssueAdminConfig, PkiIssueCsrConfig, PkiIssueServerConfig, PkiWorkerConfig,
     PkiOperationSummary, SignedWorkerCert, SignerError, DEFAULT_MAX_ATTEMPTS,
     DEFAULT_PAIRING_TOKEN_TTL_SECONDS, DEFAULT_SERVER_SANS,
 };

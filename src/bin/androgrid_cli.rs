@@ -15,16 +15,17 @@ use std::time::SystemTime;
 use androgrid_backend::admin_service_client::AdminServiceClient;
 use androgrid_backend::{
     build_client_mtls_config, cert_init, cert_issue_admin, cert_issue_csr, cert_issue_server,
-    export_png, render_ansi_qr, ArtifactPackager, AssignNodesToGroupRequest, BenchmarkConfig,
-    BenchmarkDispatcher, BenchmarkFilter, CaSource, CancelTaskGroupRequest, CancelTaskRequest,
-    CreateNodeGroupRequest, DrainNodesRequest, ExecutionEngine, GeneratePairingTokenRequest,
-    GetTaskGroupStatusRequest, GetTaskStatusRequest, ListNodeGroupsRequest, ListTaskGroupsRequest,
-    ListTasksRequest, ListWorkerNodesRequest, NetworkEgressPolicy, PkiInitConfig,
-    PkiIssueAdminConfig, PkiIssueCsrConfig, PkiIssueServerConfig, PkiOperationSummary,
-    ReplaceStrategy, ReplaceTaskGroupRequest, SubmitTaskGroupRequest, SubmitTaskRequest,
-    TaskGroupSpec, TaskGroupState, TaskPartitionSpec, TaskSpec, TaskState, TaskTemplate,
-    TerminalGuard, TuiAction, TuiApp, UpdateNodeGroupRequest, UpgradeNetworkPolicy,
-    UpgradeNodesRequest, UpgradeRolloutStrategy, UploadArtifactRequest, WasiValidator,
+    cert_worker, export_png, render_ansi_qr, ArtifactPackager, AssignNodesToGroupRequest,
+    BenchmarkConfig, BenchmarkDispatcher, BenchmarkFilter, CaSource, CancelTaskGroupRequest,
+    CancelTaskRequest, CreateNodeGroupRequest, DrainNodesRequest, ExecutionEngine,
+    GeneratePairingTokenRequest, GetTaskGroupStatusRequest, GetTaskStatusRequest,
+    ListNodeGroupsRequest, ListTaskGroupsRequest, ListTasksRequest, ListWorkerNodesRequest,
+    NetworkEgressPolicy, PkiInitConfig, PkiIssueAdminConfig, PkiIssueCsrConfig,
+    PkiIssueServerConfig, PkiOperationSummary, PkiWorkerConfig, ReplaceStrategy,
+    ReplaceTaskGroupRequest, SubmitTaskGroupRequest, SubmitTaskRequest, TaskGroupSpec,
+    TaskGroupState, TaskPartitionSpec, TaskSpec, TaskState, TaskTemplate, TerminalGuard,
+    TuiAction, TuiApp, UpdateNodeGroupRequest, UpgradeNetworkPolicy, UpgradeNodesRequest,
+    UpgradeRolloutStrategy, UploadArtifactRequest, WasiValidator,
 };
 
 #[derive(Parser, Debug)]
@@ -564,6 +565,34 @@ enum CertCommands {
         #[command(subcommand)]
         target: CertIssueCommands,
     },
+
+    /// Generate a standalone worker P-256 keypair, CSR, and CA-signed client certificate
+    /// Traces to: [INV-002], [NFR-SEC-001], [REQ-OP-001]
+    Worker {
+        /// Expected worker node identifier (e.g. node_Pixel_8_84cb0f6d)
+        #[arg(long)]
+        node_id: String,
+
+        /// Directory containing existing CA files (defaults to ./pki when --ca-key is omitted)
+        #[arg(long, conflicts_with = "ca_key")]
+        ca_dir: Option<PathBuf>,
+
+        /// Explicit path to Root CA private key PEM (requires --ca-cert)
+        #[arg(long, conflicts_with = "ca_dir")]
+        ca_key: Option<PathBuf>,
+
+        /// Output directory for worker PKI hierarchy (writes client.crt, client.key, ca.crt)
+        #[arg(long, default_value = "./pki/worker")]
+        out: PathBuf,
+
+        /// Certificate validity in days (default: 365)
+        #[arg(long, default_value_t = 365)]
+        days: u32,
+
+        /// Allow overwriting existing output certificate/key file(s)
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -657,6 +686,34 @@ enum CertIssueCommands {
         days: u32,
 
         /// Allow overwriting existing output certificate file(s)
+        #[arg(long)]
+        force: bool,
+    },
+
+    /// Generate a standalone worker P-256 keypair, CSR, and CA-signed client certificate
+    /// Traces to: [INV-002], [NFR-SEC-001], [REQ-OP-001]
+    Worker {
+        /// Expected worker node identifier (e.g. node_Pixel_8_84cb0f6d)
+        #[arg(long)]
+        node_id: String,
+
+        /// Directory containing existing CA files (defaults to ./pki when --ca-key is omitted)
+        #[arg(long, conflicts_with = "ca_key")]
+        ca_dir: Option<PathBuf>,
+
+        /// Explicit path to Root CA private key PEM (requires --ca-cert)
+        #[arg(long, conflicts_with = "ca_dir")]
+        ca_key: Option<PathBuf>,
+
+        /// Output directory for worker PKI hierarchy (writes client.crt, client.key, ca.crt)
+        #[arg(long, default_value = "./pki/worker")]
+        out: PathBuf,
+
+        /// Certificate validity in days (default: 365)
+        #[arg(long, default_value_t = 365)]
+        days: u32,
+
+        /// Allow overwriting existing output certificate/key file(s)
         #[arg(long)]
         force: bool,
     },
@@ -1715,7 +1772,45 @@ fn handle_cert_command(
                     })?;
                     print_cert_summary(&summary, format, None)?;
                 }
+                CertIssueCommands::Worker {
+                    node_id,
+                    ca_dir,
+                    ca_key,
+                    out,
+                    days,
+                    force,
+                } => {
+                    let ca_source =
+                        resolve_ca_source(ca_dir, global_ca_cert, ca_cert_from_cli, ca_key)?;
+                    let summary = cert_worker(&PkiWorkerConfig {
+                        ca_source,
+                        node_id,
+                        out_dir: out,
+                        days,
+                        force,
+                    })?;
+                    print_cert_summary(&summary, format, None)?;
+                }
             }
+        }
+        CertCommands::Worker {
+            node_id,
+            ca_dir,
+            ca_key,
+            out,
+            days,
+            force,
+        } => {
+            let ca_source =
+                resolve_ca_source(ca_dir, global_ca_cert, ca_cert_from_cli, ca_key)?;
+            let summary = cert_worker(&PkiWorkerConfig {
+                ca_source,
+                node_id,
+                out_dir: out,
+                days,
+                force,
+            })?;
+            print_cert_summary(&summary, format, None)?;
         }
     }
     Ok(())
@@ -2849,6 +2944,83 @@ mod tests {
         ])
         .expect("cert issue server with explicit CA files should parse");
         assert_eq!(issue_srv.ca_cert, Some(PathBuf::from("/tmp/ca.crt")));
+
+        let worker_cli = Cli::try_parse_from([
+            "androgrid-cli",
+            "cert",
+            "worker",
+            "--node-id",
+            "node_Pixel_8_84cb0f6d",
+            "--ca-dir",
+            "/tmp/pki",
+            "--out",
+            "/tmp/worker_pki",
+            "--days",
+            "180",
+            "--force",
+        ])
+        .expect("cert worker parse should succeed");
+        match worker_cli.command {
+            Commands::Cert {
+                action:
+                    CertCommands::Worker {
+                        node_id,
+                        ca_dir,
+                        ca_key,
+                        out,
+                        days,
+                        force,
+                    },
+            } => {
+                assert_eq!(node_id, "node_Pixel_8_84cb0f6d");
+                assert_eq!(ca_dir, Some(PathBuf::from("/tmp/pki")));
+                assert_eq!(ca_key, None);
+                assert_eq!(out, PathBuf::from("/tmp/worker_pki"));
+                assert_eq!(days, 180);
+                assert!(force);
+            }
+            _ => panic!("Expected Cert Worker"),
+        }
+
+        let issue_worker_cli = Cli::try_parse_from([
+            "androgrid-cli",
+            "cert",
+            "issue",
+            "worker",
+            "--node-id",
+            "node_Redmi_Note_5",
+            "--ca-cert",
+            "/tmp/ca.crt",
+            "--ca-key",
+            "/tmp/ca.key",
+            "--out",
+            "/tmp/redmi_pki",
+        ])
+        .expect("cert issue worker parse should succeed");
+        match issue_worker_cli.command {
+            Commands::Cert {
+                action:
+                    CertCommands::Issue {
+                        target:
+                            CertIssueCommands::Worker {
+                                node_id,
+                                ca_dir,
+                                ca_key,
+                                out,
+                                days,
+                                force,
+                            },
+                    },
+            } => {
+                assert_eq!(node_id, "node_Redmi_Note_5");
+                assert_eq!(ca_dir, None);
+                assert_eq!(ca_key, Some(PathBuf::from("/tmp/ca.key")));
+                assert_eq!(out, PathBuf::from("/tmp/redmi_pki"));
+                assert_eq!(days, 365);
+                assert!(!force);
+            }
+            _ => panic!("Expected Cert Issue Worker"),
+        }
     }
 
     #[test]

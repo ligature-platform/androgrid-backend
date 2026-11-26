@@ -41,6 +41,11 @@ cloudflare-tunnel.json
 /deploy/pki/
 /deploy/credentials.json
 
+# Frame buffers, raw memory/display dumps & screen captures
+*.raw
+*.png
+!tests/fixtures/**/*.png
+
 # Developer Environments & Tooling
 .agents/
 .agent/
