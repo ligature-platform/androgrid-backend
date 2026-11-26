@@ -13,7 +13,7 @@ The cluster divides network operations into two distinct interaction planes:
 ```mermaid
 flowchart TD
     subgraph ControlPlane["Host Control Plane (Rust Orchestrator)"]
-        Scheduler["Thermal-Aware Scheduler & CAS State Engine"]
+        Scheduler["Thermal-Aware Scheduler & Guarded State Engine"]
         ArtifactStore["Content-Addressed Artifact Store (SHA-256)"]
         TonicServer["Tonic gRPC Server (TLS 1.3 mTLS)"]
     end
@@ -41,19 +41,19 @@ flowchart TD
 
 ### 2. Cellular Disconnected Unary Surface (Metered WAN)
 - **Outbound-Only Ingress (`[INV-001]`):** Cellular workers never listen on server ports. All requests originate outbound.
-- **Zero-Keepalive Unary Leases (`[INV-003]`, `[NFR-POW-001]`):** Cellular devices do not maintain persistent streams or heartbeats. A worker invokes `ClaimCellularTask` as a single unary RPC and immediately terminates the TCP socket within 200 ms to return the cellular modem to low-power Radio Resource Control (RRC) sleep.
+- **Zero-Keepalive Unary Leases (`[INV-003]`, `[NFR-POW-001]`):** Cellular devices do not maintain persistent streams or heartbeats. A worker invokes `ClaimCellularTask` as a single unary RPC and immediately terminates the client socket within 200 ms to avoid prolonging the carrier network's Radio Resource Control (RRC) tail timer.
 - **Spot Lease Cap (`[INV-005]`):** Tasks claimed over cellular WAN are granted with a strict execution deadline capped at 180 seconds.
 
 ---
 
-## Monotonic Consensus and Compare-And-Swap (CAS) Engine
+## Monotonic Attempt Fencing and Guarded State Transitions
 
 In distributed mobile edge computing, workers experience latency spikes, radio drops, and spot preemption. To prevent double-commit races and stale execution commits, AndroGrid implements **Monotonic Attempt Fencing** (`[INV-004]`).
 
 ```mermaid
 sequenceDiagram
     autonumber
-    participant Orch as Host Orchestrator (CAS Engine)
+    participant Orch as Host Orchestrator (Scheduler State)
     participant Cell as Cellular Worker (Attempt 1)
     participant WiFi as Wi-Fi Worker (Attempt 2)
 
@@ -77,7 +77,7 @@ sequenceDiagram
     Note over WiFi,Orch: Wi-Fi worker completes Attempt 2
     WiFi->>Orch: SyncNodeStateRequest (Task X completed, run_attempt=2)
     Orch->>Orch: Fencing Check: submitted (2) == active (2)
-    Orch->>Orch: CAS update state: RUNNING -> COMPLETED
+    Orch->>Orch: Guarded update state: RUNNING -> COMPLETED
     Orch-->>WiFi: SyncNodeStateResponse (acknowledged=Task X, accepted=true)
 ```
 
@@ -86,7 +86,7 @@ sequenceDiagram
 2. If a cellular worker claims Task X (`run_attempt = 1`), `active_attempt` is initialized to 1.
 3. When an unmetered Wi-Fi worker connects, the orchestrator may speculatively dual-assign or preempt Task X to the Wi-Fi node, monotonically incrementing `active_attempt` to 2 and dispatching `run_attempt = 2`.
 4. **Monotonic Fencing Rule (`src/scheduler/engine.rs`):** Any incoming submission bearing `run_attempt < active_attempt` is immediately rejected with `TASK_ATTEMPT_STALE`. Because activating attempt 2 sets `active_attempt = 2`, the cellular worker's attempt 1 cannot commit.
-5. Once a valid submission matching `active_attempt` arrives, the orchestrator commits an atomic Compare-And-Swap (CAS) transition from `RUNNING` (or `PREEMPTED`) to `COMPLETED` or `FAILED`.
+5. Once a valid submission matching `active_attempt` arrives, the orchestrator commits a guarded state transition from `RUNNING` (or `PREEMPTED`) to `COMPLETED` or `FAILED` within its scheduler lock.
 6. Any submission arriving after a task is finalized in `Completed` or `Failed` state is rejected with `AlreadyFinalized`, guaranteeing exactly-once finalization and zero duplicate executions (`[NFR-REL-001]`).
 
 ---
@@ -109,7 +109,7 @@ For multi-partition workloads (such as tiled image processing or distributed map
   - `group_epoch` (`u64`, starting at `1`) fences workload-level upgrades across the entire group (`GROUP_SUPERSEDED`).
   - `run_attempt` (`u32`) continues to fence per-task retries and Wi-Fi speculative preemptions (`TASK_ATTEMPT_STALE`).
 - **Atomic Epoch Replacement (`ReplaceTaskGroup`):**
-  - Optimistic CAS via `optional uint64 expected_epoch` (`ABORTED` on mismatch) prevents concurrent operator races.
+  - Optimistic epoch guard via `optional uint64 expected_epoch` (`ABORTED` on mismatch) prevents concurrent operator races.
   - **`REPLACE_STRATEGY_IMMEDIATE` (Default):** Cancels all non-terminal tasks in the prior epoch (`TASK_STATE_CANCELLED`), queues `cancel_task_ids` for Wi-Fi workers, and enqueues the new epoch immediately.
   - **`REPLACE_STRATEGY_DRAIN`:** Cancels `PENDING` tasks from the prior epoch, enters `TASK_GROUP_STATE_DRAINING` so in-flight `LEASED`/`RUNNING` tasks can finish within their existing lease deadlines, and enqueues the new epoch concurrently.
 
@@ -117,7 +117,7 @@ For multi-partition workloads (such as tiled image processing or distributed map
 sequenceDiagram
     autonumber
     participant Op as Operator (androgrid-cli group)
-    participant Orch as Control Plane (SchedulerInner CAS)
+    participant Orch as Control Plane (SchedulerInner State)
     participant Worker as Worker Node (Epoch 1)
 
     Op->>Orch: SubmitTaskGroup (group="img-batch", partitions=4, sha256=v1)
@@ -126,7 +126,7 @@ sequenceDiagram
     Orch-->>Worker: Assigned img-batch:e1:p0 (group_epoch=1)
 
     Op->>Orch: ReplaceTaskGroup (group="img-batch", expected_epoch=1, sha256=v2, strategy=IMMEDIATE)
-    Orch->>Orch: Single-lock CAS: bump group_epoch 1 -> 2, mark e1 tasks CANCELLED
+    Orch->>Orch: Guarded update: bump group_epoch 1 -> 2, mark e1 tasks CANCELLED
     Orch-->>Op: Accepted (new_epoch=2, cancelled_tasks=4, created_tasks=4)
 
     Worker->>Orch: SubmitCellularResult (img-batch:e1:p0)

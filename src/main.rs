@@ -1,7 +1,7 @@
 //! AndroGrid Control Plane Binary Entry Point
 //!
 //! Hosts the gRPC control plane service over mutual TLS 1.3 or local loopback,
-//! backed by the atomic lock-free ClusterScheduler.
+//! backed by the in-memory guarded ClusterScheduler.
 //!
 //! Traces to: AG-SPEC-2026-V2 Section 2.2, Section 2.3, [INV-002], [NFR-SEC-001], [NFR-PERF-001]
 

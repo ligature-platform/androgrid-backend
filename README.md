@@ -23,7 +23,7 @@ The high-concurrency Rust control plane and task orchestrator for **AndroGrid**:
 AndroGrid connects three foundational pillars to transform idle consumer mobile hardware into a resilient, private edge-compute cluster:
 
 1. **Host Control Plane (`androgrid-backend`):** High-concurrency task orchestrator coordinating monotonic fencing, dual assignment, and content-addressed bytecode delivery.
-2. **Mobile Worker Client (`androgrid-android`):** Native Android worker service running sandboxed WASI workloads via Chicory and Wasmtime with zero-keepalive cellular lifecycle.
+2. **Mobile Worker Client (`androgrid-android`):** Native Android worker service running sandboxed WASI workloads via Chicory (WASI Preview 1 in-process engine) with zero-keepalive cellular lifecycle.
 3. **System Architecture Specification (`AG-SPEC-2026-V2`):** ISO/IEC/IEEE 29148 requirements traceability matrix defining all state machines, protocol contracts, and security boundaries.
 
 For comprehensive architectural walkthroughs, visit the [Ecosystem Overview](docs/src/showcase/ecosystem.md), inspect the [ISO 29148 Traceability Matrix](docs/traceability_matrix.md), or review the [Control Plane Architecture Decision Records](docs/adr/ADR-001-mutual-tls-1.3-ecdsa-p256.md).
@@ -34,10 +34,10 @@ For comprehensive architectural walkthroughs, visit the [Ecosystem Overview](doc
 
 Deploying cluster compute onto smartphones often raises valid concerns regarding hardware longevity and thermal impact:
 
-- **Battery Longevity (80% Charge Limit):** Android 14+ battery protection limits maximum charge to 80%, reducing cathode voltage stress and preventing electrolyte decomposition. Tasks are rejected below 20% battery (`[REQ-OP-003]`).
-- **Thermal Hysteresis Protection:** `ThermalSafetyGuard` cuts off computation if battery temperature exceeds 38 C or the OS reports `THERMAL_STATUS_SEVERE`. Computation resumes only after cooling to 35 C, eliminating start-stop thermal flapping.
-- **Superior Efficiency vs Raspberry Pi / x86:** ARM big.LITTLE mobile chips consume 15 mW to 50 mW in radio sleep, whereas a Raspberry Pi 4 consumes 2.5 W to 4.0 W continuously idling. Under cellular operation, sockets terminate within 200 ms (`[NFR-POW-001]`), permitting immediate baseband RRC low-power sleep.
-- **Zero Hardware Cost:** Transforms millions of unused drawer smartphones into private edge compute nodes with built-in battery backup (UPS), Wi-Fi 6, and hardware cryptographic accelerators.
+- **Battery Longevity & Admission Gating:** Supported devices offer configurable charging limits (e.g. Android 14+ Battery Protection or OEM equivalents). AndroGrid enforces admission gating by rejecting tasks below 20% battery (`[REQ-OP-003]`).
+- **Thermal Hysteresis Protection:** The worker defers new task launches if battery temperature exceeds 38 C or the OS reports `THERMAL_STATUS_SEVERE`. New launches resume once cooled to 35 C, eliminating start-stop thermal flapping while permitting in-flight tasks to finish within timeouts.
+- **Energy Efficiency vs Raspberry Pi / x86:** ARM big.LITTLE mobile SoCs draw 2.5 W to 4.5 W under active compute, providing high performance-per-watt compared to 15 W to 35 W x86 Mini-PCs. Under cellular operation, client sockets terminate within 200 ms (`[NFR-POW-001]`) to avoid prolonging carrier RRC tail timers.
+- **Hardware Reclamation:** Repurposes existing amortized drawer smartphones into private edge compute nodes with built-in battery backup (UPS), Wi-Fi 6, and hardware cryptographic accelerators.
 - **Zero Inbound Ports (`[INV-001]`):** Worker devices never expose listening ports. All connections originate outbound over mutual TLS 1.3 (`[INV-002]`).
 
 Read the complete empirical analysis in the [Mobile Economics & Battery FAQ](docs/src/showcase/economics_faq.md).
@@ -46,7 +46,7 @@ Read the complete empirical analysis in the [Mobile Economics & Battery FAQ](doc
 
 ## Architecture Overview
 
-The Host Control Plane coordinates task scheduling, speculative dual-assignment, monotonic fencing, and result consensus:
+The Host Control Plane coordinates task scheduling, speculative dual-assignment, monotonic fencing, and guarded state transitions:
 
 - **Monotonic Attempt Fencing (`[INV-004]`):** Every dispatched task carries a monotonically increasing `run_attempt`. Submissions with stale attempt counters are atomically discarded with `TASK_ATTEMPT_STALE`, eliminating double-commit races.
 - **Cellular Spot Preemption (`[INV-005]`):** Cellular tasks operate as speculative spot instances capped at 180 seconds. If an unmetered Wi-Fi worker connects, the task is dual-assigned with `run_attempt + 1`. The first node to commit wins.

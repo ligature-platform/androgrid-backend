@@ -15,7 +15,7 @@ flowchart TD
     subgraph HostControlPlane ["Host Control Plane (androgrid-backend)"]
         Orchestrator["Tonic gRPC Orchestrator (Port 50051)"]
         Scheduler["Dual-Assignment Scheduler (INV-004 / INV-005)"]
-        CASStorage["Compare-And-Swap State Consensus"]
+        CASStorage["Guarded In-Memory Scheduler State (RwLock)"]
         CASArtifact["Content-Addressed Artifact Server (/artifacts)"]
         WebDashboard["Embedded Observability Dashboard (Port 8080)"]
         CLI["androgrid-cli (Operator & Dev Tool)"]
@@ -29,7 +29,7 @@ flowchart TD
     subgraph MobileWorkers ["Mobile Worker Nodes (androgrid-android)"]
         Pixel["Google Pixel 7 Worker (Wi-Fi Unmetered)"]
         Galaxy["Samsung Galaxy S22 Worker (Cellular WAN)"]
-        Chicory["In-Process Chicory / Wasmtime WASI Sandbox"]
+        Chicory["In-Process Chicory WASI Sandbox"]
         Thermal["ThermalSafetyGuard & Battery Monitor"]
     end
 
