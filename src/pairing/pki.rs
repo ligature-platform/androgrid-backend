@@ -418,7 +418,12 @@ pub fn cert_worker(config: &PkiWorkerConfig) -> Result<PkiOperationSummary, PkiE
     }
 
     write_file_atomic(&client_key_path, key_pem.as_bytes(), true, config.force)?;
-    write_file_atomic(&client_crt_path, signed.client_cert_pem.as_bytes(), false, config.force)?;
+    write_file_atomic(
+        &client_crt_path,
+        signed.client_cert_pem.as_bytes(),
+        false,
+        config.force,
+    )?;
     let ca_content = format!("{}\n", signed.ca_cert_pem.trim());
     write_file_atomic(&ca_crt_path, ca_content.as_bytes(), false, config.force)?;
 

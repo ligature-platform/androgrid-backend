@@ -23,8 +23,8 @@ use androgrid_backend::{
     NetworkEgressPolicy, PkiInitConfig, PkiIssueAdminConfig, PkiIssueCsrConfig,
     PkiIssueServerConfig, PkiOperationSummary, PkiWorkerConfig, ReplaceStrategy,
     ReplaceTaskGroupRequest, SubmitTaskGroupRequest, SubmitTaskRequest, TaskGroupSpec,
-    TaskGroupState, TaskPartitionSpec, TaskSpec, TaskState, TaskTemplate, TerminalGuard,
-    TuiAction, TuiApp, UpdateNodeGroupRequest, UpgradeNetworkPolicy, UpgradeNodesRequest,
+    TaskGroupState, TaskPartitionSpec, TaskSpec, TaskState, TaskTemplate, TerminalGuard, TuiAction,
+    TuiApp, UpdateNodeGroupRequest, UpgradeNetworkPolicy, UpgradeNodesRequest,
     UpgradeRolloutStrategy, UploadArtifactRequest, WasiValidator,
 };
 
@@ -1801,8 +1801,7 @@ fn handle_cert_command(
             days,
             force,
         } => {
-            let ca_source =
-                resolve_ca_source(ca_dir, global_ca_cert, ca_cert_from_cli, ca_key)?;
+            let ca_source = resolve_ca_source(ca_dir, global_ca_cert, ca_cert_from_cli, ca_key)?;
             let summary = cert_worker(&PkiWorkerConfig {
                 ca_source,
                 node_id,
