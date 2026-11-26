@@ -35,6 +35,7 @@ pub struct AdminServiceImpl {
     token_store: Arc<PairingTokenStore>,
     ca_fingerprint: String,
     cluster_endpoint: String,
+    allow_unauthenticated: bool,
 }
 
 impl AdminServiceImpl {
@@ -47,6 +48,7 @@ impl AdminServiceImpl {
             token_store: Arc::new(PairingTokenStore::default()),
             ca_fingerprint: String::new(),
             cluster_endpoint: "https://127.0.0.1:50051".to_string(),
+            allow_unauthenticated: true,
         }
     }
 
@@ -65,6 +67,7 @@ impl AdminServiceImpl {
             token_store: Arc::new(PairingTokenStore::default()),
             ca_fingerprint: String::new(),
             cluster_endpoint: "https://127.0.0.1:50051".to_string(),
+            allow_unauthenticated: true,
         }
     }
 
@@ -86,20 +89,53 @@ impl AdminServiceImpl {
             token_store,
             ca_fingerprint,
             cluster_endpoint,
+            allow_unauthenticated: true,
         }
     }
 
+    /// Configures whether requests without client mTLS identity are permitted.
+    ///
+    /// Defaults to `true` on standalone constructors for unit testing convenience.
+    /// In production deployments, setting this to `false` enforces fail-closed authorization.
+    pub fn with_allow_unauthenticated(mut self, allow: bool) -> Self {
+        self.allow_unauthenticated = allow;
+        self
+    }
+
     /// Enforces a positive allowlist requiring operator certificates
-    /// (`OU = Control Plane`) when mTLS identity metadata is attached.
-    fn authorize_admin_peer<T>(request: &Request<T>) -> Result<(), Status> {
+    /// (`OU = Control Plane`). Fails closed when client identity metadata is missing
+    /// unless explicitly configured via [`with_allow_unauthenticated`].
+    ///
+    /// Traces to: [INV-002], [NFR-SEC-001]
+    fn authorize_admin_peer<T>(&self, request: &Request<T>) -> Result<(), Status> {
         if let Some(peer) = request.extensions().get::<AuthenticatedPeer>() {
             if peer.organizational_unit.as_deref() != Some("Control Plane") {
                 return Err(Status::permission_denied(
                     "AdminService requires an operator certificate with OU=Control Plane",
                 ));
             }
+            return Ok(());
         }
-        Ok(())
+
+        if let Some(certs) = request.peer_certs() {
+            if let Some(cert) = certs.first() {
+                let peer = crate::transport::tls::parse_leaf_identity(cert.as_ref())?;
+                if peer.organizational_unit.as_deref() != Some("Control Plane") {
+                    return Err(Status::permission_denied(
+                        "AdminService requires an operator certificate with OU=Control Plane",
+                    ));
+                }
+                return Ok(());
+            }
+        }
+
+        if self.allow_unauthenticated {
+            return Ok(());
+        }
+
+        Err(Status::unauthenticated(
+            "Missing verified mTLS peer identity on AdminService [INV-002]",
+        ))
     }
 
     /// Validates WASM artifact references against ArtifactStore when inline bytecode is empty.
@@ -178,7 +214,7 @@ impl AdminService for AdminServiceImpl {
         &self,
         request: Request<SubmitTaskRequest>,
     ) -> Result<Response<SubmitTaskResponse>, Status> {
-        Self::authorize_admin_peer(&request)?;
+        self.authorize_admin_peer(&request)?;
         let req = request.into_inner();
         let task = req.task.ok_or_else(|| {
             Status::invalid_argument("task field is required in SubmitTaskRequest")
@@ -225,7 +261,7 @@ impl AdminService for AdminServiceImpl {
         &self,
         request: Request<GetTaskStatusRequest>,
     ) -> Result<Response<GetTaskStatusResponse>, Status> {
-        Self::authorize_admin_peer(&request)?;
+        self.authorize_admin_peer(&request)?;
         let req = request.into_inner();
         let task_id = req.task_id;
         if task_id.is_empty() {
@@ -270,7 +306,7 @@ impl AdminService for AdminServiceImpl {
         &self,
         request: Request<ListWorkerNodesRequest>,
     ) -> Result<Response<ListWorkerNodesResponse>, Status> {
-        Self::authorize_admin_peer(&request)?;
+        self.authorize_admin_peer(&request)?;
         let nodes = self.scheduler.list_worker_nodes();
         Ok(Response::new(ListWorkerNodesResponse { nodes }))
     }
@@ -282,7 +318,7 @@ impl AdminService for AdminServiceImpl {
         &self,
         request: Request<ListTasksRequest>,
     ) -> Result<Response<ListTasksResponse>, Status> {
-        Self::authorize_admin_peer(&request)?;
+        self.authorize_admin_peer(&request)?;
         let req = request.into_inner();
         let state_filter = if req.state_filter == 0 {
             None
@@ -300,7 +336,7 @@ impl AdminService for AdminServiceImpl {
         &self,
         request: Request<CancelTaskRequest>,
     ) -> Result<Response<CancelTaskResponse>, Status> {
-        Self::authorize_admin_peer(&request)?;
+        self.authorize_admin_peer(&request)?;
         let req = request.into_inner();
         let task_id = req.task_id;
         if task_id.is_empty() {
@@ -331,7 +367,7 @@ impl AdminService for AdminServiceImpl {
         &self,
         request: Request<UploadArtifactRequest>,
     ) -> Result<Response<UploadArtifactResponse>, Status> {
-        Self::authorize_admin_peer(&request)?;
+        self.authorize_admin_peer(&request)?;
         let req = request.into_inner();
         let bytecode = req.bytecode;
         if bytecode.is_empty() {
@@ -386,7 +422,7 @@ impl AdminService for AdminServiceImpl {
         &self,
         request: Request<GeneratePairingTokenRequest>,
     ) -> Result<Response<GeneratePairingTokenResponse>, Status> {
-        Self::authorize_admin_peer(&request)?;
+        self.authorize_admin_peer(&request)?;
         if self.ca_fingerprint.is_empty() {
             return Err(Status::failed_precondition(
                 "Root CA signer is not initialized; pairing enrollment is unavailable (check ANDROGRID_CA_KEY_PATH)",
@@ -455,7 +491,7 @@ impl AdminService for AdminServiceImpl {
         &self,
         request: Request<SubmitTaskGroupRequest>,
     ) -> Result<Response<SubmitTaskGroupResponse>, Status> {
-        Self::authorize_admin_peer(&request)?;
+        self.authorize_admin_peer(&request)?;
         let req = request.into_inner();
         let group = req.group.ok_or_else(|| {
             Status::invalid_argument("group field is required in SubmitTaskGroupRequest")
@@ -485,7 +521,7 @@ impl AdminService for AdminServiceImpl {
         &self,
         request: Request<ReplaceTaskGroupRequest>,
     ) -> Result<Response<ReplaceTaskGroupResponse>, Status> {
-        Self::authorize_admin_peer(&request)?;
+        self.authorize_admin_peer(&request)?;
         let req = request.into_inner();
         let template = req.template.as_ref().ok_or_else(|| {
             Status::invalid_argument("template field is required in ReplaceTaskGroupRequest")
@@ -512,7 +548,7 @@ impl AdminService for AdminServiceImpl {
         &self,
         request: Request<CancelTaskGroupRequest>,
     ) -> Result<Response<CancelTaskGroupResponse>, Status> {
-        Self::authorize_admin_peer(&request)?;
+        self.authorize_admin_peer(&request)?;
         let req = request.into_inner();
         if req.group_id.is_empty() {
             return Err(Status::invalid_argument("group_id must not be empty"));
@@ -531,7 +567,7 @@ impl AdminService for AdminServiceImpl {
         &self,
         request: Request<GetTaskGroupStatusRequest>,
     ) -> Result<Response<GetTaskGroupStatusResponse>, Status> {
-        Self::authorize_admin_peer(&request)?;
+        self.authorize_admin_peer(&request)?;
         let req = request.into_inner();
         if req.group_id.is_empty() {
             return Err(Status::invalid_argument("group_id must not be empty"));
@@ -550,7 +586,7 @@ impl AdminService for AdminServiceImpl {
         &self,
         request: Request<ListTaskGroupsRequest>,
     ) -> Result<Response<ListTaskGroupsResponse>, Status> {
-        Self::authorize_admin_peer(&request)?;
+        self.authorize_admin_peer(&request)?;
         let req = request.into_inner();
         let state_filter = if req.state_filter == 0 {
             None
@@ -568,7 +604,7 @@ impl AdminService for AdminServiceImpl {
         &self,
         request: Request<CreateNodeGroupRequest>,
     ) -> Result<Response<CreateNodeGroupResponse>, Status> {
-        Self::authorize_admin_peer(&request)?;
+        self.authorize_admin_peer(&request)?;
         let req = request.into_inner();
         let res = self
             .scheduler
@@ -583,7 +619,7 @@ impl AdminService for AdminServiceImpl {
         &self,
         request: Request<UpdateNodeGroupRequest>,
     ) -> Result<Response<UpdateNodeGroupResponse>, Status> {
-        Self::authorize_admin_peer(&request)?;
+        self.authorize_admin_peer(&request)?;
         let req = request.into_inner();
         let res = self
             .scheduler
@@ -598,7 +634,7 @@ impl AdminService for AdminServiceImpl {
         &self,
         request: Request<ListNodeGroupsRequest>,
     ) -> Result<Response<ListNodeGroupsResponse>, Status> {
-        Self::authorize_admin_peer(&request)?;
+        self.authorize_admin_peer(&request)?;
         let groups = self.scheduler.list_node_groups();
         Ok(Response::new(ListNodeGroupsResponse { groups }))
     }
@@ -610,7 +646,7 @@ impl AdminService for AdminServiceImpl {
         &self,
         request: Request<AssignNodesToGroupRequest>,
     ) -> Result<Response<AssignNodesToGroupResponse>, Status> {
-        Self::authorize_admin_peer(&request)?;
+        self.authorize_admin_peer(&request)?;
         let req = request.into_inner();
         let res = self
             .scheduler
@@ -625,7 +661,7 @@ impl AdminService for AdminServiceImpl {
         &self,
         request: Request<DrainNodesRequest>,
     ) -> Result<Response<DrainNodesResponse>, Status> {
-        Self::authorize_admin_peer(&request)?;
+        self.authorize_admin_peer(&request)?;
         let req = request.into_inner();
         let res = self.scheduler.drain_nodes(req)?;
         Ok(Response::new(res))
@@ -638,7 +674,7 @@ impl AdminService for AdminServiceImpl {
         &self,
         request: Request<UpgradeNodesRequest>,
     ) -> Result<Response<UpgradeNodesResponse>, Status> {
-        Self::authorize_admin_peer(&request)?;
+        self.authorize_admin_peer(&request)?;
         let req = request.into_inner();
         let res = self.scheduler.upgrade_nodes(req)?;
         Ok(Response::new(res))

@@ -198,8 +198,8 @@ async fn test_generated_pki_completes_live_mtls_handshake() {
         cert_init, cert_issue_csr, CaSource, PkiInitConfig, PkiIssueCsrConfig,
     };
     use androgrid_backend::{
-        build_client_mtls_config, build_server_mtls_config, AdminServiceImpl, ClusterScheduler,
-        ListWorkerNodesRequest,
+        build_client_mtls_config, build_server_mtls_config, require_client_mtls_interceptor,
+        AdminServiceImpl, ClusterScheduler, ListWorkerNodesRequest,
     };
 
     let root = temp_dir("mtls_handshake");
@@ -259,7 +259,10 @@ async fn test_generated_pki_completes_live_mtls_handshake() {
         Server::builder()
             .tls_config(server_tls)
             .unwrap()
-            .add_service(AdminServiceServer::new(admin_service))
+            .add_service(AdminServiceServer::with_interceptor(
+                admin_service,
+                require_client_mtls_interceptor,
+            ))
             .serve_with_incoming(incoming)
             .await
             .unwrap();
@@ -283,7 +286,7 @@ async fn test_generated_pki_completes_live_mtls_handshake() {
         .expect("AdminService with operator cert must succeed");
     assert!(resp.into_inner().nodes.is_empty());
 
-    // 2. CSR-signed worker cert (OU=Edge Compute) also completes the mTLS handshake
+    // 2. CSR-signed worker cert (OU=Edge Compute) completes mTLS handshake but is rejected by RBAC [INV-002]
     let worker_tls = build_client_mtls_config(&worker_cert, &worker_key_pem, &ca_pem, "localhost");
     let worker_channel = Channel::from_shared(endpoint_uri.clone())
         .unwrap()
@@ -293,10 +296,11 @@ async fn test_generated_pki_completes_live_mtls_handshake() {
         .await
         .expect("Worker mTLS handshake must succeed");
     let mut worker_client = AdminServiceClient::new(worker_channel);
-    worker_client
+    let worker_err = worker_client
         .list_worker_nodes(ListWorkerNodesRequest {})
         .await
-        .expect("Worker cert must be accepted by server mTLS trust store");
+        .expect_err("Worker cert (OU=Edge Compute) must be rejected with PermissionDenied by AdminService");
+    assert_eq!(worker_err.code(), tonic::Code::PermissionDenied);
 
     // 3. Untrusted self-signed client cert must be rejected by server mTLS
     let rogue_key = KeyPair::generate().unwrap();

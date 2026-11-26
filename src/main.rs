@@ -211,7 +211,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Arc::clone(&token_store),
         ca_fingerprint.clone(),
         cluster_endpoint.clone(),
-    );
+    )
+    .with_allow_unauthenticated(!mtls_enabled);
     let admin_server = tonic::codegen::InterceptedService::new(
         AdminServiceServer::new(admin_service)
             .max_decoding_message_size(config.max_frame_size_bytes)
