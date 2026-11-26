@@ -6,7 +6,7 @@
 //! Traces to: AG-SPEC-2026-V2, [REQ-OP-001], [REQ-OP-004], [INV-002], [NFR-SEC-001], [NFR-PERF-001]
 
 use clap::parser::ValueSource;
-use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
+use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -568,31 +568,35 @@ enum CertCommands {
 
     /// Generate a standalone worker P-256 keypair, CSR, and CA-signed client certificate
     /// Traces to: [INV-002], [NFR-SEC-001], [REQ-OP-001]
-    Worker {
-        /// Expected worker node identifier (e.g. node_Pixel_8_84cb0f6d)
-        #[arg(long)]
-        node_id: String,
+    Worker(CertWorkerArgs),
+}
 
-        /// Directory containing existing CA files (defaults to ./pki when --ca-key is omitted)
-        #[arg(long, conflicts_with = "ca_key")]
-        ca_dir: Option<PathBuf>,
+/// Command-line arguments for standalone worker PKI generation (`cert worker` and `cert issue worker`).
+#[derive(Args, Debug, Clone)]
+pub struct CertWorkerArgs {
+    /// Expected worker node identifier (e.g. node_Pixel_8_84cb0f6d)
+    #[arg(long)]
+    pub node_id: String,
 
-        /// Explicit path to Root CA private key PEM (requires --ca-cert)
-        #[arg(long, conflicts_with = "ca_dir")]
-        ca_key: Option<PathBuf>,
+    /// Directory containing existing CA files (defaults to ./pki when --ca-key is omitted)
+    #[arg(long, conflicts_with = "ca_key")]
+    pub ca_dir: Option<PathBuf>,
 
-        /// Output directory for worker PKI hierarchy (writes client.crt, client.key, ca.crt)
-        #[arg(long, default_value = "./pki/worker")]
-        out: PathBuf,
+    /// Explicit path to Root CA private key PEM (requires --ca-cert)
+    #[arg(long, conflicts_with = "ca_dir")]
+    pub ca_key: Option<PathBuf>,
 
-        /// Certificate validity in days (default: 365)
-        #[arg(long, default_value_t = 365)]
-        days: u32,
+    /// Output directory for worker PKI hierarchy (writes client.crt, client.key, ca.crt)
+    #[arg(long, default_value = "./pki/worker")]
+    pub out: PathBuf,
 
-        /// Allow overwriting existing output certificate/key file(s)
-        #[arg(long)]
-        force: bool,
-    },
+    /// Certificate validity in days (default: 365)
+    #[arg(long, default_value_t = 365)]
+    pub days: u32,
+
+    /// Allow overwriting existing output certificate/key file(s)
+    #[arg(long)]
+    pub force: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -692,31 +696,7 @@ enum CertIssueCommands {
 
     /// Generate a standalone worker P-256 keypair, CSR, and CA-signed client certificate
     /// Traces to: [INV-002], [NFR-SEC-001], [REQ-OP-001]
-    Worker {
-        /// Expected worker node identifier (e.g. node_Pixel_8_84cb0f6d)
-        #[arg(long)]
-        node_id: String,
-
-        /// Directory containing existing CA files (defaults to ./pki when --ca-key is omitted)
-        #[arg(long, conflicts_with = "ca_key")]
-        ca_dir: Option<PathBuf>,
-
-        /// Explicit path to Root CA private key PEM (requires --ca-cert)
-        #[arg(long, conflicts_with = "ca_dir")]
-        ca_key: Option<PathBuf>,
-
-        /// Output directory for worker PKI hierarchy (writes client.crt, client.key, ca.crt)
-        #[arg(long, default_value = "./pki/worker")]
-        out: PathBuf,
-
-        /// Certificate validity in days (default: 365)
-        #[arg(long, default_value_t = 365)]
-        days: u32,
-
-        /// Allow overwriting existing output certificate/key file(s)
-        #[arg(long)]
-        force: bool,
-    },
+    Worker(CertWorkerArgs),
 }
 
 /// Parses KEY=VALUE command-line strings into pairs.
@@ -1772,46 +1752,36 @@ fn handle_cert_command(
                     })?;
                     print_cert_summary(&summary, format, None)?;
                 }
-                CertIssueCommands::Worker {
-                    node_id,
-                    ca_dir,
-                    ca_key,
-                    out,
-                    days,
-                    force,
-                } => {
-                    let ca_source =
-                        resolve_ca_source(ca_dir, global_ca_cert, ca_cert_from_cli, ca_key)?;
-                    let summary = cert_worker(&PkiWorkerConfig {
-                        ca_source,
-                        node_id,
-                        out_dir: out,
-                        days,
-                        force,
-                    })?;
-                    print_cert_summary(&summary, format, None)?;
+                CertIssueCommands::Worker(args) => {
+                    handle_cert_worker(args, global_ca_cert, ca_cert_from_cli, format)?;
                 }
             }
         }
-        CertCommands::Worker {
-            node_id,
-            ca_dir,
-            ca_key,
-            out,
-            days,
-            force,
-        } => {
-            let ca_source = resolve_ca_source(ca_dir, global_ca_cert, ca_cert_from_cli, ca_key)?;
-            let summary = cert_worker(&PkiWorkerConfig {
-                ca_source,
-                node_id,
-                out_dir: out,
-                days,
-                force,
-            })?;
-            print_cert_summary(&summary, format, None)?;
+        CertCommands::Worker(args) => {
+            handle_cert_worker(args, global_ca_cert, ca_cert_from_cli, format)?;
         }
     }
+    Ok(())
+}
+
+fn handle_cert_worker(
+    args: CertWorkerArgs,
+    global_ca_cert: Option<&Path>,
+    ca_cert_from_cli: bool,
+    format: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    eprintln!(
+        "[!] Notice: Host-generated worker keypair bypasses hardware attestation (ADR-009). Intended for testing or headless runtimes."
+    );
+    let ca_source = resolve_ca_source(args.ca_dir, global_ca_cert, ca_cert_from_cli, args.ca_key)?;
+    let summary = cert_worker(&PkiWorkerConfig {
+        ca_source,
+        node_id: args.node_id,
+        out_dir: args.out,
+        days: args.days,
+        force: args.force,
+    })?;
+    print_cert_summary(&summary, format, None)?;
     Ok(())
 }
 
@@ -2962,14 +2932,14 @@ mod tests {
         match worker_cli.command {
             Commands::Cert {
                 action:
-                    CertCommands::Worker {
+                    CertCommands::Worker(CertWorkerArgs {
                         node_id,
                         ca_dir,
                         ca_key,
                         out,
                         days,
                         force,
-                    },
+                    }),
             } => {
                 assert_eq!(node_id, "node_Pixel_8_84cb0f6d");
                 assert_eq!(ca_dir, Some(PathBuf::from("/tmp/pki")));
@@ -3001,14 +2971,14 @@ mod tests {
                 action:
                     CertCommands::Issue {
                         target:
-                            CertIssueCommands::Worker {
+                            CertIssueCommands::Worker(CertWorkerArgs {
                                 node_id,
                                 ca_dir,
                                 ca_key,
                                 out,
                                 days,
                                 force,
-                            },
+                            }),
                     },
             } => {
                 assert_eq!(node_id, "node_Redmi_Note_5");
