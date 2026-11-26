@@ -316,6 +316,29 @@ impl CaSigner {
             ));
         }
 
+        let now = OffsetDateTime::now_utc();
+        let now_secs = now.unix_timestamp();
+        let ca_remaining_secs = self.ca_not_after_epoch_secs - now_secs;
+        if ca_remaining_secs <= 0 {
+            return Err(SignerError::CaLifetimeInsufficient {
+                ca_remaining_days: ca_remaining_secs.div_euclid(86_400),
+                required_days: 1,
+            });
+        }
+        let max_days = ca_remaining_secs / 86_400;
+        let effective_days =
+            if now_secs + i64::from(days_valid) * 86_400 > self.ca_not_after_epoch_secs {
+                if max_days == 0 {
+                    return Err(SignerError::CaLifetimeInsufficient {
+                        ca_remaining_days: 0,
+                        required_days: 1,
+                    });
+                }
+                (max_days as u32).min(days_valid)
+            } else {
+                days_valid
+            };
+
         let mut csr_params = CertificateSigningRequestParams::from_pem(csr_pem)
             .map_err(|e| SignerError::InvalidCsr(e.to_string()))?;
 
@@ -348,9 +371,15 @@ impl CaSigner {
         csr_params.params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
         csr_params.params.subject_alt_names.clear();
 
-        let now = OffsetDateTime::now_utc();
         csr_params.params.not_before = now - Duration::minutes(5);
-        csr_params.params.not_after = now + Duration::days(i64::from(days_valid));
+        let computed_not_after = now + Duration::days(i64::from(effective_days));
+        csr_params.params.not_after = if let Ok(ca_expiry) =
+            OffsetDateTime::from_unix_timestamp(self.ca_not_after_epoch_secs)
+        {
+            computed_not_after.min(ca_expiry)
+        } else {
+            computed_not_after
+        };
 
         // Sign the CSR using the Root CA
         let signed_cert = csr_params
@@ -587,5 +616,31 @@ mod tests {
             CaSigner::compute_ca_fingerprint(&ca_key_pem).unwrap_err(),
             SignerError::CaCertParseError(_)
         ));
+    }
+
+    #[test]
+    fn test_sign_worker_csr_clamps_to_ca_lifetime() {
+        let mut ca_params = CertificateParams::default();
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        ca_params
+            .distinguished_name
+            .push(DnType::CommonName, "Short-Lived CA");
+        let now = OffsetDateTime::now_utc();
+        ca_params.not_before = now - Duration::days(1);
+        ca_params.not_after = now + Duration::days(10);
+        let ca_key = KeyPair::generate().unwrap();
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+        let signer = CaSigner::from_pem(&ca_cert.pem(), &ca_key.serialize_pem()).unwrap();
+
+        let (csr_pem, _) = generate_test_csr("node-clamp-test");
+        let signed = signer
+            .sign_worker_csr_with_days(&csr_pem, "node-clamp-test", 365)
+            .expect("Signing with long requested duration should clamp to CA remaining");
+        let parsed_pem = pem::parse(&signed.client_cert_pem).unwrap();
+        let (_, cert) = x509_parser::parse_x509_certificate(parsed_pem.contents()).unwrap();
+        assert!(
+            cert.validity().not_after.timestamp() <= signer.ca_not_after_epoch_secs,
+            "Signed cert notAfter must not exceed Root CA expiration"
+        );
     }
 }

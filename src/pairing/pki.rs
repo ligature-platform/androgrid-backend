@@ -316,8 +316,8 @@ pub fn cert_issue_csr(config: &PkiIssueCsrConfig) -> Result<PkiOperationSummary,
     })?;
 
     let signer = load_ca_signer(&config.ca_source)?;
-    let (_, _, not_before_str, not_after_str) = build_validity_window(config.days)?;
     let signed = signer.sign_worker_csr_with_days(&csr_pem, &config.node_id, config.days)?;
+    let (not_before_str, not_after_str) = extract_cert_validity_rfc3339(&signed.client_cert_pem)?;
 
     if let Some(parent) = config.out_path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -407,8 +407,8 @@ pub fn cert_worker(config: &PkiWorkerConfig) -> Result<PkiOperationSummary, PkiE
     let csr_pem = csr.pem()?;
 
     let signer = load_ca_signer(&config.ca_source)?;
-    let (_, _, not_before_str, not_after_str) = build_validity_window(config.days)?;
     let signed = signer.sign_worker_csr_with_days(&csr_pem, &config.node_id, config.days)?;
+    let (not_before_str, not_after_str) = extract_cert_validity_rfc3339(&signed.client_cert_pem)?;
 
     if !config.out_dir.as_os_str().is_empty() {
         fs::create_dir_all(&config.out_dir).map_err(|e| PkiError::Io {
@@ -724,6 +724,40 @@ fn build_validity_window(
         .map_err(|e| PkiError::InvalidArgument(e.to_string()))?;
 
     Ok((not_before, not_after, not_before_str, not_after_str))
+}
+
+/// Extracts the exact `notBefore` and `notAfter` timestamps directly from a PEM certificate
+/// and formats them as RFC 3339 strings to ensure zero clock skew against the issued artifact.
+fn extract_cert_validity_rfc3339(cert_pem: &str) -> Result<(String, String), PkiError> {
+    let pem_blocks: Vec<pem::Pem> = pem::parse_many(cert_pem).map_err(|e| {
+        PkiError::Signer(SignerError::SigningFailed(format!(
+            "Failed to parse certificate PEM: {e}"
+        )))
+    })?;
+    let cert_block = pem_blocks
+        .into_iter()
+        .find(|p| p.tag() == "CERTIFICATE")
+        .ok_or_else(|| {
+            PkiError::Signer(SignerError::SigningFailed(
+                "No CERTIFICATE block found in PEM".to_string(),
+            ))
+        })?;
+    let (_, cert) = x509_parser::parse_x509_certificate(cert_block.contents()).map_err(|e| {
+        PkiError::Signer(SignerError::SigningFailed(format!(
+            "Failed to parse X.509 certificate: {e}"
+        )))
+    })?;
+    let nb_secs = cert.validity().not_before.timestamp();
+    let na_secs = cert.validity().not_after.timestamp();
+    let not_before = OffsetDateTime::from_unix_timestamp(nb_secs)
+        .map_err(|e| PkiError::Signer(SignerError::SigningFailed(e.to_string())))?
+        .format(&Rfc3339)
+        .map_err(|e| PkiError::Signer(SignerError::SigningFailed(e.to_string())))?;
+    let not_after = OffsetDateTime::from_unix_timestamp(na_secs)
+        .map_err(|e| PkiError::Signer(SignerError::SigningFailed(e.to_string())))?
+        .format(&Rfc3339)
+        .map_err(|e| PkiError::Signer(SignerError::SigningFailed(e.to_string())))?;
+    Ok((not_before, not_after))
 }
 
 fn validate_days(days: u32, flag_name: &str) -> Result<(), PkiError> {
