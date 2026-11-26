@@ -1298,6 +1298,71 @@ mod tests {
         assert!(client_key.exists());
         assert!(ca_crt.exists());
 
+        // Verify X.509 certificate attributes, SANs, and key usages [INV-002], [NFR-SEC-001]
+        let crt_bytes = fs::read(&client_crt).unwrap();
+        let pem_blocks = pem::parse_many(&crt_bytes).unwrap();
+        let cert_block = pem_blocks
+            .into_iter()
+            .find(|p| p.tag() == "CERTIFICATE")
+            .unwrap();
+        let (_, cert) = x509_parser::parse_x509_certificate(cert_block.contents()).unwrap();
+
+        assert!(!cert.is_ca(), "Worker cert must have CA:FALSE");
+        assert!(
+            cert.subject_alternative_name().unwrap().is_none(),
+            "Worker cert must not contain SANs"
+        );
+
+        let cn = cert
+            .subject()
+            .iter_common_name()
+            .next()
+            .unwrap()
+            .as_str()
+            .unwrap();
+        assert_eq!(cn, node_id, "Worker cert CN must match node_id");
+
+        let ou = cert
+            .subject()
+            .iter_organizational_unit()
+            .next()
+            .unwrap()
+            .as_str()
+            .unwrap();
+        assert_eq!(ou, "Edge Compute", "Worker cert OU must be Edge Compute");
+
+        let org = cert
+            .subject()
+            .iter_organization()
+            .next()
+            .unwrap()
+            .as_str()
+            .unwrap();
+        assert_eq!(org, "AndroGrid Worker", "Worker cert O must be AndroGrid Worker");
+
+        let eku = cert.extended_key_usage().unwrap().unwrap().value;
+        assert!(eku.client_auth, "Worker cert must have EKU ClientAuth");
+        assert!(!eku.server_auth, "Worker cert must not have EKU ServerAuth");
+        assert!(!eku.code_signing, "Worker cert must not have EKU CodeSigning");
+
+        let ku = cert.key_usage().unwrap().unwrap().value;
+        assert!(
+            ku.digital_signature(),
+            "Worker cert must have KeyUsage DigitalSignature"
+        );
+        assert!(
+            !ku.key_cert_sign(),
+            "Worker cert must not have KeyUsage KeyCertSign"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let meta = fs::metadata(&client_key).unwrap();
+            let mode = meta.permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "Private key must be restricted to 0600 on Unix");
+        }
+
         // Verify Tonic client mTLS configuration accepts generated client cert and key against CA
         let _client_tls = build_client_mtls_config(
             &fs::read(&client_crt).unwrap(),
