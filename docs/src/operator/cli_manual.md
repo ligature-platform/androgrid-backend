@@ -32,6 +32,7 @@ Traceability: `ADR-001`, `[INV-002]`, `[NFR-SEC-001]`, `[REQ-OP-001]`.
 - `androgrid-cli cert issue server [--ca-dir ./deploy/pki | --ca-cert <PATH> --ca-key <PATH>] [--out ./pki/runtime] [--san <HOST_OR_IP>] [--no-default-sans] [--days 365] [--force]`: Rotates `server.crt` (fullchain) and `server.key` without modifying the Root CA. Restart `androgrid-backend` after rotation.
 - `androgrid-cli cert issue admin [--ca-dir ./deploy/pki | --ca-cert <PATH> --ca-key <PATH>] [--out ./pki/operator] [--cn operator] [--days 365] [--force]`: Issues or rotates an operator `OU=Control Plane` client certificate.
 - `androgrid-cli cert issue csr --csr <PATH> --node-id <ID> --out <PATH> [--ca-out <PATH>] [--ca-dir ./deploy/pki | --ca-cert <PATH> --ca-key <PATH>] [--days 365] [--force]`: Signs a worker PKCS#10 CSR offline using `CaSigner` policy (for air-gapped CAs where `ANDROGRID_ALLOW_PAIRING=false`).
+- `androgrid-cli cert worker --node-id <ID> [--out ./pki/worker] [--ca-dir ./deploy/pki | --ca-cert <PATH> --ca-key <PATH>] [--days 365] [--force]` (or `androgrid-cli cert issue worker`): Generates a standalone ECDSA P-256 worker keypair, constructs a PKCS#10 CSR, and signs it offline against the Root CA via `CaSigner`, writing `client.crt`, `client.key` (mode 0600 on Unix), and `ca.crt`. Note: Host-generated worker keypairs bypass Android KeyStore hardware attestation (`ADR-009`) and are intended for testing, simulation, or headless worker runtimes.
 
 ---
 

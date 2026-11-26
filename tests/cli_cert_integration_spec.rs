@@ -299,7 +299,9 @@ async fn test_generated_pki_completes_live_mtls_handshake() {
     let worker_err = worker_client
         .list_worker_nodes(ListWorkerNodesRequest {})
         .await
-        .expect_err("Worker cert (OU=Edge Compute) must be rejected with PermissionDenied by AdminService");
+        .expect_err(
+            "Worker cert (OU=Edge Compute) must be rejected with PermissionDenied by AdminService",
+        );
     assert_eq!(worker_err.code(), tonic::Code::PermissionDenied);
 
     // 3. Untrusted self-signed client cert must be rejected by server mTLS

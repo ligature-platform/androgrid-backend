@@ -1338,12 +1338,18 @@ mod tests {
             .unwrap()
             .as_str()
             .unwrap();
-        assert_eq!(org, "AndroGrid Worker", "Worker cert O must be AndroGrid Worker");
+        assert_eq!(
+            org, "AndroGrid Worker",
+            "Worker cert O must be AndroGrid Worker"
+        );
 
         let eku = cert.extended_key_usage().unwrap().unwrap().value;
         assert!(eku.client_auth, "Worker cert must have EKU ClientAuth");
         assert!(!eku.server_auth, "Worker cert must not have EKU ServerAuth");
-        assert!(!eku.code_signing, "Worker cert must not have EKU CodeSigning");
+        assert!(
+            !eku.code_signing,
+            "Worker cert must not have EKU CodeSigning"
+        );
 
         let ku = cert.key_usage().unwrap().unwrap().value;
         assert!(
@@ -1360,7 +1366,10 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             let meta = fs::metadata(&client_key).unwrap();
             let mode = meta.permissions().mode() & 0o777;
-            assert_eq!(mode, 0o600, "Private key must be restricted to 0600 on Unix");
+            assert_eq!(
+                mode, 0o600,
+                "Private key must be restricted to 0600 on Unix"
+            );
         }
 
         // Verify Tonic client mTLS configuration accepts generated client cert and key against CA
