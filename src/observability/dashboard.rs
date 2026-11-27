@@ -89,17 +89,6 @@ pub struct PairingWebResponse {
     pub apk_download_url: String,
     #[serde(default)]
     pub confirmed: bool,
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub confirmation_pin: Option<String>,
-}
-
-/// Request body for POST /api/pair with optional operator credentials.
-#[derive(Debug, Deserialize, Default)]
-pub struct PairingPostRequest {
-    #[serde(default)]
-    pub pin: Option<String>,
-    #[serde(default)]
-    pub confirmation_token: Option<String>,
 }
 
 /// Request body for POST /api/pair/confirm.
@@ -303,7 +292,6 @@ fn build_pairing_response(
         qr_png_data_url,
         apk_download_url: state.apk_download_url.clone(),
         confirmed: false,
-        confirmation_pin: None,
     })
 }
 
@@ -478,13 +466,29 @@ async fn handle_confirm_pairing(
             .into_response(),
         Err(PairingError::InvalidConfirmationPin) => {
             let mut failed_map = state.failed_confirmations.write().await;
-            let entry = failed_map.entry(ip).or_insert((0, now));
-            if now.saturating_sub(entry.1) >= 300 {
-                entry.0 = 1;
+            if let Some(entry) = failed_map.get_mut(&ip) {
+                if now.saturating_sub(entry.1) >= 300 {
+                    entry.0 = 1;
+                } else {
+                    entry.0 += 1;
+                }
+                entry.1 = now;
             } else {
-                entry.0 += 1;
+                const MAX_FAILED_CONFIRMATION_IPS: usize = 1024;
+                if failed_map.len() >= MAX_FAILED_CONFIRMATION_IPS {
+                    failed_map.retain(|_, (_, ts)| now.saturating_sub(*ts) < 300);
+                }
+                if failed_map.len() >= MAX_FAILED_CONFIRMATION_IPS {
+                    if let Some(oldest_ip) = failed_map
+                        .iter()
+                        .min_by_key(|(_, (_, ts))| *ts)
+                        .map(|(k, _)| *k)
+                    {
+                        failed_map.remove(&oldest_ip);
+                    }
+                }
+                failed_map.insert(ip, (1, now));
             }
-            entry.1 = now;
             (
                 StatusCode::UNAUTHORIZED,
                 Json(ConfirmPairingResponse {
@@ -842,7 +846,6 @@ mod tests {
             .unwrap();
         let pair_data: PairingWebResponse = serde_json::from_slice(&post_bytes).unwrap();
         assert!(!pair_data.confirmed);
-        assert!(pair_data.confirmation_pin.is_none());
 
         // 2. Confirming with invalid PIN yields 401 Unauthorized
         let bad_confirm_req = Request::builder()
@@ -889,5 +892,162 @@ mod tests {
         // 4. Token is now marked confirmed in store
         let confirmed_rec = token_store.get_token(&pair_data.pairing_token).unwrap();
         assert!(confirmed_rec.is_confirmed);
+    }
+
+    #[tokio::test]
+    async fn test_web_ui_router_get_pair_returns_405_method_not_allowed() {
+        let scheduler = Arc::new(ClusterScheduler::new());
+        let token_store = Arc::new(PairingTokenStore::default());
+        let state = WebUiState::new(
+            scheduler,
+            Some(token_store),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_string(),
+            "192.168.1.100:50051".to_string(),
+            "https://example.com/worker.apk".to_string(),
+            300,
+        );
+
+        let app = web_ui_router(state);
+
+        let req = Request::builder()
+            .uri("/api/pair")
+            .method("GET")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(resp.headers().get("allow").unwrap(), "POST");
+    }
+
+    #[tokio::test]
+    async fn test_web_ui_router_pair_confirm_rate_limit_lockout() {
+        let scheduler = Arc::new(ClusterScheduler::new());
+        let token_store = Arc::new(PairingTokenStore::with_operator_gate(
+            true,
+            20,
+            true,
+            Some("123456".to_string()),
+            None,
+        ));
+
+        let state = WebUiState::new(
+            scheduler,
+            Some(Arc::clone(&token_store)),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_string(),
+            "192.168.1.100:50051".to_string(),
+            "https://example.com/worker.apk".to_string(),
+            300,
+        );
+
+        let app = web_ui_router(state);
+
+        let rec = token_store
+            .generate_token(None, Some(300))
+            .expect("Token generation");
+
+        // 10 failed confirmation attempts should yield 401 Unauthorized
+        for _ in 0..10 {
+            let bad_req = Request::builder()
+                .uri("/api/pair/confirm")
+                .method("POST")
+                .header(CONTENT_TYPE, "application/json")
+                .header("X-Requested-With", "XMLHttpRequest")
+                .body(Body::from(
+                    serde_json::to_string(&ConfirmPairingRequest {
+                        token: rec.token.clone(),
+                        pin: Some("000000".to_string()),
+                        confirmation_token: None,
+                    })
+                    .unwrap(),
+                ))
+                .unwrap();
+            let bad_resp = app.clone().oneshot(bad_req).await.unwrap();
+            assert_eq!(bad_resp.status(), StatusCode::UNAUTHORIZED);
+        }
+
+        // 11th attempt (even with valid PIN) must be locked out with 429 Too Many Requests
+        let locked_out_req = Request::builder()
+            .uri("/api/pair/confirm")
+            .method("POST")
+            .header(CONTENT_TYPE, "application/json")
+            .header("X-Requested-With", "XMLHttpRequest")
+            .body(Body::from(
+                serde_json::to_string(&ConfirmPairingRequest {
+                    token: rec.token.clone(),
+                    pin: Some("123456".to_string()),
+                    confirmation_token: None,
+                })
+                .unwrap(),
+            ))
+            .unwrap();
+        let locked_resp = app.clone().oneshot(locked_out_req).await.unwrap();
+        assert_eq!(locked_resp.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn test_web_ui_router_pair_confirm_rate_limit_at_capacity_eviction() {
+        let scheduler = Arc::new(ClusterScheduler::new());
+        let token_store = Arc::new(PairingTokenStore::with_operator_gate(
+            true,
+            20,
+            true,
+            Some("123456".to_string()),
+            None,
+        ));
+
+        let state = WebUiState::new(
+            scheduler,
+            Some(Arc::clone(&token_store)),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_string(),
+            "192.168.1.100:50051".to_string(),
+            "https://example.com/worker.apk".to_string(),
+            300,
+        );
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::ZERO)
+            .as_secs();
+
+        // Fill failed_confirmations map with 1024 distinct mock IPs (half expired, half fresh)
+        {
+            let mut failed_map = state.failed_confirmations.write().await;
+            for i in 1..=1024 {
+                let ip = IpAddr::V4(Ipv4Addr::new(10, (i >> 8) as u8, (i & 0xff) as u8, 1));
+                let ts = if i <= 512 { now - 400 } else { now - 10 };
+                failed_map.insert(ip, (1, ts));
+            }
+            assert_eq!(failed_map.len(), 1024);
+        }
+
+        let app = web_ui_router(state.clone());
+        let rec = token_store
+            .generate_token(None, Some(300))
+            .expect("Token generation");
+
+        // Send a failed attempt from a new IP (127.0.0.1, the oneshot fallback IP)
+        let req = Request::builder()
+            .uri("/api/pair/confirm")
+            .method("POST")
+            .header(CONTENT_TYPE, "application/json")
+            .header("X-Requested-With", "XMLHttpRequest")
+            .body(Body::from(
+                serde_json::to_string(&ConfirmPairingRequest {
+                    token: rec.token.clone(),
+                    pin: Some("000000".to_string()),
+                    confirmation_token: None,
+                })
+                .unwrap(),
+            ))
+            .unwrap();
+
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        // Map must have pruned expired entries and retained the new IP
+        let failed_map = state.failed_confirmations.read().await;
+        assert!(failed_map.len() <= 1024);
+        assert!(failed_map.contains_key(&IpAddr::V4(Ipv4Addr::LOCALHOST)));
     }
 }

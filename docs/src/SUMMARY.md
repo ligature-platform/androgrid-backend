@@ -23,6 +23,7 @@
   - [ADR-009: Android KeyStore Hardware Attestation Chain Verification](adr/ADR-009-keystore-hardware-attestation-verification.md)
   - [ADR-010: Declarative Over-the-Air OTA Node Upgrades and Version Synchronization](adr/ADR-010-declarative-ota-node-upgrades.md)
   - [ADR-011: Controlled Outbound Network Access for Sandboxed Workloads](adr/ADR-011-controlled-wasm-outbound-network-access.md)
+  - [ADR-012: Operator Pairing Confirmation Gate and Web UI Transport Boundary](adr/ADR-012-operator-pairing-confirmation-gate.md)
 - [Feature Architecture Decision Records](adr/ADR-001-documentation-portal.md)
   - [ADR-001: Documentation Portal](adr/ADR-001-documentation-portal.md)
   - [ADR-002: Release Automation](adr/ADR-002-release-automation.md)

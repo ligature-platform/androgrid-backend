@@ -38,6 +38,7 @@ crossterm = "0.29.0"
 tokio-stream = { version = "0.1", features = ["sync"] }
 mdns-sd = "0.22.0"
 base64 = "0.22"
+subtle = "2.6"
 
 
 [features]

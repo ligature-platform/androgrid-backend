@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::sync::{Mutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use subtle::ConstantTimeEq;
 use thiserror::Error;
 
 /// Default ephemeral token lifetime in seconds (5 minutes).
@@ -498,10 +499,15 @@ impl PairingTokenStore {
     }
 }
 
-/// Compares two ASCII/UTF-8 strings in constant time to prevent timing side channels.
-#[allow(deprecated)]
+/// Compares two ASCII/UTF-8 strings in constant time using `subtle::ConstantTimeEq` to prevent timing side channels.
+/// Traces to: [NFR-SEC-001]
 fn constant_time_eq(a: &str, b: &str) -> bool {
-    ring::constant_time::verify_slices_are_equal(a.as_bytes(), b.as_bytes()).is_ok()
+    let a_bytes = a.as_bytes();
+    let b_bytes = b.as_bytes();
+    if a_bytes.len() != b_bytes.len() {
+        return false;
+    }
+    a_bytes.ct_eq(b_bytes).into()
 }
 
 /// Generates a 256-bit cryptographically secure random token encoded as 64 hex chars.
@@ -808,5 +814,54 @@ mod tests {
         // Second redemption must fail with TokenAlreadyRedeemed
         let second = store.redeem_token(&rec.token, "node-alpha");
         assert_eq!(second, Err(PairingError::TokenAlreadyRedeemed));
+    }
+
+    #[test]
+    fn test_dynamic_per_session_pin_rotation_without_operator_override() {
+        // Instantiate store with operator confirmation gate enabled, but NO static override PIN
+        let store = PairingTokenStore::with_operator_gate(true, 5, true, None, None);
+
+        // Generate token 1
+        let rec1 = store
+            .generate_token(Some("node-1".to_string()), Some(300))
+            .unwrap();
+        assert!(!rec1.is_confirmed);
+        assert_eq!(rec1.confirmation_pin.len(), 6);
+        assert!(rec1.confirmation_pin.chars().all(|c| c.is_ascii_digit()));
+
+        // Generate token 2
+        let rec2 = store
+            .generate_token(Some("node-2".to_string()), Some(300))
+            .unwrap();
+        assert!(!rec2.is_confirmed);
+        assert_eq!(rec2.confirmation_pin.len(), 6);
+        assert!(rec2.confirmation_pin.chars().all(|c| c.is_ascii_digit()));
+
+        // Both tokens must have their own unique tokens
+        assert_ne!(rec1.token, rec2.token);
+
+        // Confirming token 1 with token 2's PIN must fail (unless 1-in-a-million collision)
+        if rec1.confirmation_pin != rec2.confirmation_pin {
+            let cross_confirm = store.confirm_token(&rec1.token, &rec2.confirmation_pin);
+            assert_eq!(cross_confirm, Err(PairingError::InvalidConfirmationPin));
+        }
+
+        // Confirming token 1 with its own PIN succeeds
+        assert!(store
+            .confirm_token(&rec1.token, &rec1.confirmation_pin)
+            .is_ok());
+        let confirmed1 = store.get_token(&rec1.token).unwrap();
+        assert!(confirmed1.is_confirmed);
+
+        // Token 2 remains unconfirmed
+        let unconfirmed2 = store.get_token(&rec2.token).unwrap();
+        assert!(!unconfirmed2.is_confirmed);
+
+        // Confirming token 2 with its own PIN succeeds
+        assert!(store
+            .confirm_token(&rec2.token, &rec2.confirmation_pin)
+            .is_ok());
+        let confirmed2 = store.get_token(&rec2.token).unwrap();
+        assert!(confirmed2.is_confirmed);
     }
 }

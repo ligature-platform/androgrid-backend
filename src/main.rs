@@ -119,9 +119,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let artifact_base_url = config.resolve_artifact_base_url();
 
-    if let Some(ref pin) = config.operator_pin {
+    if config.operator_pin.is_some() {
         info!("================================================================================");
-        info!("==> Ephemeral Operator Pairing PIN override configured: {pin} [NFR-SEC-001]");
+        info!("==> Ephemeral Operator Pairing PIN override configured [NFR-SEC-001]");
         info!("================================================================================");
     } else {
         info!("==> Operator Pairing PIN: per-session dynamic generation and rotation enabled [NFR-SEC-001]");
@@ -275,7 +275,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if !config.web_listen_addr.ip().is_loopback() {
             warn!(
                 web_addr = %config.web_listen_addr,
-                "Web UI listening on non-loopback address over plaintext HTTP. LAN traffic is unencrypted (RSK-NET-03 residual risk) [NFR-SEC-001]"
+                "Web UI listening on non-loopback address. For production and external networks, Web UI traffic MUST be fronted by a TLS reverse proxy / ingress controller to enforce transport encryption [INV-002], [NFR-SEC-001]"
             );
         }
         let web_listener = tokio::net::TcpListener::bind(config.web_listen_addr).await?;

@@ -1113,8 +1113,14 @@
 
     async function confirmCurrentPairing() {
       const pin = document.getElementById('inputOperatorPin').value.trim();
-      const token = currentPairingToken || document.getElementById('valToken').innerText.trim();
       const feedback = document.getElementById('pinFeedback');
+
+      if (!currentPairingToken) {
+        feedback.innerText = 'No active pairing session. Please generate a token first.';
+        feedback.style.color = 'var(--accent-red)';
+        return;
+      }
+      const token = currentPairingToken;
 
       if (!pin || (pin.length !== 6 && pin.length !== 64)) {
         feedback.innerText = 'Please enter a 6-digit PIN or 64-char token.';
