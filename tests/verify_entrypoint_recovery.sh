@@ -6,17 +6,38 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-
-if [ -f "${REPO_ROOT}/target/debug/androgrid-cli.exe" ]; then
-    CLI="${REPO_ROOT}/target/debug/androgrid-cli.exe"
-elif [ -f "${REPO_ROOT}/target/debug/androgrid-cli" ]; then
-    CLI="${REPO_ROOT}/target/debug/androgrid-cli"
-else
-    CLI="androgrid-cli"
-fi
+ENTRYPOINT="${REPO_ROOT}/deploy/all-in-one/entrypoint.sh"
 
 TEST_TMP="$(mktemp -d /tmp/androgrid_entrypoint_test_XXXXXX 2>/dev/null || mktemp -d)"
 trap 'rm -rf "${TEST_TMP}"' EXIT
+
+MOCK_BIN="${TEST_TMP}/bin"
+mkdir -p "${MOCK_BIN}"
+
+# Stub for androgrid-backend that exits cleanly on startup
+cat << "BACKEND_EOF" > "${MOCK_BIN}/androgrid-backend"
+#!/bin/sh
+exit 0
+BACKEND_EOF
+chmod +x "${MOCK_BIN}/androgrid-backend"
+
+# Locate and copy androgrid-cli executable into MOCK_BIN
+if [ -f "${REPO_ROOT}/target/debug/androgrid-cli.exe" ]; then
+    cp "${REPO_ROOT}/target/debug/androgrid-cli.exe" "${MOCK_BIN}/androgrid-cli.exe"
+elif [ -f "${REPO_ROOT}/target/debug/androgrid-cli" ]; then
+    cp "${REPO_ROOT}/target/debug/androgrid-cli" "${MOCK_BIN}/androgrid-cli"
+    chmod +x "${MOCK_BIN}/androgrid-cli"
+else
+    CLI_PATH="$(command -v androgrid-cli || true)"
+    if [ -n "${CLI_PATH}" ]; then
+        cp "${CLI_PATH}" "${MOCK_BIN}/"
+    else
+        echo "FAIL: androgrid-cli binary not found in target/debug or PATH" >&2
+        exit 1
+    fi
+fi
+
+export PATH="${MOCK_BIN}:${PATH}"
 
 echo "=== Running Certificate Recovery Verification ==="
 
@@ -29,16 +50,13 @@ mkdir -p "${CASE1_DATA}"
 
 (
     export ANDROGRID_DATA_DIR="${CASE1_DATA}"
-    export HOST_IP="192.168.1.185"
-    PKI_DIR="${CASE1_DATA}/pki"
-    mkdir -p "${PKI_DIR}"
-
-    "$CLI" cert init --out "${PKI_DIR}" --san "${HOST_IP}" --force
-
-    [ -f "${PKI_DIR}/runtime/ca.crt" ] || { echo "FAIL: Case 1 missing runtime/ca.crt"; exit 1; }
-    [ -f "${PKI_DIR}/runtime/server.crt" ] || { echo "FAIL: Case 1 missing runtime/server.crt"; exit 1; }
-    [ -f "${PKI_DIR}/operator/ca.key" ] || { echo "FAIL: Case 1 missing operator/ca.key"; exit 1; }
+    export ANDROGRID_HOST_IP="192.168.1.185"
+    bash "${ENTRYPOINT}" >/dev/null 2>&1 || { echo "FAIL: Case 1 entrypoint.sh failed"; exit 1; }
 )
+
+[ -f "${CASE1_DATA}/pki/runtime/ca.crt" ] || { echo "FAIL: Case 1 missing runtime/ca.crt"; exit 1; }
+[ -f "${CASE1_DATA}/pki/runtime/server.crt" ] || { echo "FAIL: Case 1 missing runtime/server.crt"; exit 1; }
+[ -f "${CASE1_DATA}/pki/operator/ca.key" ] || { echo "FAIL: Case 1 missing operator/ca.key"; exit 1; }
 echo "PASS: Case 1 Fresh Day-0 PKI init succeeded."
 
 # ------------------------------------------------------------------------------
@@ -56,41 +74,19 @@ ORIG_CA_HASH=$(sha256sum "${CASE2_DATA}/pki/runtime/ca.crt" | awk '{print $1}')
 rm -f "${CASE2_DATA}/pki/runtime/server.crt" "${CASE2_DATA}/pki/runtime/server.key"
 
 (
-    PKI_DIR="${CASE2_DATA}/pki"
-    HOST_IP="192.168.1.185"
-
-    NEEDS_PKI=0
-    if [ ! -f "${PKI_DIR}/runtime/server.crt" ] && [ ! -f "${PKI_DIR}/server.crt" ]; then
-        NEEDS_PKI=1
-    fi
-
-    if [ "$NEEDS_PKI" -eq 1 ]; then
-        if [ ! -f "${PKI_DIR}/ca.crt" ] && [ ! -f "${PKI_DIR}/runtime/ca.crt" ]; then
-            echo "FAIL: Should have detected existing CA"; exit 1;
-        else
-            EXISTING_CA_CERT="${PKI_DIR}/runtime/ca.crt"
-            [ -f "${EXISTING_CA_CERT}" ] || EXISTING_CA_CERT="${PKI_DIR}/ca.crt"
-            EXISTING_CA_KEY="${PKI_DIR}/operator/ca.key"
-            [ -f "${EXISTING_CA_KEY}" ] || EXISTING_CA_KEY="${PKI_DIR}/ca.key"
-
-            if [ -f "${EXISTING_CA_KEY}" ]; then
-                SERVER_OUT_DIR="$(dirname "${EXISTING_CA_CERT}")"
-                "$CLI" cert issue server --ca-key "${EXISTING_CA_KEY}" --ca-cert "${EXISTING_CA_CERT}" --out "${SERVER_OUT_DIR}" --san "${HOST_IP}" --force
-            else
-                exit 1
-            fi
-        fi
-    fi
-
-    # Verify server.crt was re-issued in runtime/
-    [ -f "${PKI_DIR}/runtime/server.crt" ] || { echo "FAIL: server.crt not in runtime/"; exit 1; }
-    [ -f "${PKI_DIR}/runtime/server.key" ] || { echo "FAIL: server.key not in runtime/"; exit 1; }
-
-    NEW_CA_HASH=$(sha256sum "${PKI_DIR}/runtime/ca.crt" | awk '{print $1}')
-    if [ "${ORIG_CA_HASH}" != "${NEW_CA_HASH}" ]; then
-        echo "FAIL: CA certificate was modified during server cert recovery!"; exit 1;
-    fi
+    export ANDROGRID_DATA_DIR="${CASE2_DATA}"
+    export ANDROGRID_HOST_IP="192.168.1.185"
+    bash "${ENTRYPOINT}" >/dev/null 2>&1 || { echo "FAIL: Case 2 entrypoint.sh failed"; exit 1; }
 )
+
+# Verify server.crt was re-issued in runtime/
+[ -f "${CASE2_DATA}/pki/runtime/server.crt" ] || { echo "FAIL: server.crt not in runtime/"; exit 1; }
+[ -f "${CASE2_DATA}/pki/runtime/server.key" ] || { echo "FAIL: server.key not in runtime/"; exit 1; }
+
+NEW_CA_HASH=$(sha256sum "${CASE2_DATA}/pki/runtime/ca.crt" | awk '{print $1}')
+if [ "${ORIG_CA_HASH}" != "${NEW_CA_HASH}" ]; then
+    echo "FAIL: CA certificate was modified during server cert recovery!"; exit 1;
+fi
 echo "PASS: Case 2 Hierarchical server recovery preserved CA SHA-256."
 
 # ------------------------------------------------------------------------------
@@ -107,41 +103,19 @@ cp "${CASE1_DATA}/pki/operator/ca.key" "${PKI3_DIR}/ca.key"
 ORIG_FLAT_CA_HASH=$(sha256sum "${PKI3_DIR}/ca.crt" | awk '{print $1}')
 
 (
-    PKI_DIR="${PKI3_DIR}"
-    HOST_IP="192.168.1.185"
-
-    NEEDS_PKI=0
-    if [ ! -f "${PKI_DIR}/runtime/server.crt" ] && [ ! -f "${PKI_DIR}/server.crt" ]; then
-        NEEDS_PKI=1
-    fi
-
-    if [ "$NEEDS_PKI" -eq 1 ]; then
-        if [ ! -f "${PKI_DIR}/ca.crt" ] && [ ! -f "${PKI_DIR}/runtime/ca.crt" ]; then
-            echo "FAIL: Should have detected flat CA"; exit 1;
-        else
-            EXISTING_CA_CERT="${PKI_DIR}/runtime/ca.crt"
-            [ -f "${EXISTING_CA_CERT}" ] || EXISTING_CA_CERT="${PKI_DIR}/ca.crt"
-            EXISTING_CA_KEY="${PKI_DIR}/operator/ca.key"
-            [ -f "${EXISTING_CA_KEY}" ] || EXISTING_CA_KEY="${PKI_DIR}/ca.key"
-
-            if [ -f "${EXISTING_CA_KEY}" ]; then
-                SERVER_OUT_DIR="$(dirname "${EXISTING_CA_CERT}")"
-                "$CLI" cert issue server --ca-key "${EXISTING_CA_KEY}" --ca-cert "${EXISTING_CA_CERT}" --out "${SERVER_OUT_DIR}" --san "${HOST_IP}" --force
-            else
-                exit 1
-            fi
-        fi
-    fi
-
-    # Verify server.crt was created in flat PKI_DIR
-    [ -f "${PKI_DIR}/server.crt" ] || { echo "FAIL: server.crt not in flat PKI_DIR"; exit 1; }
-    [ -f "${PKI_DIR}/server.key" ] || { echo "FAIL: server.key not in flat PKI_DIR"; exit 1; }
-
-    NEW_FLAT_CA_HASH=$(sha256sum "${PKI_DIR}/ca.crt" | awk '{print $1}')
-    if [ "${ORIG_FLAT_CA_HASH}" != "${NEW_FLAT_CA_HASH}" ]; then
-        echo "FAIL: Flat CA certificate was modified during recovery!"; exit 1;
-    fi
+    export ANDROGRID_DATA_DIR="${CASE3_DATA}"
+    export ANDROGRID_HOST_IP="192.168.1.185"
+    bash "${ENTRYPOINT}" >/dev/null 2>&1 || { echo "FAIL: Case 3 entrypoint.sh failed"; exit 1; }
 )
+
+# Verify server.crt was created in flat PKI_DIR
+[ -f "${PKI3_DIR}/server.crt" ] || { echo "FAIL: server.crt not in flat PKI_DIR"; exit 1; }
+[ -f "${PKI3_DIR}/server.key" ] || { echo "FAIL: server.key not in flat PKI_DIR"; exit 1; }
+
+NEW_FLAT_CA_HASH=$(sha256sum "${PKI3_DIR}/ca.crt" | awk '{print $1}')
+if [ "${ORIG_FLAT_CA_HASH}" != "${NEW_FLAT_CA_HASH}" ]; then
+    echo "FAIL: Flat CA certificate was modified during recovery!"; exit 1;
+fi
 echo "PASS: Case 3 Flat server recovery preserved CA SHA-256."
 
 # ------------------------------------------------------------------------------
@@ -156,32 +130,9 @@ cp "${CASE1_DATA}/pki/runtime/ca.crt" "${PKI4_DIR}/ca.crt"
 
 EXIT_CODE=0
 (
-    PKI_DIR="${PKI4_DIR}"
-    HOST_IP="192.168.1.185"
-
-    NEEDS_PKI=0
-    if [ ! -f "${PKI_DIR}/runtime/server.crt" ] && [ ! -f "${PKI_DIR}/server.crt" ]; then
-        NEEDS_PKI=1
-    fi
-
-    if [ "$NEEDS_PKI" -eq 1 ]; then
-        if [ ! -f "${PKI_DIR}/ca.crt" ] && [ ! -f "${PKI_DIR}/runtime/ca.crt" ]; then
-            exit 2
-        else
-            EXISTING_CA_CERT="${PKI_DIR}/runtime/ca.crt"
-            [ -f "${EXISTING_CA_CERT}" ] || EXISTING_CA_CERT="${PKI_DIR}/ca.crt"
-            EXISTING_CA_KEY="${PKI_DIR}/operator/ca.key"
-            [ -f "${EXISTING_CA_KEY}" ] || EXISTING_CA_KEY="${PKI_DIR}/ca.key"
-
-            if [ -f "${EXISTING_CA_KEY}" ]; then
-                SERVER_OUT_DIR="$(dirname "${EXISTING_CA_CERT}")"
-                "$CLI" cert issue server --ca-key "${EXISTING_CA_KEY}" --ca-cert "${EXISTING_CA_CERT}" --out "${SERVER_OUT_DIR}" --san "${HOST_IP}" --force
-            else
-                echo "Expected error: CA certificate exists but server certificate and CA key are missing!" >&2
-                exit 1
-            fi
-        fi
-    fi
+    export ANDROGRID_DATA_DIR="${CASE4_DATA}"
+    export ANDROGRID_HOST_IP="192.168.1.185"
+    bash "${ENTRYPOINT}" >/dev/null 2>&1
 ) || EXIT_CODE=$?
 
 if [ "${EXIT_CODE}" -ne 1 ]; then

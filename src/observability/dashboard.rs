@@ -1010,12 +1010,12 @@ mod tests {
             .unwrap_or(Duration::ZERO)
             .as_secs();
 
-        // Fill failed_confirmations map with 1024 distinct mock IPs (half expired, half fresh)
+        // Fill failed_confirmations map with 1024 distinct mock IPs (all within active 300s window)
         {
             let mut failed_map = state.failed_confirmations.write().await;
             for i in 1..=1024 {
                 let ip = IpAddr::V4(Ipv4Addr::new(10, (i >> 8) as u8, (i & 0xff) as u8, 1));
-                let ts = if i <= 512 { now - 400 } else { now - 10 };
+                let ts = now.saturating_sub(10 + (i as u64 % 200));
                 failed_map.insert(ip, (1, ts));
             }
             assert_eq!(failed_map.len(), 1024);
@@ -1045,9 +1045,9 @@ mod tests {
         let resp = app.clone().oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 
-        // Map must have pruned expired entries and retained the new IP
+        // Map must have executed LRU eviction, remaining capped at exactly 1024 while retaining the new IP
         let failed_map = state.failed_confirmations.read().await;
-        assert!(failed_map.len() <= 1024);
+        assert_eq!(failed_map.len(), 1024);
         assert!(failed_map.contains_key(&IpAddr::V4(Ipv4Addr::LOCALHOST)));
     }
 }

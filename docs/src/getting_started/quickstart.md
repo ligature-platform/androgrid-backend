@@ -27,17 +27,17 @@ podman run -d --net=host -v androgrid-data:/data:Z ghcr.io/ligature-platform/and
 ```
 
 > [!WARNING]
-> **Network Security Scope:** The turnkey container is scoped strictly to trusted local LANs. Do not run with `--net=host` on public-IP hosts without setting `ANDROGRID_WEB_LISTEN_ADDR=127.0.0.1:8080` or `ANDROGRID_ALLOW_PAIRING=false` to prevent unauthenticated onboarding over the Internet.
+> **Network Security Scope:** The turnkey container binds the Operator Web UI strictly to loopback (`127.0.0.1:8080`) by default in accordance with `[INV-002]`. For remote or multi-host access across the LAN or WAN, operators must front the interface with a TLS reverse proxy (e.g. Nginx, Caddy), a Cloudflare Tunnel, or an SSH local port forward (`ssh -L 8080:127.0.0.1:8080 <host>`). Plaintext LAN pairing is rejected as an accepted architecture.
 
 ### Automated Turnkey Capabilities:
 1. **Primary LAN IP Detection:** The container inspects host routing tables to resolve the primary LAN IP.
 2. **Auto-PKI Initialization:** If `/data/pki/` is empty, it runs `androgrid-cli cert init --san <host_ip>` generating NIST P-256 ECDSA certificates with valid SAN attributes for mobile verification (`[NFR-SEC-001]`, ADR-001).
 3. **mDNS Service Advertisement:** The orchestrator advertises `_androgrid._tcp.local.` on port 50051 via UDP 5353. Android devices on the local Wi-Fi detect the cluster automatically without entering IP addresses.
-4. **Embedded Operator Web UI (Port 8080):** Open `http://<host_ip>:8080` in any web browser to:
+4. **Embedded Operator Web UI (Port 8080):** Access `http://127.0.0.1:8080` on the host machine (or via secure tunnel/TLS reverse proxy) to:
    - View the live pairing QR code to enroll Android devices with a single camera scan.
    - Monitor connected worker nodes in real time (SoC / ABI, RAM, Battery %, OS version, active tasks).
    - Download the worker APK directly to the device or scan the APK download QR code.
-5. **Operator Confirmation Gate:** Turnkey enrollment requires operator authorization before minting mTLS client certificates. When an Android worker scans the pairing QR code, the orchestrator issues a pending token. The operator authorizes device enrollment by confirming the 6-digit PIN displayed on the orchestrator console or in the Web UI dashboard (`http://<host_ip>:8080`), preventing unauthorized network-adjacent devices from minting certificates.
+5. **Operator Confirmation Gate:** Turnkey enrollment requires operator authorization before minting mTLS client certificates. When an Android worker scans the pairing QR code, the orchestrator issues a pending token. The operator authorizes device enrollment by entering the 6-digit confirmation PIN (printed to the orchestrator console / container logs) into the Web UI dashboard or operator CLI, preventing unauthorized network-adjacent devices from minting certificates.
 
 ---
 
