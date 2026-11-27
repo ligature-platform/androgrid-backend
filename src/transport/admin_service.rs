@@ -465,7 +465,7 @@ impl AdminService for AdminServiceImpl {
 
         let record = self
             .token_store
-            .generate_token(target_node_id.clone(), ttl)
+            .generate_token_with_preconfirmation(target_node_id.clone(), ttl, true)
             .map_err(|e| Status::failed_precondition(e.to_string()))?;
 
         let payload = PairingPayload {

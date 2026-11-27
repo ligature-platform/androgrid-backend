@@ -10,11 +10,6 @@ FROM rust:1-bookworm AS builder
 
 WORKDIR /usr/src/androgrid-backend
 
-# Install build dependencies for protobuf codegen
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    protobuf-compiler \
-    && rm -rf /var/lib/apt/lists/*
-
 # Add WebAssembly compilation target for edge workloads
 RUN rustup target add wasm32-wasip1
 
@@ -25,16 +20,16 @@ COPY src ./src
 COPY workloads ./workloads
 
 # Compile production orchestrator binaries
-RUN cargo build --release --bin androgrid-backend --bin androgrid-cli
+RUN cargo build --release --locked --bin androgrid-backend --bin androgrid-cli
 
 # Compile edge WebAssembly workloads inside builder stage
 RUN mkdir -p /usr/src/androgrid-backend/built-workloads && \
     if [ -f "workloads/http-benchmark/Cargo.toml" ]; then \
-        cargo build --release --target wasm32-wasip1 --manifest-path workloads/http-benchmark/Cargo.toml && \
+        cargo build --release --locked --target wasm32-wasip1 --manifest-path workloads/http-benchmark/Cargo.toml && \
         cp workloads/http-benchmark/target/wasm32-wasip1/release/http_benchmark.wasm /usr/src/androgrid-backend/built-workloads/; \
     fi && \
     if [ -f "workloads/image-processor/Cargo.toml" ]; then \
-        cargo build --release --target wasm32-wasip1 --manifest-path workloads/image-processor/Cargo.toml && \
+        cargo build --release --locked --target wasm32-wasip1 --manifest-path workloads/image-processor/Cargo.toml && \
         cp workloads/image-processor/target/wasm32-wasip1/release/image-processor.wasm /usr/src/androgrid-backend/built-workloads/; \
     fi
 

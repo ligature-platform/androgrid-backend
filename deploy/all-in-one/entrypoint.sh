@@ -56,10 +56,26 @@ if [ ! -f "${PKI_DIR}/runtime/server.crt" ] && [ ! -f "${PKI_DIR}/server.crt" ];
 fi
 
 if [ "$NEEDS_PKI" -eq 1 ]; then
-    echo "==> [Auto-PKI] No TLS certificates found in ${PKI_DIR}."
-    echo "==> [Auto-PKI] Initializing ECDSA P-256 TLS 1.3 Root CA and server fullchain with SAN: ${HOST_IP}..."
-    androgrid-cli cert init --out "${PKI_DIR}" --san "${HOST_IP}" --force
-    echo "==> [Auto-PKI] PKI hierarchy successfully generated in ${PKI_DIR}."
+    if [ ! -f "${PKI_DIR}/ca.crt" ] && [ ! -f "${PKI_DIR}/runtime/ca.crt" ]; then
+        echo "==> [Auto-PKI] No TLS certificates found in ${PKI_DIR}."
+        echo "==> [Auto-PKI] Initializing ECDSA P-256 TLS 1.3 Root CA and server fullchain with SAN: ${HOST_IP}..."
+        androgrid-cli cert init --out "${PKI_DIR}" --san "${HOST_IP}" --force
+        echo "==> [Auto-PKI] PKI hierarchy successfully generated in ${PKI_DIR}."
+    else
+        EXISTING_CA_CERT="${PKI_DIR}/runtime/ca.crt"
+        [ -f "${EXISTING_CA_CERT}" ] || EXISTING_CA_CERT="${PKI_DIR}/ca.crt"
+        EXISTING_CA_KEY="${PKI_DIR}/operator/ca.key"
+        [ -f "${EXISTING_CA_KEY}" ] || EXISTING_CA_KEY="${PKI_DIR}/ca.key"
+
+        if [ -f "${EXISTING_CA_KEY}" ]; then
+            SERVER_OUT_DIR="$(dirname "${EXISTING_CA_CERT}")"
+            echo "==> [Auto-PKI] Existing CA found, issuing server certificate to ${SERVER_OUT_DIR} with SAN: ${HOST_IP}..."
+            androgrid-cli cert issue server --ca-key "${EXISTING_CA_KEY}" --ca-cert "${EXISTING_CA_CERT}" --out "${SERVER_OUT_DIR}" --san "${HOST_IP}" --force
+        else
+            echo "ERROR: CA certificate exists at ${EXISTING_CA_CERT} but server certificate and CA key are missing!" >&2
+            exit 1
+        fi
+    fi
 else
     echo "==> Existing PKI certificates detected in ${PKI_DIR}."
 fi
@@ -75,6 +91,14 @@ else
     SERVER_CERT_PATH="${PKI_DIR}/server.crt"
     SERVER_KEY_PATH="${PKI_DIR}/server.key"
     CA_KEY_PATH="${PKI_DIR}/ca.key"
+fi
+
+# Hardening: Lock Root CA private key strictly to POSIX 0600 permissions [NFR-SEC-001]
+if [ -f "${CA_KEY_PATH}" ]; then
+    chmod 0600 "${CA_KEY_PATH}" || { echo "ERROR: Failed to enforce POSIX 0600 permissions on ${CA_KEY_PATH}" >&2; exit 1; }
+fi
+if [ -f "${SERVER_KEY_PATH}" ]; then
+    chmod 0600 "${SERVER_KEY_PATH}" || { echo "ERROR: Failed to enforce POSIX 0600 permissions on ${SERVER_KEY_PATH}" >&2; exit 1; }
 fi
 
 # Step 4: Seed pre-packaged workloads to artifact store if empty
@@ -99,7 +123,7 @@ fi
 # Step 5: Export runtime environment settings
 export ANDROGRID_LISTEN_ADDR="${ANDROGRID_LISTEN_ADDR:-0.0.0.0:50051}"
 export ANDROGRID_ARTIFACT_LISTEN_ADDR="${ANDROGRID_ARTIFACT_LISTEN_ADDR:-0.0.0.0:50052}"
-export ANDROGRID_WEB_LISTEN_ADDR="${ANDROGRID_WEB_LISTEN_ADDR:-0.0.0.0:8080}"
+export ANDROGRID_WEB_LISTEN_ADDR="${ANDROGRID_WEB_LISTEN_ADDR:-127.0.0.1:8080}"
 export ANDROGRID_CA_CERT_PATH="${CA_CERT_PATH}"
 export ANDROGRID_SERVER_CERT_PATH="${SERVER_CERT_PATH}"
 export ANDROGRID_SERVER_KEY_PATH="${SERVER_KEY_PATH}"
@@ -116,7 +140,7 @@ echo "--------------------------------------------------------------------------
 echo " Service Bindings:"
 echo "   - Control Plane (gRPC TLS 1.3 mTLS): ${ANDROGRID_LISTEN_ADDR}"
 echo "   - Artifact Store (HTTP Blobs):       ${ANDROGRID_ARTIFACT_LISTEN_ADDR}"
-echo "   - Operator Web UI (Pairing & Dash):  http://${HOST_IP}:8080"
+echo "   - Operator Web UI (Pairing & Dash):  http://${ANDROGRID_WEB_LISTEN_ADDR}"
 echo "   - Multicast DNS (DNS-SD):            5353/UDP (_androgrid._tcp.local.)"
 echo "   - Advertised Cluster Endpoint:       ${ANDROGRID_CLUSTER_ENDPOINT}"
 echo "================================================================================"

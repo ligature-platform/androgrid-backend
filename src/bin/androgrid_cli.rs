@@ -66,6 +66,18 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
+    /// Probe raw TCP connectivity to orchestrator port (container healthcheck)
+    /// Traces to: [REQ-OP-001], [NFR-REL-001]
+    Probe {
+        /// Target socket address (host:port) to verify network connectivity
+        #[arg(long, default_value = "127.0.0.1:50051")]
+        addr: String,
+
+        /// Connection timeout in seconds (default: 2)
+        #[arg(long, default_value_t = 2)]
+        timeout_secs: u64,
+    },
+
     /// Validate and package a WebAssembly module with JSON deployment manifest
     /// Traces to: [INV-006], [REQ-OP-003]
     Pack {
@@ -1034,6 +1046,33 @@ async fn run_top(
     Ok(())
 }
 
+/// Probes TCP network connectivity against a target socket address.
+///
+/// Traces to: [REQ-OP-001], [NFR-REL-001]
+fn probe_addr(addr: &str, timeout_secs: u64) -> Result<std::net::SocketAddr, String> {
+    use std::net::ToSocketAddrs;
+    let addrs: Vec<std::net::SocketAddr> = addr
+        .to_socket_addrs()
+        .map_err(|e| format!("Failed to resolve target address {addr}: {e}"))?
+        .collect();
+    if addrs.is_empty() {
+        return Err(format!("No resolved addresses for {addr}"));
+    }
+    for target in addrs {
+        if std::net::TcpStream::connect_timeout(
+            &target,
+            std::time::Duration::from_secs(timeout_secs),
+        )
+        .is_ok()
+        {
+            return Ok(target);
+        }
+    }
+    Err(format!(
+        "Connection refused or timed out connecting to {addr}"
+    ))
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let matches = Cli::command().get_matches();
@@ -1140,6 +1179,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
+    if let Commands::Probe { addr, timeout_secs } = cli.command {
+        match probe_addr(&addr, timeout_secs) {
+            Ok(target) => {
+                if cli.format != "json" {
+                    println!("OK: TCP handshake successful to {target}");
+                }
+                return Ok(());
+            }
+            Err(e) => {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+
     let channel = create_channel(
         &cli.endpoint,
         cli.ca_cert.as_deref(),
@@ -1151,6 +1205,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut client = AdminServiceClient::new(channel);
 
     match cli.command {
+        Commands::Probe { .. } => unreachable!(),
         Commands::Pack { .. } => unreachable!(),
         Commands::Benchmark { .. } => unreachable!(),
         Commands::Cert { .. } => unreachable!(),
@@ -3289,5 +3344,25 @@ mod tests {
         assert!(parse_egress_policy_flag("1").is_err());
         assert!(parse_egress_policy_flag("2").is_err());
         assert!(parse_egress_policy_flag("invalid").is_err());
+    }
+
+    #[test]
+    fn test_probe_socket_open_and_closed() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("Bind test TCP port");
+        let local_addr = listener.local_addr().expect("Read local addr");
+        let addr_str = local_addr.to_string();
+
+        let res_open = probe_addr(&addr_str, 2);
+        assert!(
+            res_open.is_ok(),
+            "Probe against listening port must succeed: {:?}",
+            res_open
+        );
+        assert_eq!(res_open.unwrap(), local_addr);
+
+        drop(listener);
+
+        let res_closed = probe_addr(&addr_str, 1);
+        assert!(res_closed.is_err(), "Probe against closed port must fail");
     }
 }

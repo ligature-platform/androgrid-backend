@@ -15,8 +15,24 @@ pub enum ConfigError {
     InvalidSocketAddr { var: &'static str, val: String },
     #[error("Invalid integer value in {var}: {val}")]
     InvalidInteger { var: &'static str, val: String },
+    #[error("Invalid boolean value in {var}: {val}")]
+    InvalidBoolean { var: &'static str, val: String },
     #[error("Invalid certificate renewal policy: {0}")]
     InvalidRenewalPolicy(String),
+}
+
+/// Helper parsing boolean environment variables strictly without fail-open defaults.
+///
+/// Traces to: [REQ-OP-001], [NFR-SEC-001]
+pub fn parse_env_bool(var: &'static str, val: &str) -> Result<bool, ConfigError> {
+    match val.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" | "on" => Ok(true),
+        "false" | "0" | "no" | "off" => Ok(false),
+        _ => Err(ConfigError::InvalidBoolean {
+            var,
+            val: val.to_string(),
+        }),
+    }
 }
 
 /// Orchestrator host control plane configuration settings.
@@ -128,6 +144,14 @@ pub struct ClusterConfig {
     /// Optional explicit cluster endpoint (e.g. "192.168.1.100:50051").
     /// Traces to: [REQ-OP-001], [INV-001]
     pub cluster_endpoint: Option<String>,
+
+    /// Optional operator confirmation PIN (e.g. 6-digit numeric PIN).
+    /// Traces to: [NFR-SEC-001], [REQ-OP-001]
+    pub operator_pin: Option<String>,
+
+    /// Optional operator confirmation token for automated pairing approval.
+    /// Traces to: [NFR-SEC-001], [REQ-OP-001]
+    pub confirmation_token: Option<String>,
 }
 
 impl Default for ClusterConfig {
@@ -167,6 +191,8 @@ impl Default for ClusterConfig {
             mdns_service_name: "androgrid-orchestrator".to_string(),
             apk_download_url: "https://github.com/ligature-platform/androgrid-android/releases/latest/download/androgrid-worker.apk".to_string(),
             cluster_endpoint: None,
+            operator_pin: None,
+            confirmation_token: None,
         }
     }
 }
@@ -208,11 +234,11 @@ impl ClusterConfig {
         }
 
         if let Ok(val) = std::env::var("ANDROGRID_ALLOW_PAIRING") {
-            config.allow_pairing = !val.eq_ignore_ascii_case("false") && val != "0";
+            config.allow_pairing = parse_env_bool("ANDROGRID_ALLOW_PAIRING", &val)?;
         }
 
         if let Ok(val) = std::env::var("ANDROGRID_ALLOW_CERT_RENEWAL") {
-            config.allow_cert_renewal = !val.eq_ignore_ascii_case("false") && val != "0";
+            config.allow_cert_renewal = parse_env_bool("ANDROGRID_ALLOW_CERT_RENEWAL", &val)?;
         }
 
         if let Ok(val) = std::env::var("ANDROGRID_CERT_RENEWAL_WINDOW_DAYS") {
@@ -264,7 +290,8 @@ impl ClusterConfig {
         }
 
         if let Ok(val) = std::env::var("ANDROGRID_ALLOW_INSECURE_ROOT_TASKS") {
-            config.allow_insecure_root_tasks = val.eq_ignore_ascii_case("true") || val == "1";
+            config.allow_insecure_root_tasks =
+                parse_env_bool("ANDROGRID_ALLOW_INSECURE_ROOT_TASKS", &val)?;
         }
 
         if let Ok(val) = std::env::var("ANDROGRID_ARTIFACT_LISTEN_ADDR") {
@@ -297,11 +324,13 @@ impl ClusterConfig {
         }
 
         if let Ok(val) = std::env::var("ANDROGRID_ENFORCE_HARDWARE_ATTESTATION") {
-            config.enforce_hardware_attestation = val.eq_ignore_ascii_case("true") || val == "1";
+            config.enforce_hardware_attestation =
+                parse_env_bool("ANDROGRID_ENFORCE_HARDWARE_ATTESTATION", &val)?;
         }
 
         if let Ok(val) = std::env::var("ANDROGRID_REQUIRE_ATTESTATION_CHALLENGE") {
-            config.require_attestation_challenge = val.eq_ignore_ascii_case("true") || val == "1";
+            config.require_attestation_challenge =
+                parse_env_bool("ANDROGRID_REQUIRE_ATTESTATION_CHALLENGE", &val)?;
         }
 
         if let Ok(val) = std::env::var("ANDROGRID_WEB_LISTEN_ADDR") {
@@ -312,11 +341,11 @@ impl ClusterConfig {
         }
 
         if let Ok(val) = std::env::var("ANDROGRID_ENABLE_WEB_UI") {
-            config.enable_web_ui = val.eq_ignore_ascii_case("true") || val == "1";
+            config.enable_web_ui = parse_env_bool("ANDROGRID_ENABLE_WEB_UI", &val)?;
         }
 
         if let Ok(val) = std::env::var("ANDROGRID_ENABLE_MDNS") {
-            config.enable_mdns = val.eq_ignore_ascii_case("true") || val == "1";
+            config.enable_mdns = parse_env_bool("ANDROGRID_ENABLE_MDNS", &val)?;
         }
 
         if let Ok(val) = std::env::var("ANDROGRID_MDNS_SERVICE_NAME") {
@@ -331,6 +360,20 @@ impl ClusterConfig {
             config.cluster_endpoint = Some(val);
         } else if let Ok(val) = std::env::var("ANDROGRID_PUBLIC_ENDPOINT") {
             config.cluster_endpoint = Some(val);
+        }
+
+        if let Ok(val) = std::env::var("ANDROGRID_OPERATOR_PIN") {
+            let trimmed = val.trim();
+            if !trimmed.is_empty() {
+                config.operator_pin = Some(trimmed.to_string());
+            }
+        }
+
+        if let Ok(val) = std::env::var("ANDROGRID_CONFIRMATION_TOKEN") {
+            let trimmed = val.trim();
+            if !trimmed.is_empty() {
+                config.confirmation_token = Some(trimmed.to_string());
+            }
         }
 
         config.validate_renewal_policy()?;
@@ -539,5 +582,33 @@ mod tests {
             config.resolve_cluster_endpoint(),
             "node.edge.androgrid:50051"
         );
+    }
+
+    #[test]
+    fn test_parse_env_bool_valid_and_invalid() {
+        assert!(parse_env_bool("TEST_VAR", "true").unwrap());
+        assert!(parse_env_bool("TEST_VAR", "TRUE").unwrap());
+        assert!(parse_env_bool("TEST_VAR", "1").unwrap());
+        assert!(parse_env_bool("TEST_VAR", "yes").unwrap());
+        assert!(parse_env_bool("TEST_VAR", "on").unwrap());
+
+        assert!(!parse_env_bool("TEST_VAR", "false").unwrap());
+        assert!(!parse_env_bool("TEST_VAR", "FALSE").unwrap());
+        assert!(!parse_env_bool("TEST_VAR", "0").unwrap());
+        assert!(!parse_env_bool("TEST_VAR", "no").unwrap());
+        assert!(!parse_env_bool("TEST_VAR", "off").unwrap());
+
+        assert!(matches!(
+            parse_env_bool("TEST_VAR", "flase"),
+            Err(ConfigError::InvalidBoolean { .. })
+        ));
+        assert!(matches!(
+            parse_env_bool("TEST_VAR", "2"),
+            Err(ConfigError::InvalidBoolean { .. })
+        ));
+        assert!(matches!(
+            parse_env_bool("TEST_VAR", "none"),
+            Err(ConfigError::InvalidBoolean { .. })
+        ));
     }
 }

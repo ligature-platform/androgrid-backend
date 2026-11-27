@@ -212,6 +212,8 @@ async fn test_http_enrollment_endpoint_lifecycle() {
         node_id: node_id.to_string(),
         csr_pem: csr_pem.clone(),
         attestation_certificate_chain_pem: Vec::new(),
+        pin: None,
+        confirmation_token: None,
     };
 
     let resp = client
@@ -246,6 +248,8 @@ async fn test_http_enrollment_endpoint_lifecycle() {
         node_id: node_id.to_string(),
         csr_pem,
         attestation_certificate_chain_pem: Vec::new(),
+        pin: None,
+        confirmation_token: None,
     };
     let invalid_resp = client
         .post(format!("{base_url}/api/v1/enroll"))

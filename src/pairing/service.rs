@@ -36,6 +36,14 @@ pub struct HttpEnrollRequest {
     /// Optional PEM-encoded Android KeyStore hardware attestation certificate chain.
     #[serde(default)]
     pub attestation_certificate_chain_pem: Vec<String>,
+
+    /// Optional 6-digit operator confirmation PIN.
+    #[serde(default)]
+    pub pin: Option<String>,
+
+    /// Optional operator confirmation token.
+    #[serde(default)]
+    pub confirmation_token: Option<String>,
 }
 
 /// HTTP JSON response body for device bootstrap enrollment.
@@ -129,6 +137,27 @@ impl EnrollmentContext {
         csr_pem: &str,
         attestation_chain_pem: &[String],
     ) -> Result<SignedWorkerCert, EnrollFailure> {
+        self.redeem_and_sign_with_pin(token, node_id, csr_pem, attestation_chain_pem, None)
+    }
+
+    /// Atomically validates the pairing token (enforcing operator confirmation gate if active),
+    /// verifies KeyStore hardware attestation, and signs the worker CSR.
+    ///
+    /// Traces to: [INV-001], [INV-002], [NFR-SEC-001], [REQ-OP-001]
+    pub fn redeem_and_sign_with_pin(
+        &self,
+        token: &str,
+        node_id: &str,
+        csr_pem: &str,
+        attestation_chain_pem: &[String],
+        pin_or_confirmation: Option<&str>,
+    ) -> Result<SignedWorkerCert, EnrollFailure> {
+        if let Some(pin) = pin_or_confirmation {
+            self.token_store
+                .confirm_token(token, pin)
+                .map_err(EnrollFailure::Pairing)?;
+        }
+
         self.token_store
             .redeem_with(token, node_id, |_| {
                 if self.enforce_hardware_attestation && attestation_chain_pem.is_empty() {
@@ -330,11 +359,17 @@ async fn handle_http_enroll(
 
     info!(node_id = %node_id, "Processing HTTP worker enrollment request [REQ-OP-001]");
 
-    match context.redeem_and_sign(
+    let pin_or_conf = payload
+        .pin
+        .as_deref()
+        .or(payload.confirmation_token.as_deref());
+
+    match context.redeem_and_sign_with_pin(
         token,
         node_id,
         csr_pem,
         &payload.attestation_certificate_chain_pem,
+        pin_or_conf,
     ) {
         Ok(signed) => {
             info!(node_id = %node_id, "Successfully issued mTLS client certificate via HTTP [INV-002]");
@@ -356,6 +391,8 @@ async fn handle_http_enroll(
                 PairingError::TokenExpired { .. } => StatusCode::GONE,
                 PairingError::TokenAlreadyRedeemed => StatusCode::CONFLICT,
                 PairingError::PairingDisabled => StatusCode::FORBIDDEN,
+                PairingError::UnconfirmedToken => StatusCode::FORBIDDEN,
+                PairingError::InvalidConfirmationPin => StatusCode::UNAUTHORIZED,
                 _ => StatusCode::UNAUTHORIZED,
             };
 
@@ -862,5 +899,50 @@ mod tests {
             "Error must specify challenge mismatch, got: {}",
             body_mismatch.error_message
         );
+    }
+
+    #[tokio::test]
+    async fn test_http_enroll_with_invalid_pin_returns_401() {
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let (base_ctx, _ca_key, _ca_pem) = create_test_context();
+        let token_store = Arc::new(PairingTokenStore::with_operator_gate(
+            true,
+            5,
+            true,
+            Some("123456".to_string()),
+            None,
+        ));
+        let ctx = EnrollmentContext::new(token_store.clone(), base_ctx.signer.clone());
+        let app = enrollment_http_router(ctx);
+
+        let node_id = "worker-bad-pin-test";
+        let record = token_store
+            .generate_token(Some(node_id.to_string()), Some(300))
+            .expect("Token generation");
+
+        let (csr_pem, _) = generate_test_csr(node_id);
+
+        let enroll_req = HttpEnrollRequest {
+            pairing_token: record.token.clone(),
+            node_id: node_id.to_string(),
+            csr_pem,
+            attestation_certificate_chain_pem: Vec::new(),
+            pin: Some("999999".to_string()),
+            confirmation_token: None,
+        };
+
+        let req = Request::builder()
+            .uri("/api/v1/enroll")
+            .method("POST")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(
+                serde_json::to_string(&enroll_req).unwrap(),
+            ))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::UNAUTHORIZED);
     }
 }

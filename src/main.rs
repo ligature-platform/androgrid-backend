@@ -119,7 +119,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let artifact_base_url = config.resolve_artifact_base_url();
 
-    let token_store = Arc::new(PairingTokenStore::new(config.allow_pairing, 5));
+    if config.operator_pin.is_some() {
+        info!("================================================================================");
+        info!("==> Ephemeral Operator Pairing PIN override configured [NFR-SEC-001]");
+        info!("================================================================================");
+    } else {
+        info!("==> Operator Pairing PIN: per-session dynamic generation and rotation enabled [NFR-SEC-001]");
+    }
+
+    let token_store = Arc::new(PairingTokenStore::with_operator_gate(
+        config.allow_pairing,
+        5,
+        true,
+        config.operator_pin.clone(),
+        config.confirmation_token.clone(),
+    ));
+
+    #[cfg(unix)]
+    if let Some(ref ca_key_path) = config.tls_ca_key_path {
+        use std::os::unix::fs::PermissionsExt;
+        if ca_key_path.exists() {
+            let metadata = std::fs::metadata(ca_key_path)?;
+            let mut permissions = metadata.permissions();
+            let current_mode = permissions.mode() & 0o777;
+            if current_mode & 0o077 != 0 {
+                permissions.set_mode(0o600);
+                std::fs::set_permissions(ca_key_path, permissions)?;
+                info!(path = %ca_key_path.display(), "Enforced POSIX 0600 permissions on Root CA key [NFR-SEC-001]");
+            }
+        }
+    }
 
     let (ca_signer, ca_fingerprint) = if let (Some(ca_cert_path), Some(ca_key_path)) =
         (&config.tls_ca_cert_path, &config.tls_ca_key_path)
@@ -243,26 +272,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let (web_shutdown_tx, web_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     if config.enable_web_ui {
+        if !config.web_listen_addr.ip().is_loopback() {
+            warn!(
+                web_addr = %config.web_listen_addr,
+                "Web UI listening on non-loopback address. For production and external networks, Web UI traffic MUST be fronted by a TLS reverse proxy / ingress controller to enforce transport encryption [INV-002], [NFR-SEC-001]"
+            );
+        }
         let web_listener = tokio::net::TcpListener::bind(config.web_listen_addr).await?;
-        let web_state = WebUiState {
-            scheduler: Arc::clone(&scheduler),
-            token_store: if config.allow_pairing {
+        let web_state = WebUiState::new(
+            Arc::clone(&scheduler),
+            if config.allow_pairing {
                 Some(Arc::clone(&token_store))
             } else {
                 None
             },
-            ca_fingerprint: ca_fingerprint.clone(),
-            cluster_endpoint: cluster_endpoint.clone(),
-            apk_download_url: config.apk_download_url.clone(),
-            pairing_token_ttl_seconds: config.pairing_token_ttl_seconds,
-        };
+            ca_fingerprint.clone(),
+            cluster_endpoint.clone(),
+            config.apk_download_url.clone(),
+            config.pairing_token_ttl_seconds,
+        );
         let web_app = web_ui_router(web_state);
         info!(
             web_addr = %config.web_listen_addr,
             "Starting dedicated Operator Web UI & Pairing Dashboard on port 8080 [REQ-OP-001], [INV-004], [INV-005]"
         );
         tokio::spawn(async move {
-            let server = axum::serve(web_listener, web_app.into_make_service());
+            let server = axum::serve(
+                web_listener,
+                web_app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            );
             tokio::select! {
                 res = server => {
                     if let Err(e) = res {

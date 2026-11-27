@@ -1,8 +1,8 @@
 # Multi-stage production container for AndroGrid Control Plane Orchestrator (Podman Containerfile)
 # Traces to: AG-SPEC-2026-V2 Section 2.3, [INV-002], [NFR-SEC-001], [NFR-PERF-001]
 
-# Stage 1: Build binary using official Rust 1.82 toolchain
-FROM docker.io/library/rust:1.82-bookworm AS builder
+# Stage 1: Build binary using official Rust stable toolchain
+FROM docker.io/library/rust:1-bookworm AS builder
 
 WORKDIR /usr/src/androgrid-backend
 
@@ -12,7 +12,7 @@ COPY proto ./proto
 COPY src ./src
 
 # Compile production binaries with release profile
-RUN cargo build --release --bin androgrid-backend --bin androgrid-cli
+RUN cargo build --release --locked --bin androgrid-backend --bin androgrid-cli
 
 # Stage 2: Hardened, unprivileged runtime image
 FROM docker.io/library/debian:bookworm-slim AS runtime
