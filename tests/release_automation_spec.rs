@@ -161,8 +161,12 @@ fn test_release_workflow_oci_container_publishing() {
         .join("deploy")
         .join("all-in-one")
         .join("docker-compose.yml");
-    assert!(compose_path.exists(), "deploy/all-in-one/docker-compose.yml must exist");
-    let compose_content = fs::read_to_string(&compose_path).expect("Failed to read docker-compose.yml");
+    assert!(
+        compose_path.exists(),
+        "deploy/all-in-one/docker-compose.yml must exist"
+    );
+    let compose_content =
+        fs::read_to_string(&compose_path).expect("Failed to read docker-compose.yml");
     assert!(
         compose_content.contains("ghcr.io/ligature-platform/androgrid-all-in-one:latest"),
         "All-in-one docker-compose.yml must reference ghcr.io/ligature-platform/androgrid-all-in-one:latest"

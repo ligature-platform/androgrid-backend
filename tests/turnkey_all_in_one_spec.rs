@@ -333,7 +333,10 @@ async fn test_end_to_end_worker_pairing_from_web_qr_code() {
 
     assert_eq!(pair_res.cluster_endpoint, grpc_addr.to_string());
     assert_eq!(pair_res.ca_fingerprint, ca_fingerprint);
-    assert!(!pair_res.confirmed, "Turnkey pairing token must require operator confirmation");
+    assert!(
+        !pair_res.confirmed,
+        "Turnkey pairing token must require operator confirmation"
+    );
 
     // 4b. Operator confirms pairing session via POST /api/pair/confirm with 6-digit console PIN
     let confirm_res = http_client
@@ -526,9 +529,12 @@ async fn test_ephemeral_operator_confirmation_gate_security_lifecycle() {
     let enroll_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let enroll_addr = enroll_listener.local_addr().unwrap();
     tokio::spawn(async move {
-        axum::serve(enroll_listener, enrollment_http_router(enrollment_ctx).into_make_service())
-            .await
-            .expect("Enrollment HTTP server");
+        axum::serve(
+            enroll_listener,
+            enrollment_http_router(enrollment_ctx).into_make_service(),
+        )
+        .await
+        .expect("Enrollment HTTP server");
     });
 
     // Spin up Web UI dashboard router (port B)
@@ -562,7 +568,10 @@ async fn test_ephemeral_operator_confirmation_gate_security_lifecycle() {
         .await
         .unwrap();
 
-    assert!(!pair_resp.confirmed, "Unauthenticated pairing token must require confirmation");
+    assert!(
+        !pair_resp.confirmed,
+        "Unauthenticated pairing token must require confirmation"
+    );
     let token = pair_resp.pairing_token;
 
     // Generate worker CSR

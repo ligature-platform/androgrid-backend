@@ -221,8 +221,8 @@ impl PairingTokenStore {
         let trimmed_input = pin_or_conf.trim();
         let matches = trimmed_input == record.confirmation_pin
             || trimmed_input == record.confirmation_token
-            || self.operator_pin.as_deref().map_or(false, |p| p == trimmed_input)
-            || self.confirmation_token.as_deref().map_or(false, |t| t == trimmed_input);
+            || self.operator_pin.as_deref() == Some(trimmed_input)
+            || self.confirmation_token.as_deref() == Some(trimmed_input);
 
         if matches {
             record.is_confirmed = true;
@@ -281,9 +281,10 @@ impl PairingTokenStore {
         let expires_at = now + ttl;
         let token = generate_csprng_token_hex()?;
         let confirmation_token = generate_csprng_token_hex()?;
-        let confirmation_pin = self.operator_pin.clone().unwrap_or_else(|| {
-            generate_6digit_pin().unwrap_or_else(|_| "123456".to_string())
-        });
+        let confirmation_pin = self
+            .operator_pin
+            .clone()
+            .unwrap_or_else(|| generate_6digit_pin().unwrap_or_else(|_| "123456".to_string()));
 
         let record = PairingTokenRecord {
             token: token.clone(),
@@ -766,7 +767,9 @@ mod tests {
             Some("conf-secret-token".to_string()),
         );
 
-        let rec = store.generate_token(Some("node-alpha".to_string()), Some(300)).unwrap();
+        let rec = store
+            .generate_token(Some("node-alpha".to_string()), Some(300))
+            .unwrap();
         assert!(!rec.is_confirmed);
         assert_eq!(rec.confirmation_pin, "654321");
         assert_eq!(rec.confirmation_token.len(), 64);

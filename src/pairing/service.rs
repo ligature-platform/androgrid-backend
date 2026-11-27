@@ -360,7 +360,7 @@ async fn handle_http_enroll(
     let pin_or_conf = payload
         .pin
         .as_deref()
-        .or_else(|| payload.confirmation_token.as_deref());
+        .or(payload.confirmation_token.as_deref());
 
     match context.redeem_and_sign_with_pin(
         token,

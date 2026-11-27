@@ -360,10 +360,11 @@ async fn handle_confirm_pairing(
         .pin
         .as_deref()
         .or_else(|| headers.get("x-operator-pin").and_then(|v| v.to_str().ok()));
-    let conf_token = payload
-        .confirmation_token
-        .as_deref()
-        .or_else(|| headers.get("x-confirmation-token").and_then(|v| v.to_str().ok()));
+    let conf_token = payload.confirmation_token.as_deref().or_else(|| {
+        headers
+            .get("x-confirmation-token")
+            .and_then(|v| v.to_str().ok())
+    });
 
     let candidate = match pin.or(conf_token) {
         Some(c) => c,
@@ -383,84 +384,72 @@ async fn handle_confirm_pairing(
     };
 
     match token_store.confirm_token(&payload.token, candidate) {
-        Ok(()) => {
-            (
-                StatusCode::OK,
-                Json(ConfirmPairingResponse {
-                    success: true,
-                    token: payload.token,
-                    confirmed: true,
-                    message: "Pairing session confirmed by operator".to_string(),
-                    error: String::new(),
-                }),
-            )
-                .into_response()
-        }
-        Err(PairingError::TokenNotFound) => {
-            (
-                StatusCode::NOT_FOUND,
-                Json(ConfirmPairingResponse {
-                    success: false,
-                    token: payload.token,
-                    confirmed: false,
-                    message: String::new(),
-                    error: "Specified pairing token not found".to_string(),
-                }),
-            )
-                .into_response()
-        }
-        Err(PairingError::TokenExpired { .. }) => {
-            (
-                StatusCode::GONE,
-                Json(ConfirmPairingResponse {
-                    success: false,
-                    token: payload.token,
-                    confirmed: false,
-                    message: String::new(),
-                    error: "Pairing token has expired".to_string(),
-                }),
-            )
-                .into_response()
-        }
-        Err(PairingError::RateLimitExceeded) => {
-            (
-                StatusCode::TOO_MANY_REQUESTS,
-                Json(ConfirmPairingResponse {
-                    success: false,
-                    token: payload.token,
-                    confirmed: false,
-                    message: String::new(),
-                    error: "Rate limit exceeded for pairing confirmation".to_string(),
-                }),
-            )
-                .into_response()
-        }
-        Err(PairingError::InvalidConfirmationPin) => {
-            (
-                StatusCode::UNAUTHORIZED,
-                Json(ConfirmPairingResponse {
-                    success: false,
-                    token: payload.token,
-                    confirmed: false,
-                    message: String::new(),
-                    error: "Invalid operator confirmation PIN or token".to_string(),
-                }),
-            )
-                .into_response()
-        }
-        Err(e) => {
-            (
-                StatusCode::FORBIDDEN,
-                Json(ConfirmPairingResponse {
-                    success: false,
-                    token: payload.token,
-                    confirmed: false,
-                    message: String::new(),
-                    error: e.to_string(),
-                }),
-            )
-                .into_response()
-        }
+        Ok(()) => (
+            StatusCode::OK,
+            Json(ConfirmPairingResponse {
+                success: true,
+                token: payload.token,
+                confirmed: true,
+                message: "Pairing session confirmed by operator".to_string(),
+                error: String::new(),
+            }),
+        )
+            .into_response(),
+        Err(PairingError::TokenNotFound) => (
+            StatusCode::NOT_FOUND,
+            Json(ConfirmPairingResponse {
+                success: false,
+                token: payload.token,
+                confirmed: false,
+                message: String::new(),
+                error: "Specified pairing token not found".to_string(),
+            }),
+        )
+            .into_response(),
+        Err(PairingError::TokenExpired { .. }) => (
+            StatusCode::GONE,
+            Json(ConfirmPairingResponse {
+                success: false,
+                token: payload.token,
+                confirmed: false,
+                message: String::new(),
+                error: "Pairing token has expired".to_string(),
+            }),
+        )
+            .into_response(),
+        Err(PairingError::RateLimitExceeded) => (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(ConfirmPairingResponse {
+                success: false,
+                token: payload.token,
+                confirmed: false,
+                message: String::new(),
+                error: "Rate limit exceeded for pairing confirmation".to_string(),
+            }),
+        )
+            .into_response(),
+        Err(PairingError::InvalidConfirmationPin) => (
+            StatusCode::UNAUTHORIZED,
+            Json(ConfirmPairingResponse {
+                success: false,
+                token: payload.token,
+                confirmed: false,
+                message: String::new(),
+                error: "Invalid operator confirmation PIN or token".to_string(),
+            }),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::FORBIDDEN,
+            Json(ConfirmPairingResponse {
+                success: false,
+                token: payload.token,
+                confirmed: false,
+                message: String::new(),
+                error: e.to_string(),
+            }),
+        )
+            .into_response(),
     }
 }
 
@@ -776,11 +765,14 @@ mod tests {
             .uri("/api/pair/confirm")
             .method("POST")
             .header(CONTENT_TYPE, "application/json")
-            .body(Body::from(serde_json::to_string(&ConfirmPairingRequest {
-                token: pair_data.pairing_token.clone(),
-                pin: Some("999999".to_string()),
-                confirmation_token: None,
-            }).unwrap()))
+            .body(Body::from(
+                serde_json::to_string(&ConfirmPairingRequest {
+                    token: pair_data.pairing_token.clone(),
+                    pin: Some("999999".to_string()),
+                    confirmation_token: None,
+                })
+                .unwrap(),
+            ))
             .unwrap();
         let bad_confirm_resp = app.clone().oneshot(bad_confirm_req).await.unwrap();
         assert_eq!(bad_confirm_resp.status(), StatusCode::UNAUTHORIZED);
@@ -790,11 +782,14 @@ mod tests {
             .uri("/api/pair/confirm")
             .method("POST")
             .header(CONTENT_TYPE, "application/json")
-            .body(Body::from(serde_json::to_string(&ConfirmPairingRequest {
-                token: pair_data.pairing_token.clone(),
-                pin: Some("123456".to_string()),
-                confirmation_token: None,
-            }).unwrap()))
+            .body(Body::from(
+                serde_json::to_string(&ConfirmPairingRequest {
+                    token: pair_data.pairing_token.clone(),
+                    pin: Some("123456".to_string()),
+                    confirmation_token: None,
+                })
+                .unwrap(),
+            ))
             .unwrap();
         let good_confirm_resp = app.clone().oneshot(good_confirm_req).await.unwrap();
         assert_eq!(good_confirm_resp.status(), StatusCode::OK);
