@@ -108,10 +108,10 @@ Deploy the entire AndroGrid control plane stack with a single container command 
 
 ```bash
 # Launch with Docker
-docker run -d --net=host -v androgrid-data:/data ghcr.io/ligature-platform/androgrid-backend:latest
+docker run -d --net=host -v androgrid-data:/data ghcr.io/ligature-platform/androgrid-all-in-one:latest
 
 # Or launch with Podman (rootless)
-podman run -d --net=host -v androgrid-data:/data:Z ghcr.io/ligature-platform/androgrid-backend:latest
+podman run -d --net=host -v androgrid-data:/data:Z ghcr.io/ligature-platform/androgrid-all-in-one:latest
 ```
 
 > [!WARNING]
@@ -125,6 +125,7 @@ podman run -d --net=host -v androgrid-data:/data:Z ghcr.io/ligature-platform/and
   - Connected worker node table (Node ID, SoC / ABI, RAM, Battery %, OS version, active tasks).
   - Direct download button and scannable QR code for the worker APK on GitHub Releases.
   - Live task submission status viewer and real-time SSE cluster event feed.
+- **Operator Confirmation Gate:** Enforces interactive operator approval (via a 6-digit PIN printed to console or confirmed in the Web UI) before signing worker CSRs, preventing unauthorized mTLS certificate issuance across local networks.
 - **Port Allocation Boundaries:**
   - `50051/tcp`: Primary gRPC TLS 1.3 mTLS control plane (`[INV-002]`)
   - `50052/tcp`: Content-addressed HTTP artifact distribution (`[REQ-OP-003]`)

@@ -688,6 +688,23 @@
           <span class="pairing-property-label">Ephemeral Pairing Token</span>
           <span class="pairing-property-value" id="valToken">Generating...</span>
         </div>
+        <div class="pairing-property-row">
+          <span class="pairing-property-label">Confirmation Gate</span>
+          <span class="pairing-property-value" id="valConfirmedStatus">
+            <span style="background: rgba(234, 179, 8, 0.2); color: var(--accent-yellow); padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 600;">AWAITING CONFIRMATION</span>
+          </span>
+        </div>
+        <div id="operatorGateBox" style="margin-top: 10px; padding: 10px; background: rgba(255, 255, 255, 0.03); border: 1px solid var(--border-color); border-radius: 6px;">
+          <div style="font-size: 12px; font-weight: 600; margin-bottom: 4px;">Operator Confirmation Gate [NFR-SEC-001]</div>
+          <div style="font-size: 11px; color: var(--text-muted); margin-bottom: 6px;">
+            Enter 6-digit Console PIN to authorize worker CSR signing:
+          </div>
+          <div style="display: flex; gap: 8px; align-items: center;">
+            <input type="password" id="inputOperatorPin" placeholder="PIN" maxlength="6" style="width: 90px; padding: 4px 8px; font-family: monospace; font-size: 13px; letter-spacing: 2px; border: 1px solid var(--border-color); background: rgba(0,0,0,0.3); color: var(--text-color); border-radius: 4px;" />
+            <button class="btn btn-secondary" style="padding: 4px 10px; font-size: 12px;" onclick="confirmCurrentPairing()">Authorize</button>
+          </div>
+          <div id="pinFeedback" style="font-size: 11px; margin-top: 4px;"></div>
+        </div>
         <div style="font-size: 12px; color: var(--text-muted); margin-top: 6px;">
           <strong>Pairing Instructions:</strong>
           1. Install <code>androgrid-worker.apk</code> on your Android device (Android 14+, API 34+).<br />
@@ -1060,6 +1077,14 @@
           document.getElementById('btnApkDirectDownload').href = data.apk_download_url;
         }
 
+        if (data.confirmed) {
+          document.getElementById('valConfirmedStatus').innerHTML =
+            '<span style="background: rgba(34, 197, 94, 0.2); color: var(--accent-green); padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 600;">CONFIRMED</span>';
+        } else {
+          document.getElementById('valConfirmedStatus').innerHTML =
+            '<span style="background: rgba(234, 179, 8, 0.2); color: var(--accent-yellow); padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 600;">AWAITING CONFIRMATION</span>';
+        }
+
         pairingExpiresAtEpochS = data.expires_at_epoch_s || 0;
         updatePairingCountdown();
 
@@ -1072,6 +1097,39 @@
 
     async function fetchNewPairingToken() {
       await fetchPairingInfo('POST');
+    }
+
+    async function confirmCurrentPairing() {
+      const pin = document.getElementById('inputOperatorPin').value.trim();
+      const token = document.getElementById('valToken').innerText.trim();
+      const feedback = document.getElementById('pinFeedback');
+
+      if (!pin || pin.length < 6) {
+        feedback.innerText = 'Please enter a 6-digit PIN.';
+        feedback.style.color = 'var(--accent-red)';
+        return;
+      }
+
+      try {
+        const resp = await fetch('/api/pair/confirm', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ token, pin })
+        });
+        const data = await resp.json();
+        if (resp.ok && data.success) {
+          feedback.innerText = 'Pairing authorized! Worker CSR signing unlocked.';
+          feedback.style.color = 'var(--accent-green)';
+          document.getElementById('valConfirmedStatus').innerHTML =
+            '<span style="background: rgba(34, 197, 94, 0.2); color: var(--accent-green); padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 600;">CONFIRMED</span>';
+        } else {
+          feedback.innerText = data.error || ('Confirmation rejected (HTTP ' + resp.status + ')');
+          feedback.style.color = 'var(--accent-red)';
+        }
+      } catch (err) {
+        feedback.innerText = 'Confirmation request failed: ' + err.message;
+        feedback.style.color = 'var(--accent-red)';
+      }
     }
 
     function updatePairingCountdown() {

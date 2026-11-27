@@ -20,10 +20,10 @@ Operators can launch the entire control plane with a single container run comman
 
 ```bash
 # Launch with Docker (host networking required for mDNS 5353/UDP & host LAN detection)
-docker run -d --net=host -v androgrid-data:/data ghcr.io/ligature-platform/androgrid-backend:latest
+docker run -d --net=host -v androgrid-data:/data ghcr.io/ligature-platform/androgrid-all-in-one:latest
 
 # Or launch with Podman (rootless)
-podman run -d --net=host -v androgrid-data:/data:Z ghcr.io/ligature-platform/androgrid-backend:latest
+podman run -d --net=host -v androgrid-data:/data:Z ghcr.io/ligature-platform/androgrid-all-in-one:latest
 ```
 
 > [!WARNING]
@@ -37,6 +37,7 @@ podman run -d --net=host -v androgrid-data:/data:Z ghcr.io/ligature-platform/and
    - View the live pairing QR code to enroll Android devices with a single camera scan.
    - Monitor connected worker nodes in real time (SoC / ABI, RAM, Battery %, OS version, active tasks).
    - Download the worker APK directly to the device or scan the APK download QR code.
+5. **Operator Confirmation Gate:** Turnkey enrollment requires operator authorization before minting mTLS client certificates. When an Android worker scans the pairing QR code, the orchestrator issues a pending token. The operator authorizes device enrollment by confirming the 6-digit PIN displayed on the orchestrator console or in the Web UI dashboard (`http://<host_ip>:8080`), preventing unauthorized network-adjacent devices from minting certificates.
 
 ---
 

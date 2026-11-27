@@ -51,6 +51,12 @@ pub enum PairingError {
 
     #[error("Cryptographic random number generator failure")]
     RngFailure,
+
+    #[error("Pairing token requires operator confirmation before certificate issuance")]
+    UnconfirmedToken,
+
+    #[error("Invalid operator confirmation PIN or token")]
+    InvalidConfirmationPin,
 }
 
 /// Error returned by [`PairingTokenStore::redeem_with`], distinguishing token
@@ -86,6 +92,15 @@ pub struct PairingTokenRecord {
 
     /// Number of failed enrollment attempts recorded against this token.
     pub failed_attempts: u32,
+
+    /// Whether this pairing session has been authorized/confirmed by an operator.
+    pub is_confirmed: bool,
+
+    /// Ephemeral 6-digit confirmation PIN generated for operator authorization.
+    pub confirmation_pin: String,
+
+    /// Ephemeral cryptographic confirmation token for operator authorization.
+    pub confirmation_token: String,
 }
 
 /// Thread-safe in-memory manager governing ephemeral pairing tokens.
@@ -96,6 +111,9 @@ pub struct PairingTokenStore {
     global_window: Mutex<GlobalAttemptWindow>,
     max_failed_attempts: u32,
     enabled: bool,
+    require_operator_confirmation: bool,
+    operator_pin: Option<String>,
+    confirmation_token: Option<String>,
 }
 
 impl Default for PairingTokenStore {
@@ -105,12 +123,25 @@ impl Default for PairingTokenStore {
 }
 
 impl PairingTokenStore {
-    /// Creates a new PairingTokenStore.
+    /// Creates a new PairingTokenStore with default gate policy (pre-confirmed for testing).
     ///
     /// # Arguments
     /// * `enabled` - Whether pairing token issuance and redemption are enabled.
     /// * `max_failed_attempts` - Max failed attempts permitted before rate-limiting.
     pub fn new(enabled: bool, max_failed_attempts: u32) -> Self {
+        Self::with_operator_gate(enabled, max_failed_attempts, false, None, None)
+    }
+
+    /// Creates a new PairingTokenStore with an explicit operator confirmation gate.
+    ///
+    /// Traces to: [NFR-SEC-001], [REQ-OP-001]
+    pub fn with_operator_gate(
+        enabled: bool,
+        max_failed_attempts: u32,
+        require_operator_confirmation: bool,
+        operator_pin: Option<String>,
+        confirmation_token: Option<String>,
+    ) -> Self {
         Self {
             tokens: RwLock::new(HashMap::new()),
             global_window: Mutex::new(GlobalAttemptWindow {
@@ -119,6 +150,86 @@ impl PairingTokenStore {
             }),
             max_failed_attempts,
             enabled,
+            require_operator_confirmation,
+            operator_pin,
+            confirmation_token,
+        }
+    }
+
+    /// Returns the global operator PIN configured on this store, if any.
+    pub fn operator_pin(&self) -> Option<&str> {
+        self.operator_pin.as_deref()
+    }
+
+    /// Returns the global confirmation token configured on this store, if any.
+    pub fn confirmation_token(&self) -> Option<&str> {
+        self.confirmation_token.as_deref()
+    }
+
+    /// Sets whether operator confirmation is strictly required before token redemption.
+    pub fn set_require_operator_confirmation(&mut self, required: bool) {
+        self.require_operator_confirmation = required;
+    }
+
+    /// Checks if operator confirmation is strictly required before redemption.
+    pub fn is_operator_confirmation_required(&self) -> bool {
+        self.require_operator_confirmation
+    }
+
+    /// Confirms an ephemeral pairing token using an operator-provided PIN or confirmation token.
+    ///
+    /// Traces to: [NFR-SEC-001], [REQ-OP-001]
+    pub fn confirm_token(&self, token: &str, pin_or_conf: &str) -> Result<(), PairingError> {
+        if !self.enabled {
+            return Err(PairingError::PairingDisabled);
+        }
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::ZERO)
+            .as_secs();
+
+        self.check_global_window(now)?;
+
+        let mut lock = self.tokens.write().expect("Token store lock poisoned");
+        let record = match lock.get_mut(token) {
+            Some(r) => r,
+            None => {
+                drop(lock);
+                self.record_global_failure(now);
+                return Err(PairingError::TokenNotFound);
+            }
+        };
+
+        if record.failed_attempts >= self.max_failed_attempts {
+            return Err(PairingError::RateLimitExceeded);
+        }
+
+        if now > record.expires_at_epoch_s {
+            record.failed_attempts += 1;
+            return Err(PairingError::TokenExpired {
+                expired_at_epoch_s: record.expires_at_epoch_s,
+                current_epoch_s: now,
+            });
+        }
+
+        if record.is_redeemed {
+            record.failed_attempts += 1;
+            return Err(PairingError::TokenAlreadyRedeemed);
+        }
+
+        let trimmed_input = pin_or_conf.trim();
+        let matches = trimmed_input == record.confirmation_pin
+            || trimmed_input == record.confirmation_token
+            || self.operator_pin.as_deref().map_or(false, |p| p == trimmed_input)
+            || self.confirmation_token.as_deref().map_or(false, |t| t == trimmed_input);
+
+        if matches {
+            record.is_confirmed = true;
+            Ok(())
+        } else {
+            record.failed_attempts += 1;
+            Err(PairingError::InvalidConfirmationPin)
         }
     }
 
@@ -138,6 +249,22 @@ impl PairingTokenStore {
         target_node_id: Option<String>,
         ttl_seconds: Option<u32>,
     ) -> Result<PairingTokenRecord, PairingError> {
+        self.generate_token_with_preconfirmation(
+            target_node_id,
+            ttl_seconds,
+            !self.require_operator_confirmation,
+        )
+    }
+
+    /// Generates a new ephemeral pairing token with explicit pre-confirmation control.
+    ///
+    /// Traces to: [INV-002], [NFR-SEC-001], [REQ-OP-001]
+    pub fn generate_token_with_preconfirmation(
+        &self,
+        target_node_id: Option<String>,
+        ttl_seconds: Option<u32>,
+        pre_confirmed: bool,
+    ) -> Result<PairingTokenRecord, PairingError> {
         if !self.enabled {
             return Err(PairingError::PairingDisabled);
         }
@@ -153,6 +280,10 @@ impl PairingTokenStore {
 
         let expires_at = now + ttl;
         let token = generate_csprng_token_hex()?;
+        let confirmation_token = generate_csprng_token_hex()?;
+        let confirmation_pin = self.operator_pin.clone().unwrap_or_else(|| {
+            generate_6digit_pin().unwrap_or_else(|_| "123456".to_string())
+        });
 
         let record = PairingTokenRecord {
             token: token.clone(),
@@ -161,6 +292,9 @@ impl PairingTokenStore {
             expires_at_epoch_s: expires_at,
             is_redeemed: false,
             failed_attempts: 0,
+            is_confirmed: pre_confirmed,
+            confirmation_pin,
+            confirmation_token,
         };
 
         let mut lock = self.tokens.write().expect("Token store lock poisoned");
@@ -219,6 +353,11 @@ impl PairingTokenStore {
 
         if record.failed_attempts >= self.max_failed_attempts {
             return Err(RedeemActionError::Pairing(PairingError::RateLimitExceeded));
+        }
+
+        if self.require_operator_confirmation && !record.is_confirmed {
+            record.failed_attempts += 1;
+            return Err(RedeemActionError::Pairing(PairingError::UnconfirmedToken));
         }
 
         if record.is_redeemed {
@@ -364,6 +503,15 @@ fn generate_csprng_token_hex() -> Result<String, PairingError> {
     Ok(hex)
 }
 
+/// Generates a 6-digit numeric PIN formatted as 6 ASCII digits (e.g. "048291").
+fn generate_6digit_pin() -> Result<String, PairingError> {
+    let rng = SystemRandom::new();
+    let mut bytes = [0u8; 4];
+    rng.fill(&mut bytes).map_err(|_| PairingError::RngFailure)?;
+    let val = u32::from_ne_bytes(bytes) % 1_000_000;
+    Ok(format!("{val:06}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -437,6 +585,9 @@ mod tests {
                     expires_at_epoch_s: 200,
                     is_redeemed: false,
                     failed_attempts: 0,
+                    is_confirmed: true,
+                    confirmation_pin: "123456".to_string(),
+                    confirmation_token: "conf".to_string(),
                 },
             );
         }
@@ -547,6 +698,9 @@ mod tests {
                     expires_at_epoch_s: 20,
                     is_redeemed: false,
                     failed_attempts: 0,
+                    is_confirmed: true,
+                    confirmation_pin: "123456".to_string(),
+                    confirmation_token: "conf".to_string(),
                 },
             );
         }
@@ -599,5 +753,45 @@ mod tests {
             assert!(rec.token.chars().all(|c| c.is_ascii_hexdigit()));
             assert!(seen.insert(rec.token));
         }
+    }
+
+    #[test]
+    fn test_operator_confirmation_gate_lifecycle() {
+        // Create store with operator confirmation gate strictly enabled
+        let store = PairingTokenStore::with_operator_gate(
+            true,
+            5,
+            true,
+            Some("654321".to_string()),
+            Some("conf-secret-token".to_string()),
+        );
+
+        let rec = store.generate_token(Some("node-alpha".to_string()), Some(300)).unwrap();
+        assert!(!rec.is_confirmed);
+        assert_eq!(rec.confirmation_pin, "654321");
+        assert_eq!(rec.confirmation_token.len(), 64);
+
+        // Redemption before confirmation must fail with UnconfirmedToken
+        let early_redemption = store.redeem_token(&rec.token, "node-alpha");
+        assert_eq!(early_redemption, Err(PairingError::UnconfirmedToken));
+
+        // Confirming with bad PIN must fail with InvalidConfirmationPin
+        let bad_pin_res = store.confirm_token(&rec.token, "000000");
+        assert_eq!(bad_pin_res, Err(PairingError::InvalidConfirmationPin));
+
+        // Confirming with correct operator PIN must succeed
+        let good_pin_res = store.confirm_token(&rec.token, "654321");
+        assert!(good_pin_res.is_ok());
+
+        let confirmed_rec = store.get_token(&rec.token).unwrap();
+        assert!(confirmed_rec.is_confirmed);
+
+        // Now redemption must succeed
+        let redeemed = store.redeem_token(&rec.token, "node-alpha").unwrap();
+        assert!(redeemed.is_redeemed);
+
+        // Second redemption must fail with TokenAlreadyRedeemed
+        let second = store.redeem_token(&rec.token, "node-alpha");
+        assert_eq!(second, Err(PairingError::TokenAlreadyRedeemed));
     }
 }

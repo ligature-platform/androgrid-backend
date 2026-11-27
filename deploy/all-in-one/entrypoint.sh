@@ -77,6 +77,14 @@ else
     CA_KEY_PATH="${PKI_DIR}/ca.key"
 fi
 
+# Hardening: Lock Root CA private key strictly to POSIX 0600 permissions [NFR-SEC-001]
+if [ -f "${CA_KEY_PATH}" ]; then
+    chmod 0600 "${CA_KEY_PATH}" 2>/dev/null || true
+fi
+if [ -f "${SERVER_KEY_PATH}" ]; then
+    chmod 0600 "${SERVER_KEY_PATH}" 2>/dev/null || true
+fi
+
 # Step 4: Seed pre-packaged workloads to artifact store if empty
 # Stores workloads under both original name and content-addressed sha256 hash (<hash>.wasm)
 if [ -d "/opt/androgrid/workloads" ]; then

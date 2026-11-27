@@ -6,6 +6,7 @@
 //! Traces to: AG-SPEC-2026-V2 Section 2.2, Section 2.3, [INV-002], [NFR-SEC-001], [NFR-PERF-001]
 
 use clap::Parser;
+use ring::rand::SecureRandom;
 use std::sync::Arc;
 use tokio::signal;
 use tonic::transport::Server;
@@ -119,7 +120,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let artifact_base_url = config.resolve_artifact_base_url();
 
-    let token_store = Arc::new(PairingTokenStore::new(config.allow_pairing, 5));
+    let operator_pin = config.operator_pin.clone().unwrap_or_else(|| {
+        let mut bytes = [0u8; 4];
+        let _ = ring::rand::SystemRandom::new().fill(&mut bytes);
+        let val = u32::from_ne_bytes(bytes) % 1_000_000;
+        format!("{val:06}")
+    });
+
+    info!("================================================================================");
+    info!("==> Ephemeral Operator Pairing PIN: {operator_pin} [NFR-SEC-001]");
+    info!("================================================================================");
+
+    let token_store = Arc::new(PairingTokenStore::with_operator_gate(
+        config.allow_pairing,
+        5,
+        true,
+        Some(operator_pin.clone()),
+        config.confirmation_token.clone(),
+    ));
+
+    #[cfg(unix)]
+    if let Some(ref ca_key_path) = config.tls_ca_key_path {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(metadata) = std::fs::metadata(ca_key_path) {
+            let mut permissions = metadata.permissions();
+            let current_mode = permissions.mode() & 0o777;
+            if current_mode != 0o600 {
+                permissions.set_mode(0o600);
+                if let Err(e) = std::fs::set_permissions(ca_key_path, permissions) {
+                    warn!(path = %ca_key_path.display(), error = %e, "Could not enforce POSIX 0600 permissions on Root CA key");
+                } else {
+                    info!(path = %ca_key_path.display(), "Enforced POSIX 0600 permissions on Root CA key [NFR-SEC-001]");
+                }
+            }
+        }
+    }
 
     let (ca_signer, ca_fingerprint) = if let (Some(ca_cert_path), Some(ca_key_path)) =
         (&config.tls_ca_cert_path, &config.tls_ca_key_path)
@@ -255,6 +290,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             cluster_endpoint: cluster_endpoint.clone(),
             apk_download_url: config.apk_download_url.clone(),
             pairing_token_ttl_seconds: config.pairing_token_ttl_seconds,
+            operator_pin: Some(operator_pin.clone()),
+            confirmation_token: config.confirmation_token.clone(),
         };
         let web_app = web_ui_router(web_state);
         info!(

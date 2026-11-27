@@ -20,7 +20,9 @@ use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
 
 use crate::observability::snapshot::ClusterSnapshot;
-use crate::pairing::{render_png_bytes, render_png_data_url, PairingPayload, PairingTokenStore};
+use crate::pairing::{
+    render_png_bytes, render_png_data_url, PairingError, PairingPayload, PairingTokenStore,
+};
 use crate::scheduler::engine::ClusterScheduler;
 
 /// Embedded single-page dashboard HTML asset.
@@ -43,6 +45,10 @@ pub struct WebUiState {
     pub apk_download_url: String,
     /// Configured pairing token TTL in seconds (default: 300).
     pub pairing_token_ttl_seconds: u32,
+    /// Optional operator confirmation PIN (e.g. 6-digit numeric PIN).
+    pub operator_pin: Option<String>,
+    /// Optional operator confirmation token.
+    pub confirmation_token: Option<String>,
 }
 
 /// JSON payload containing pairing parameters and QR representation.
@@ -57,6 +63,41 @@ pub struct PairingWebResponse {
     pub pairing_payload_json: String,
     pub qr_png_data_url: String,
     pub apk_download_url: String,
+    #[serde(default)]
+    pub confirmed: bool,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub confirmation_pin: Option<String>,
+}
+
+/// Request body for POST /api/pair with optional operator credentials.
+#[derive(Debug, Deserialize, Default)]
+pub struct PairingPostRequest {
+    #[serde(default)]
+    pub pin: Option<String>,
+    #[serde(default)]
+    pub confirmation_token: Option<String>,
+}
+
+/// Request body for POST /api/pair/confirm.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfirmPairingRequest {
+    pub token: String,
+    #[serde(default)]
+    pub pin: Option<String>,
+    #[serde(default)]
+    pub confirmation_token: Option<String>,
+}
+
+/// Response body for POST /api/pair/confirm.
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConfirmPairingResponse {
+    pub success: bool,
+    pub token: String,
+    pub confirmed: bool,
+    #[serde(skip_serializing_if = "String::is_empty", default)]
+    pub message: String,
+    #[serde(skip_serializing_if = "String::is_empty", default)]
+    pub error: String,
 }
 
 /// JSON payload containing worker APK download metadata and QR representation.
@@ -97,6 +138,7 @@ pub fn web_ui_router(state: WebUiState) -> Router {
         .route("/events", get(handle_web_events))
         .route("/api/pair", get(handle_get_pairing))
         .route("/api/pair", post(handle_post_pairing))
+        .route("/api/pair/confirm", post(handle_confirm_pairing))
         .route("/api/pair/qr.png", get(handle_pairing_qr_png))
         .route("/api/apk-info", get(handle_apk_info))
         .route("/api/apk/qr.png", get(handle_apk_qr_png))
@@ -156,9 +198,33 @@ async fn handle_web_events(
     handle_events(State(state.scheduler)).await
 }
 
+/// Helper verifying operator confirmation credentials from headers or body.
+fn check_operator_auth(
+    state: &WebUiState,
+    pin: Option<&str>,
+    confirmation_token: Option<&str>,
+) -> bool {
+    if let Some(expected_pin) = state.operator_pin.as_deref() {
+        if let Some(provided) = pin {
+            if provided.trim() == expected_pin {
+                return true;
+            }
+        }
+    }
+    if let Some(expected_token) = state.confirmation_token.as_deref() {
+        if let Some(provided) = confirmation_token {
+            if provided.trim() == expected_token {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Generates a fresh ephemeral pairing token and returns the full pairing response.
 fn build_pairing_response(
     state: &WebUiState,
+    operator_auth_provided: bool,
 ) -> Result<PairingWebResponse, (StatusCode, &'static str)> {
     let token_store = state.token_store.as_ref().ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
@@ -171,12 +237,22 @@ fn build_pairing_response(
         Some(300)
     };
 
-    let record = token_store.generate_token(None, ttl).map_err(|_| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Failed to generate pairing token",
-        )
-    })?;
+    let record = token_store
+        .generate_token_with_preconfirmation(None, ttl, operator_auth_provided)
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to generate pairing token",
+            )
+        })?;
+
+    if !operator_auth_provided {
+        tracing::info!(
+            token = %record.token,
+            pin = %record.confirmation_pin,
+            "Pairing token generated; awaiting operator confirmation PIN [NFR-SEC-001]"
+        );
+    }
 
     let payload = PairingPayload {
         cluster_endpoint: state.cluster_endpoint.clone(),
@@ -208,6 +284,12 @@ fn build_pairing_response(
         pairing_payload_json: payload_json,
         qr_png_data_url,
         apk_download_url: state.apk_download_url.clone(),
+        confirmed: record.is_confirmed,
+        confirmation_pin: if operator_auth_provided {
+            Some(record.confirmation_pin)
+        } else {
+            None
+        },
     })
 }
 
@@ -217,8 +299,14 @@ fn build_pairing_response(
 /// Traces to: [REQ-OP-001], [INV-002]
 async fn handle_get_pairing(
     State(state): State<WebUiState>,
+    headers: HeaderMap,
 ) -> Result<Json<PairingWebResponse>, (StatusCode, &'static str)> {
-    let resp = build_pairing_response(&state)?;
+    let pin_hdr = headers.get("x-operator-pin").and_then(|v| v.to_str().ok());
+    let token_hdr = headers
+        .get("x-confirmation-token")
+        .and_then(|v| v.to_str().ok());
+    let is_auth = check_operator_auth(&state, pin_hdr, token_hdr);
+    let resp = build_pairing_response(&state, is_auth)?;
     Ok(Json(resp))
 }
 
@@ -227,9 +315,153 @@ async fn handle_get_pairing(
 /// Traces to: [REQ-OP-001], [INV-002]
 async fn handle_post_pairing(
     State(state): State<WebUiState>,
+    headers: HeaderMap,
+    body: Option<Json<PairingPostRequest>>,
 ) -> Result<Json<PairingWebResponse>, (StatusCode, &'static str)> {
-    let resp = build_pairing_response(&state)?;
+    let pin_hdr = headers.get("x-operator-pin").and_then(|v| v.to_str().ok());
+    let token_hdr = headers
+        .get("x-confirmation-token")
+        .and_then(|v| v.to_str().ok());
+    let pin_body = body.as_ref().and_then(|b| b.pin.as_deref());
+    let token_body = body.as_ref().and_then(|b| b.confirmation_token.as_deref());
+
+    let is_auth = check_operator_auth(&state, pin_hdr.or(pin_body), token_hdr.or(token_body));
+    let resp = build_pairing_response(&state, is_auth)?;
     Ok(Json(resp))
+}
+
+/// POST /api/pair/confirm: Operator confirmation gate for ephemeral pairing tokens.
+/// Requires 6-digit console/dashboard PIN or confirmation token before worker CSR signing.
+///
+/// Traces to: [REQ-OP-001], [INV-002], [NFR-SEC-001]
+async fn handle_confirm_pairing(
+    State(state): State<WebUiState>,
+    headers: HeaderMap,
+    Json(payload): Json<ConfirmPairingRequest>,
+) -> Response {
+    let token_store = match state.token_store.as_ref() {
+        Some(s) => s,
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ConfirmPairingResponse {
+                    success: false,
+                    token: payload.token,
+                    confirmed: false,
+                    message: String::new(),
+                    error: "Pairing token store is not configured".to_string(),
+                }),
+            )
+                .into_response();
+        }
+    };
+
+    let pin = payload
+        .pin
+        .as_deref()
+        .or_else(|| headers.get("x-operator-pin").and_then(|v| v.to_str().ok()));
+    let conf_token = payload
+        .confirmation_token
+        .as_deref()
+        .or_else(|| headers.get("x-confirmation-token").and_then(|v| v.to_str().ok()));
+
+    let candidate = match pin.or(conf_token) {
+        Some(c) => c,
+        None => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(ConfirmPairingResponse {
+                    success: false,
+                    token: payload.token,
+                    confirmed: false,
+                    message: String::new(),
+                    error: "Operator confirmation PIN or token must be provided".to_string(),
+                }),
+            )
+                .into_response();
+        }
+    };
+
+    match token_store.confirm_token(&payload.token, candidate) {
+        Ok(()) => {
+            (
+                StatusCode::OK,
+                Json(ConfirmPairingResponse {
+                    success: true,
+                    token: payload.token,
+                    confirmed: true,
+                    message: "Pairing session confirmed by operator".to_string(),
+                    error: String::new(),
+                }),
+            )
+                .into_response()
+        }
+        Err(PairingError::TokenNotFound) => {
+            (
+                StatusCode::NOT_FOUND,
+                Json(ConfirmPairingResponse {
+                    success: false,
+                    token: payload.token,
+                    confirmed: false,
+                    message: String::new(),
+                    error: "Specified pairing token not found".to_string(),
+                }),
+            )
+                .into_response()
+        }
+        Err(PairingError::TokenExpired { .. }) => {
+            (
+                StatusCode::GONE,
+                Json(ConfirmPairingResponse {
+                    success: false,
+                    token: payload.token,
+                    confirmed: false,
+                    message: String::new(),
+                    error: "Pairing token has expired".to_string(),
+                }),
+            )
+                .into_response()
+        }
+        Err(PairingError::RateLimitExceeded) => {
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(ConfirmPairingResponse {
+                    success: false,
+                    token: payload.token,
+                    confirmed: false,
+                    message: String::new(),
+                    error: "Rate limit exceeded for pairing confirmation".to_string(),
+                }),
+            )
+                .into_response()
+        }
+        Err(PairingError::InvalidConfirmationPin) => {
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(ConfirmPairingResponse {
+                    success: false,
+                    token: payload.token,
+                    confirmed: false,
+                    message: String::new(),
+                    error: "Invalid operator confirmation PIN or token".to_string(),
+                }),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            (
+                StatusCode::FORBIDDEN,
+                Json(ConfirmPairingResponse {
+                    success: false,
+                    token: payload.token,
+                    confirmed: false,
+                    message: String::new(),
+                    error: e.to_string(),
+                }),
+            )
+                .into_response()
+        }
+    }
 }
 
 /// Query parameters for /api/pair/qr.png
@@ -285,7 +517,7 @@ async fn handle_pairing_qr_png(
             )
         })?
     } else {
-        let resp = build_pairing_response(&state)?;
+        let resp = build_pairing_response(&state, false)?;
         resp.pairing_payload_json
     };
 
@@ -369,6 +601,8 @@ mod tests {
             cluster_endpoint: "192.168.1.100:50051".to_string(),
             apk_download_url: "https://example.com/worker.apk".to_string(),
             pairing_token_ttl_seconds: 300,
+            operator_pin: None,
+            confirmation_token: None,
         };
 
         let app = web_ui_router(state);
@@ -399,6 +633,8 @@ mod tests {
             cluster_endpoint: "192.168.1.100:50051".to_string(),
             apk_download_url: "https://example.com/worker.apk".to_string(),
             pairing_token_ttl_seconds: 300,
+            operator_pin: None,
+            confirmation_token: None,
         };
 
         let app = web_ui_router(state);
@@ -436,6 +672,8 @@ mod tests {
             cluster_endpoint: "192.168.1.100:50051".to_string(),
             apk_download_url: "https://example.com/worker.apk".to_string(),
             pairing_token_ttl_seconds: 300,
+            operator_pin: None,
+            confirmation_token: None,
         };
 
         let app = web_ui_router(state);
@@ -468,6 +706,8 @@ mod tests {
             cluster_endpoint: "192.168.1.100:50051".to_string(),
             apk_download_url: "https://example.com/worker.apk".to_string(),
             pairing_token_ttl_seconds: 300,
+            operator_pin: None,
+            confirmation_token: None,
         };
 
         let app = web_ui_router(state);
@@ -489,5 +729,84 @@ mod tests {
         assert!(payload
             .qr_png_data_url
             .starts_with("data:image/png;base64,"));
+    }
+
+    #[tokio::test]
+    async fn test_web_ui_router_pair_confirm_endpoint_lifecycle() {
+        let scheduler = Arc::new(ClusterScheduler::new());
+        let token_store = Arc::new(PairingTokenStore::with_operator_gate(
+            true,
+            5,
+            true,
+            Some("123456".to_string()),
+            Some("operator-secret".to_string()),
+        ));
+
+        let state = WebUiState {
+            scheduler,
+            token_store: Some(Arc::clone(&token_store)),
+            ca_fingerprint: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                .to_string(),
+            cluster_endpoint: "192.168.1.100:50051".to_string(),
+            apk_download_url: "https://example.com/worker.apk".to_string(),
+            pairing_token_ttl_seconds: 300,
+            operator_pin: Some("123456".to_string()),
+            confirmation_token: Some("operator-secret".to_string()),
+        };
+
+        let app = web_ui_router(state);
+
+        // 1. Unauthenticated POST /api/pair generates unconfirmed token
+        let post_req = Request::builder()
+            .uri("/api/pair")
+            .method("POST")
+            .body(Body::empty())
+            .unwrap();
+        let post_resp = app.clone().oneshot(post_req).await.unwrap();
+        assert_eq!(post_resp.status(), StatusCode::OK);
+        let post_bytes = axum::body::to_bytes(post_resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let pair_data: PairingWebResponse = serde_json::from_slice(&post_bytes).unwrap();
+        assert!(!pair_data.confirmed);
+        assert!(pair_data.confirmation_pin.is_none());
+
+        // 2. Confirming with invalid PIN yields 401 Unauthorized
+        let bad_confirm_req = Request::builder()
+            .uri("/api/pair/confirm")
+            .method("POST")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&ConfirmPairingRequest {
+                token: pair_data.pairing_token.clone(),
+                pin: Some("999999".to_string()),
+                confirmation_token: None,
+            }).unwrap()))
+            .unwrap();
+        let bad_confirm_resp = app.clone().oneshot(bad_confirm_req).await.unwrap();
+        assert_eq!(bad_confirm_resp.status(), StatusCode::UNAUTHORIZED);
+
+        // 3. Confirming with valid operator PIN yields 200 OK
+        let good_confirm_req = Request::builder()
+            .uri("/api/pair/confirm")
+            .method("POST")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&ConfirmPairingRequest {
+                token: pair_data.pairing_token.clone(),
+                pin: Some("123456".to_string()),
+                confirmation_token: None,
+            }).unwrap()))
+            .unwrap();
+        let good_confirm_resp = app.clone().oneshot(good_confirm_req).await.unwrap();
+        assert_eq!(good_confirm_resp.status(), StatusCode::OK);
+        let good_bytes = axum::body::to_bytes(good_confirm_resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let confirm_data: ConfirmPairingResponse = serde_json::from_slice(&good_bytes).unwrap();
+        assert!(confirm_data.success);
+        assert!(confirm_data.confirmed);
+
+        // 4. Token is now marked confirmed in store
+        let confirmed_rec = token_store.get_token(&pair_data.pairing_token).unwrap();
+        assert!(confirmed_rec.is_confirmed);
     }
 }

@@ -128,6 +128,14 @@ pub struct ClusterConfig {
     /// Optional explicit cluster endpoint (e.g. "192.168.1.100:50051").
     /// Traces to: [REQ-OP-001], [INV-001]
     pub cluster_endpoint: Option<String>,
+
+    /// Optional operator confirmation PIN (e.g. 6-digit numeric PIN).
+    /// Traces to: [NFR-SEC-001], [REQ-OP-001]
+    pub operator_pin: Option<String>,
+
+    /// Optional operator confirmation token for automated pairing approval.
+    /// Traces to: [NFR-SEC-001], [REQ-OP-001]
+    pub confirmation_token: Option<String>,
 }
 
 impl Default for ClusterConfig {
@@ -167,6 +175,8 @@ impl Default for ClusterConfig {
             mdns_service_name: "androgrid-orchestrator".to_string(),
             apk_download_url: "https://github.com/ligature-platform/androgrid-android/releases/latest/download/androgrid-worker.apk".to_string(),
             cluster_endpoint: None,
+            operator_pin: None,
+            confirmation_token: None,
         }
     }
 }
@@ -331,6 +341,20 @@ impl ClusterConfig {
             config.cluster_endpoint = Some(val);
         } else if let Ok(val) = std::env::var("ANDROGRID_PUBLIC_ENDPOINT") {
             config.cluster_endpoint = Some(val);
+        }
+
+        if let Ok(val) = std::env::var("ANDROGRID_OPERATOR_PIN") {
+            let trimmed = val.trim();
+            if !trimmed.is_empty() {
+                config.operator_pin = Some(trimmed.to_string());
+            }
+        }
+
+        if let Ok(val) = std::env::var("ANDROGRID_CONFIRMATION_TOKEN") {
+            let trimmed = val.trim();
+            if !trimmed.is_empty() {
+                config.confirmation_token = Some(trimmed.to_string());
+            }
         }
 
         config.validate_renewal_policy()?;

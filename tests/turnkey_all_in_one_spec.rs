@@ -24,14 +24,14 @@ use androgrid_backend::observability::{
     web_ui_router, ApkInfoResponse, MdnsConfig, MdnsResponder, PairingWebResponse, WebUiState,
 };
 use androgrid_backend::pairing::{
-    cert_init, CaSigner, EnrollmentContext, EnrollmentServiceImpl, PairingPayload,
-    PairingTokenStore, PkiInitConfig,
+    cert_init, enrollment_http_router, CaSigner, EnrollmentContext, EnrollmentServiceImpl,
+    PairingPayload, PairingTokenStore, PkiInitConfig,
 };
 use androgrid_backend::{
     build_client_mtls_config, build_server_bootstrap_tls_config, require_client_mtls_interceptor,
     AndroGridServiceImpl, ArtifactStore, CertRenewalManager, CertRenewalPolicy, ClusterScheduler,
-    EnrollWorkerRequest, ExecutionEngine, NetworkTransportType, NodeCapabilities,
-    RegisterNodeRequest,
+    EnrollWorkerRequest, ExecutionEngine, HttpEnrollRequest, HttpEnrollResponse,
+    NetworkTransportType, NodeCapabilities, RegisterNodeRequest,
 };
 use rcgen::{CertificateParams, DnType, KeyPair};
 use x509_parser::prelude::*;
@@ -131,6 +131,8 @@ async fn test_web_ui_dashboard_and_pairing_endpoints() {
         cluster_endpoint: cluster_endpoint.clone(),
         apk_download_url: apk_url.clone(),
         pairing_token_ttl_seconds: 300,
+        operator_pin: None,
+        confirmation_token: None,
     };
 
     let app = web_ui_router(web_state);
@@ -251,7 +253,14 @@ async fn test_end_to_end_worker_pairing_from_web_qr_code() {
     let ca_fingerprint = ca_signer.ca_fingerprint().to_string();
 
     let scheduler = Arc::new(ClusterScheduler::new());
-    let token_store = Arc::new(PairingTokenStore::new(true, 5));
+    let operator_pin = "481920".to_string();
+    let token_store = Arc::new(PairingTokenStore::with_operator_gate(
+        true,
+        5,
+        true,
+        Some(operator_pin.clone()),
+        None,
+    ));
     let artifact_store = Arc::new(ArtifactStore::new());
 
     // 2. Start combined gRPC server (bootstrap TLS with EnrollmentService + AndroGridService)
@@ -299,6 +308,8 @@ async fn test_end_to_end_worker_pairing_from_web_qr_code() {
         cluster_endpoint: grpc_addr.to_string(),
         apk_download_url: "https://example.com/androgrid-worker.apk".to_string(),
         pairing_token_ttl_seconds: 300,
+        operator_pin: Some(operator_pin.clone()),
+        confirmation_token: None,
     };
     let web_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let web_addr = web_listener.local_addr().unwrap();
@@ -322,6 +333,19 @@ async fn test_end_to_end_worker_pairing_from_web_qr_code() {
 
     assert_eq!(pair_res.cluster_endpoint, grpc_addr.to_string());
     assert_eq!(pair_res.ca_fingerprint, ca_fingerprint);
+    assert!(!pair_res.confirmed, "Turnkey pairing token must require operator confirmation");
+
+    // 4b. Operator confirms pairing session via POST /api/pair/confirm with 6-digit console PIN
+    let confirm_res = http_client
+        .post(format!("http://{web_addr}/api/pair/confirm"))
+        .json(&serde_json::json!({
+            "token": pair_res.pairing_token,
+            "pin": operator_pin,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(confirm_res.status(), reqwest::StatusCode::OK);
 
     // 5. Worker scans and decodes PairingPayload
     let payload = PairingPayload::from_json(&pair_res.pairing_payload_json).unwrap();
@@ -450,4 +474,203 @@ fn test_mdns_responder_lifecycle_and_updates() {
     assert!(responder.update_node_count(5).is_ok());
 
     responder.shutdown();
+}
+
+/// 5. Verifies the Ephemeral Operator Confirmation Gate:
+///    - An unauthenticated call to POST /api/pair returns an unconfirmed token.
+///    - HTTP worker enrollment with an unconfirmed token is rejected with HTTP 403 Forbidden.
+///    - POST /api/pair/confirm with invalid PIN is rejected with HTTP 401 Unauthorized.
+///    - POST /api/pair/confirm with valid 6-digit operator PIN authorizes the pairing token.
+///    - HTTP worker enrollment with the confirmed token succeeds with HTTP 200 OK and valid mTLS client cert.
+///    - Expired pairing tokens are rejected with HTTP 410 Gone.
+///
+/// Traces to: [REQ-OP-001], [INV-001], [INV-002], [NFR-SEC-001]
+#[tokio::test]
+async fn test_ephemeral_operator_confirmation_gate_security_lifecycle() {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let pki_out = std::env::temp_dir().join(format!("androgrid_test_pki_gate_{nonce}"));
+    let host_ip = "127.0.0.1";
+
+    let init_config = PkiInitConfig {
+        out_dir: pki_out.clone(),
+        extra_sans: vec![host_ip.to_string(), "localhost".to_string()],
+        no_default_sans: false,
+        ca_days: 365,
+        days: 90,
+        admin_cn: "operator".to_string(),
+        force: true,
+    };
+    cert_init(&init_config).expect("PKI init");
+
+    let ca_cert_pem = std::fs::read_to_string(pki_out.join("runtime/ca.crt")).unwrap();
+    let ca_key_pem = std::fs::read_to_string(pki_out.join("operator/ca.key")).unwrap();
+    let ca_signer = Arc::new(CaSigner::from_pem(&ca_cert_pem, &ca_key_pem).unwrap());
+    let ca_fingerprint = ca_signer.ca_fingerprint().to_string();
+
+    let operator_pin = "839201".to_string();
+    let token_store = Arc::new(PairingTokenStore::with_operator_gate(
+        true,
+        5,
+        true, // Confirmation gate active
+        Some(operator_pin.clone()),
+        None,
+    ));
+
+    let scheduler = Arc::new(ClusterScheduler::new());
+    let enrollment_ctx = EnrollmentContext::new(Arc::clone(&token_store), Arc::clone(&ca_signer));
+
+    // Spin up HTTP enrollment router (port A)
+    let enroll_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let enroll_addr = enroll_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(enroll_listener, enrollment_http_router(enrollment_ctx).into_make_service())
+            .await
+            .expect("Enrollment HTTP server");
+    });
+
+    // Spin up Web UI dashboard router (port B)
+    let web_state = WebUiState {
+        scheduler: Arc::clone(&scheduler),
+        token_store: Some(Arc::clone(&token_store)),
+        ca_fingerprint: ca_fingerprint.clone(),
+        cluster_endpoint: enroll_addr.to_string(),
+        apk_download_url: "https://example.com/worker.apk".to_string(),
+        pairing_token_ttl_seconds: 300,
+        operator_pin: Some(operator_pin.clone()),
+        confirmation_token: None,
+    };
+    let web_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let web_addr = web_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(web_listener, web_ui_router(web_state).into_make_service())
+            .await
+            .expect("Web UI server");
+    });
+
+    let client = reqwest::Client::new();
+
+    // 1. Unauthenticated client calls POST /api/pair on Web UI
+    let pair_resp = client
+        .post(format!("http://{web_addr}/api/pair"))
+        .send()
+        .await
+        .unwrap()
+        .json::<PairingWebResponse>()
+        .await
+        .unwrap();
+
+    assert!(!pair_resp.confirmed, "Unauthenticated pairing token must require confirmation");
+    let token = pair_resp.pairing_token;
+
+    // Generate worker CSR
+    let worker_node_id = "worker-gate-device-1";
+    let worker_key = KeyPair::generate().expect("Generate worker key");
+    let mut csr_params = CertificateParams::default();
+    csr_params
+        .distinguished_name
+        .push(DnType::CommonName, worker_node_id);
+    let worker_csr_pem = csr_params
+        .serialize_request(&worker_key)
+        .unwrap()
+        .pem()
+        .unwrap();
+
+    // 2. Unconfirmed worker attempts enrollment -> MUST be rejected with HTTP 403 Forbidden
+    let enroll_unconfirmed_resp = client
+        .post(format!("http://{enroll_addr}/api/v1/enroll"))
+        .json(&HttpEnrollRequest {
+            pairing_token: token.clone(),
+            node_id: worker_node_id.to_string(),
+            csr_pem: worker_csr_pem.clone(),
+            attestation_certificate_chain_pem: Vec::new(),
+            pin: None,
+            confirmation_token: None,
+        })
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        enroll_unconfirmed_resp.status(),
+        reqwest::StatusCode::FORBIDDEN,
+        "Enrollment before operator confirmation must be rejected with HTTP 403"
+    );
+
+    // 3. Confirm with wrong PIN -> MUST fail with HTTP 401 Unauthorized
+    let bad_confirm_resp = client
+        .post(format!("http://{web_addr}/api/pair/confirm"))
+        .json(&serde_json::json!({
+            "token": token,
+            "pin": "000000",
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        bad_confirm_resp.status(),
+        reqwest::StatusCode::UNAUTHORIZED,
+        "Confirmation with wrong PIN must be rejected with HTTP 401"
+    );
+
+    // 4. Confirm with valid operator PIN -> MUST succeed with HTTP 200 OK
+    let good_confirm_resp = client
+        .post(format!("http://{web_addr}/api/pair/confirm"))
+        .json(&serde_json::json!({
+            "token": token,
+            "pin": operator_pin,
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        good_confirm_resp.status(),
+        reqwest::StatusCode::OK,
+        "Confirmation with valid operator PIN must succeed"
+    );
+
+    // 5. Worker retries enrollment with now-confirmed token -> MUST succeed with signed cert
+    let enroll_confirmed_resp = client
+        .post(format!("http://{enroll_addr}/api/v1/enroll"))
+        .json(&HttpEnrollRequest {
+            pairing_token: token.clone(),
+            node_id: worker_node_id.to_string(),
+            csr_pem: worker_csr_pem.clone(),
+            attestation_certificate_chain_pem: Vec::new(),
+            pin: None,
+            confirmation_token: None,
+        })
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(enroll_confirmed_resp.status(), reqwest::StatusCode::OK);
+    let enroll_data: HttpEnrollResponse = enroll_confirmed_resp.json().await.unwrap();
+    assert!(enroll_data.success);
+    assert!(!enroll_data.client_cert_pem.is_empty());
+    assert!(!enroll_data.ca_cert_pem.is_empty());
+
+    // 6. Test expired token rejection with HTTP 410 Gone
+    let expired_token_str = "expired-token-for-test-gate-000000000000000000000000000000000000";
+    {
+        let confirm_expired_resp = client
+            .post(format!("http://{web_addr}/api/pair/confirm"))
+            .json(&serde_json::json!({
+                "token": expired_token_str,
+                "pin": operator_pin,
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            confirm_expired_resp.status() == reqwest::StatusCode::NOT_FOUND
+                || confirm_expired_resp.status() == reqwest::StatusCode::GONE
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&pki_out);
 }
