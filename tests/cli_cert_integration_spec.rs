@@ -182,6 +182,82 @@ fn test_cli_cert_offline_lifecycle_and_json_output() {
     assert!(worker_cert_out.exists());
     assert!(worker_ca_out.exists());
 
+    // 6. Offline cert worker with --format json
+    let worker_out_dir = root.join("cli_worker");
+    let worker_out = Command::new(bin)
+        .args([
+            "--format",
+            "json",
+            "cert",
+            "worker",
+            "--node-id",
+            "node_cli_worker_01",
+            "--ca-dir",
+            pki_dir.to_str().unwrap(),
+            "--out",
+            worker_out_dir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to run cert worker");
+    assert!(
+        worker_out.status.success(),
+        "cert worker failed: {}",
+        String::from_utf8_lossy(&worker_out.stderr)
+    );
+    let worker_stdout = String::from_utf8_lossy(&worker_out.stdout);
+    let worker_stderr = String::from_utf8_lossy(&worker_out.stderr);
+    assert!(
+        !worker_stdout.contains("PRIVATE KEY"),
+        "Private key material must not be logged to stdout"
+    );
+    assert!(
+        !worker_stderr.contains("PRIVATE KEY"),
+        "Private key material must not be logged to stderr"
+    );
+    assert!(
+        worker_stderr.contains("Host-generated worker keypair bypasses hardware attestation"),
+        "Attestation warning must be emitted to stderr"
+    );
+    let worker_json: serde_json::Value =
+        serde_json::from_str(&worker_stdout).expect("worker stdout must be pure JSON");
+    assert_eq!(worker_json["action"], "cert worker");
+    assert_eq!(worker_json["node_id"], "node_cli_worker_01");
+    assert!(worker_out_dir.join("client.crt").exists());
+    assert!(worker_out_dir.join("client.key").exists());
+    assert!(worker_out_dir.join("ca.crt").exists());
+
+    // 7. Verify cert issue worker alias
+    let worker_alias_out_dir = root.join("cli_worker_alias");
+    let worker_alias_out = Command::new(bin)
+        .args([
+            "--format",
+            "json",
+            "cert",
+            "issue",
+            "worker",
+            "--node-id",
+            "node_cli_worker_alias",
+            "--ca-dir",
+            pki_dir.to_str().unwrap(),
+            "--out",
+            worker_alias_out_dir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to run cert issue worker alias");
+    assert!(
+        worker_alias_out.status.success(),
+        "cert issue worker alias failed: {}",
+        String::from_utf8_lossy(&worker_alias_out.stderr)
+    );
+    let worker_alias_stdout = String::from_utf8_lossy(&worker_alias_out.stdout);
+    let worker_alias_json: serde_json::Value =
+        serde_json::from_str(&worker_alias_stdout).expect("worker alias stdout must be pure JSON");
+    assert_eq!(worker_alias_json["action"], "cert worker");
+    assert_eq!(worker_alias_json["node_id"], "node_cli_worker_alias");
+    assert!(worker_alias_out_dir.join("client.crt").exists());
+    assert!(worker_alias_out_dir.join("client.key").exists());
+    assert!(worker_alias_out_dir.join("ca.crt").exists());
+
     let _ = fs::remove_dir_all(&root);
 }
 
