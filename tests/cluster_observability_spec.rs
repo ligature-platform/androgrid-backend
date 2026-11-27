@@ -626,7 +626,7 @@ async fn test_admin_service_list_tasks_grpc() {
         .expect("Failed to bind ephemeral gRPC port");
     let addr = listener.local_addr().expect("Local address available");
 
-    let service = AdminServiceImpl::new(Arc::clone(&scheduler));
+    let service = AdminServiceImpl::new(Arc::clone(&scheduler)).with_allow_unauthenticated(true);
     let server = AdminServiceServer::new(service);
 
     tokio::spawn(async move {

@@ -32,6 +32,8 @@ rustc-ice-*.txt
 *.p12
 *.pfx
 *.crt
+*.csr
+*.srl
 .env*
 !*.env.example
 credentials.json
@@ -39,7 +41,13 @@ cloudflare-tunnel.json
 /pki/
 /.pki/
 /deploy/pki/
+/deploy/pki-*/
 /deploy/credentials.json
+
+# Frame buffers, raw memory/display dumps & screen captures
+*.raw
+*.png
+!tests/fixtures/**/*.png
 
 # Developer Environments & Tooling
 .agents/

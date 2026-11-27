@@ -35,10 +35,13 @@ pub struct AdminServiceImpl {
     token_store: Arc<PairingTokenStore>,
     ca_fingerprint: String,
     cluster_endpoint: String,
+    allow_unauthenticated: bool,
 }
 
 impl AdminServiceImpl {
     /// Constructs a new AdminServiceImpl with the shared cluster scheduler.
+    ///
+    /// Defaults to fail-closed authorization (`allow_unauthenticated: false`).
     pub fn new(scheduler: Arc<ClusterScheduler>) -> Self {
         Self {
             scheduler,
@@ -47,10 +50,13 @@ impl AdminServiceImpl {
             token_store: Arc::new(PairingTokenStore::default()),
             ca_fingerprint: String::new(),
             cluster_endpoint: "https://127.0.0.1:50051".to_string(),
+            allow_unauthenticated: false,
         }
     }
 
     /// Constructs an AdminServiceImpl with explicit artifact store and base URL injection.
+    ///
+    /// Defaults to fail-closed authorization (`allow_unauthenticated: false`).
     ///
     /// Traces to: [NFR-PERF-001], [REQ-OP-003]
     pub fn with_artifact_store(
@@ -65,10 +71,13 @@ impl AdminServiceImpl {
             token_store: Arc::new(PairingTokenStore::default()),
             ca_fingerprint: String::new(),
             cluster_endpoint: "https://127.0.0.1:50051".to_string(),
+            allow_unauthenticated: false,
         }
     }
 
     /// Constructs an AdminServiceImpl with full artifact and pairing subsystem injection.
+    ///
+    /// Defaults to fail-closed authorization (`allow_unauthenticated: false`).
     ///
     /// Traces to: [INV-002], [NFR-SEC-001], [REQ-OP-001]
     pub fn with_services(
@@ -86,20 +95,53 @@ impl AdminServiceImpl {
             token_store,
             ca_fingerprint,
             cluster_endpoint,
+            allow_unauthenticated: false,
         }
     }
 
+    /// Configures whether requests without client mTLS identity are permitted.
+    ///
+    /// Defaults to `false` (fail-closed secure by default).
+    /// Can be explicitly set to `true` in unauthenticated mock unit tests or plaintext dev mode.
+    pub fn with_allow_unauthenticated(mut self, allow: bool) -> Self {
+        self.allow_unauthenticated = allow;
+        self
+    }
+
     /// Enforces a positive allowlist requiring operator certificates
-    /// (`OU = Control Plane`) when mTLS identity metadata is attached.
-    fn authorize_admin_peer<T>(request: &Request<T>) -> Result<(), Status> {
+    /// (`OU = Control Plane`). Fails closed when client identity metadata is missing
+    /// unless explicitly configured via [`with_allow_unauthenticated`].
+    ///
+    /// Traces to: [INV-002], [NFR-SEC-001]
+    fn authorize_admin_peer<T>(&self, request: &Request<T>) -> Result<(), Status> {
         if let Some(peer) = request.extensions().get::<AuthenticatedPeer>() {
             if peer.organizational_unit.as_deref() != Some("Control Plane") {
                 return Err(Status::permission_denied(
                     "AdminService requires an operator certificate with OU=Control Plane",
                 ));
             }
+            return Ok(());
         }
-        Ok(())
+
+        if let Some(certs) = request.peer_certs() {
+            if let Some(cert) = certs.first() {
+                let peer = crate::transport::tls::parse_leaf_identity(cert.as_ref())?;
+                if peer.organizational_unit.as_deref() != Some("Control Plane") {
+                    return Err(Status::permission_denied(
+                        "AdminService requires an operator certificate with OU=Control Plane",
+                    ));
+                }
+                return Ok(());
+            }
+        }
+
+        if self.allow_unauthenticated {
+            return Ok(());
+        }
+
+        Err(Status::unauthenticated(
+            "Missing verified mTLS peer identity on AdminService [INV-002]",
+        ))
     }
 
     /// Validates WASM artifact references against ArtifactStore when inline bytecode is empty.
@@ -178,7 +220,7 @@ impl AdminService for AdminServiceImpl {
         &self,
         request: Request<SubmitTaskRequest>,
     ) -> Result<Response<SubmitTaskResponse>, Status> {
-        Self::authorize_admin_peer(&request)?;
+        self.authorize_admin_peer(&request)?;
         let req = request.into_inner();
         let task = req.task.ok_or_else(|| {
             Status::invalid_argument("task field is required in SubmitTaskRequest")
@@ -225,7 +267,7 @@ impl AdminService for AdminServiceImpl {
         &self,
         request: Request<GetTaskStatusRequest>,
     ) -> Result<Response<GetTaskStatusResponse>, Status> {
-        Self::authorize_admin_peer(&request)?;
+        self.authorize_admin_peer(&request)?;
         let req = request.into_inner();
         let task_id = req.task_id;
         if task_id.is_empty() {
@@ -270,7 +312,7 @@ impl AdminService for AdminServiceImpl {
         &self,
         request: Request<ListWorkerNodesRequest>,
     ) -> Result<Response<ListWorkerNodesResponse>, Status> {
-        Self::authorize_admin_peer(&request)?;
+        self.authorize_admin_peer(&request)?;
         let nodes = self.scheduler.list_worker_nodes();
         Ok(Response::new(ListWorkerNodesResponse { nodes }))
     }
@@ -282,7 +324,7 @@ impl AdminService for AdminServiceImpl {
         &self,
         request: Request<ListTasksRequest>,
     ) -> Result<Response<ListTasksResponse>, Status> {
-        Self::authorize_admin_peer(&request)?;
+        self.authorize_admin_peer(&request)?;
         let req = request.into_inner();
         let state_filter = if req.state_filter == 0 {
             None
@@ -300,7 +342,7 @@ impl AdminService for AdminServiceImpl {
         &self,
         request: Request<CancelTaskRequest>,
     ) -> Result<Response<CancelTaskResponse>, Status> {
-        Self::authorize_admin_peer(&request)?;
+        self.authorize_admin_peer(&request)?;
         let req = request.into_inner();
         let task_id = req.task_id;
         if task_id.is_empty() {
@@ -331,7 +373,7 @@ impl AdminService for AdminServiceImpl {
         &self,
         request: Request<UploadArtifactRequest>,
     ) -> Result<Response<UploadArtifactResponse>, Status> {
-        Self::authorize_admin_peer(&request)?;
+        self.authorize_admin_peer(&request)?;
         let req = request.into_inner();
         let bytecode = req.bytecode;
         if bytecode.is_empty() {
@@ -386,7 +428,7 @@ impl AdminService for AdminServiceImpl {
         &self,
         request: Request<GeneratePairingTokenRequest>,
     ) -> Result<Response<GeneratePairingTokenResponse>, Status> {
-        Self::authorize_admin_peer(&request)?;
+        self.authorize_admin_peer(&request)?;
         if self.ca_fingerprint.is_empty() {
             return Err(Status::failed_precondition(
                 "Root CA signer is not initialized; pairing enrollment is unavailable (check ANDROGRID_CA_KEY_PATH)",
@@ -455,7 +497,7 @@ impl AdminService for AdminServiceImpl {
         &self,
         request: Request<SubmitTaskGroupRequest>,
     ) -> Result<Response<SubmitTaskGroupResponse>, Status> {
-        Self::authorize_admin_peer(&request)?;
+        self.authorize_admin_peer(&request)?;
         let req = request.into_inner();
         let group = req.group.ok_or_else(|| {
             Status::invalid_argument("group field is required in SubmitTaskGroupRequest")
@@ -485,7 +527,7 @@ impl AdminService for AdminServiceImpl {
         &self,
         request: Request<ReplaceTaskGroupRequest>,
     ) -> Result<Response<ReplaceTaskGroupResponse>, Status> {
-        Self::authorize_admin_peer(&request)?;
+        self.authorize_admin_peer(&request)?;
         let req = request.into_inner();
         let template = req.template.as_ref().ok_or_else(|| {
             Status::invalid_argument("template field is required in ReplaceTaskGroupRequest")
@@ -512,7 +554,7 @@ impl AdminService for AdminServiceImpl {
         &self,
         request: Request<CancelTaskGroupRequest>,
     ) -> Result<Response<CancelTaskGroupResponse>, Status> {
-        Self::authorize_admin_peer(&request)?;
+        self.authorize_admin_peer(&request)?;
         let req = request.into_inner();
         if req.group_id.is_empty() {
             return Err(Status::invalid_argument("group_id must not be empty"));
@@ -531,7 +573,7 @@ impl AdminService for AdminServiceImpl {
         &self,
         request: Request<GetTaskGroupStatusRequest>,
     ) -> Result<Response<GetTaskGroupStatusResponse>, Status> {
-        Self::authorize_admin_peer(&request)?;
+        self.authorize_admin_peer(&request)?;
         let req = request.into_inner();
         if req.group_id.is_empty() {
             return Err(Status::invalid_argument("group_id must not be empty"));
@@ -550,7 +592,7 @@ impl AdminService for AdminServiceImpl {
         &self,
         request: Request<ListTaskGroupsRequest>,
     ) -> Result<Response<ListTaskGroupsResponse>, Status> {
-        Self::authorize_admin_peer(&request)?;
+        self.authorize_admin_peer(&request)?;
         let req = request.into_inner();
         let state_filter = if req.state_filter == 0 {
             None
@@ -568,7 +610,7 @@ impl AdminService for AdminServiceImpl {
         &self,
         request: Request<CreateNodeGroupRequest>,
     ) -> Result<Response<CreateNodeGroupResponse>, Status> {
-        Self::authorize_admin_peer(&request)?;
+        self.authorize_admin_peer(&request)?;
         let req = request.into_inner();
         let res = self
             .scheduler
@@ -583,7 +625,7 @@ impl AdminService for AdminServiceImpl {
         &self,
         request: Request<UpdateNodeGroupRequest>,
     ) -> Result<Response<UpdateNodeGroupResponse>, Status> {
-        Self::authorize_admin_peer(&request)?;
+        self.authorize_admin_peer(&request)?;
         let req = request.into_inner();
         let res = self
             .scheduler
@@ -598,7 +640,7 @@ impl AdminService for AdminServiceImpl {
         &self,
         request: Request<ListNodeGroupsRequest>,
     ) -> Result<Response<ListNodeGroupsResponse>, Status> {
-        Self::authorize_admin_peer(&request)?;
+        self.authorize_admin_peer(&request)?;
         let groups = self.scheduler.list_node_groups();
         Ok(Response::new(ListNodeGroupsResponse { groups }))
     }
@@ -610,7 +652,7 @@ impl AdminService for AdminServiceImpl {
         &self,
         request: Request<AssignNodesToGroupRequest>,
     ) -> Result<Response<AssignNodesToGroupResponse>, Status> {
-        Self::authorize_admin_peer(&request)?;
+        self.authorize_admin_peer(&request)?;
         let req = request.into_inner();
         let res = self
             .scheduler
@@ -625,7 +667,7 @@ impl AdminService for AdminServiceImpl {
         &self,
         request: Request<DrainNodesRequest>,
     ) -> Result<Response<DrainNodesResponse>, Status> {
-        Self::authorize_admin_peer(&request)?;
+        self.authorize_admin_peer(&request)?;
         let req = request.into_inner();
         let res = self.scheduler.drain_nodes(req)?;
         Ok(Response::new(res))
@@ -638,7 +680,7 @@ impl AdminService for AdminServiceImpl {
         &self,
         request: Request<UpgradeNodesRequest>,
     ) -> Result<Response<UpgradeNodesResponse>, Status> {
-        Self::authorize_admin_peer(&request)?;
+        self.authorize_admin_peer(&request)?;
         let req = request.into_inner();
         let res = self.scheduler.upgrade_nodes(req)?;
         Ok(Response::new(res))
@@ -678,9 +720,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_admin_service_defaults_to_fail_closed_unauthenticated() {
+        let scheduler = Arc::new(ClusterScheduler::new());
+        let service = AdminServiceImpl::new(scheduler);
+        let err = service
+            .list_worker_nodes(Request::new(ListWorkerNodesRequest {}))
+            .await
+            .expect_err("Default constructor must reject unauthenticated requests [INV-002]");
+        assert_eq!(err.code(), tonic::Code::Unauthenticated);
+    }
+
+    #[tokio::test]
     async fn test_submit_task_and_get_status() {
         let scheduler = Arc::new(ClusterScheduler::new());
-        let service = AdminServiceImpl::new(Arc::clone(&scheduler));
+        let service =
+            AdminServiceImpl::new(Arc::clone(&scheduler)).with_allow_unauthenticated(true);
 
         let task = make_test_task("task_admin_01");
         let submit_res = service
@@ -705,7 +759,8 @@ mod tests {
     #[tokio::test]
     async fn test_cancel_pending_task() {
         let scheduler = Arc::new(ClusterScheduler::new());
-        let service = AdminServiceImpl::new(Arc::clone(&scheduler));
+        let service =
+            AdminServiceImpl::new(Arc::clone(&scheduler)).with_allow_unauthenticated(true);
 
         let task = make_test_task("task_cancel_01");
         service
@@ -736,7 +791,8 @@ mod tests {
     #[tokio::test]
     async fn test_list_worker_nodes() {
         let scheduler = Arc::new(ClusterScheduler::new());
-        let service = AdminServiceImpl::new(Arc::clone(&scheduler));
+        let service =
+            AdminServiceImpl::new(Arc::clone(&scheduler)).with_allow_unauthenticated(true);
 
         let caps = NodeCapabilities {
             is_rooted: false,
@@ -784,7 +840,8 @@ mod tests {
             Arc::clone(&token_store),
             "fingerprint_12345".to_string(),
             "https://10.0.0.1:50051".to_string(),
-        );
+        )
+        .with_allow_unauthenticated(true);
 
         let req = GeneratePairingTokenRequest {
             node_id: "test-node-pair".to_string(),
@@ -819,7 +876,8 @@ mod tests {
             Arc::clone(&token_store),
             "fp_abc".to_string(),
             "https://10.0.0.1:50051".to_string(),
-        );
+        )
+        .with_allow_unauthenticated(true);
 
         let res_default = service
             .generate_pairing_token(Request::new(GeneratePairingTokenRequest {
@@ -857,7 +915,8 @@ mod tests {
             token_store,
             "fp_abc".to_string(),
             "https://127.0.0.1:50051".to_string(),
-        );
+        )
+        .with_allow_unauthenticated(true);
 
         let missing_sha = "a".repeat(64);
         let err = service
@@ -992,7 +1051,8 @@ mod tests {
             scheduler,
             artifact_store,
             "http://127.0.0.1:50052".to_string(),
-        );
+        )
+        .with_allow_unauthenticated(true);
 
         let err = svc
             .upload_artifact(Request::new(UploadArtifactRequest {
@@ -1007,7 +1067,7 @@ mod tests {
     #[tokio::test]
     async fn test_submit_task_rejects_caller_group_spoofing() {
         let scheduler = Arc::new(ClusterScheduler::new());
-        let svc = AdminServiceImpl::new(scheduler);
+        let svc = AdminServiceImpl::new(scheduler).with_allow_unauthenticated(true);
         let mut spec = make_test_task("spoof-task");
         spec.group_id = "fake-group".to_string();
         spec.group_epoch = 1;
@@ -1034,7 +1094,8 @@ mod tests {
             scheduler,
             artifact_store,
             "http://127.0.0.1:50052".to_string(),
-        );
+        )
+        .with_allow_unauthenticated(true);
 
         let mut worker_req = Request::new(ListTaskGroupsRequest { state_filter: 0 });
         worker_req.extensions_mut().insert(AuthenticatedPeer {
@@ -1193,32 +1254,32 @@ mod tests {
         );
 
         // Admin peer creates group
-        let mut admin_req = Request::new(CreateNodeGroupRequest {
-            group_id: "rack-1".to_string(),
-            description: "Rack 1".to_string(),
-            label_selector: std::collections::HashMap::new(),
-            initial_node_ids: Vec::new(),
-        });
-        admin_req.extensions_mut().insert(AuthenticatedPeer {
+        let admin_peer = AuthenticatedPeer {
             common_name: Some("ops".to_string()),
             organizational_unit: Some("Control Plane".to_string()),
             not_before_epoch_secs: 0,
             not_after_epoch_secs: i64::MAX,
             leaf_fingerprint_sha256: [0u8; 32],
             spki_der: Vec::new(),
+        };
+        let mut admin_req = Request::new(CreateNodeGroupRequest {
+            group_id: "rack-1".to_string(),
+            description: "Rack 1".to_string(),
+            label_selector: std::collections::HashMap::new(),
+            initial_node_ids: Vec::new(),
         });
+        admin_req.extensions_mut().insert(admin_peer.clone());
         let created = svc.create_node_group(admin_req).await.unwrap().into_inner();
         assert!(created.created);
 
         // SubmitTask with unknown node_group_affinity returns NOT_FOUND
         let mut bad_task = make_test_task("t-missing-grp");
         bad_task.node_group_affinity = "does-not-exist".to_string();
-        let task_err = svc
-            .submit_task(Request::new(SubmitTaskRequest {
-                task: Some(bad_task),
-            }))
-            .await
-            .unwrap_err();
+        let mut bad_task_req = Request::new(SubmitTaskRequest {
+            task: Some(bad_task),
+        });
+        bad_task_req.extensions_mut().insert(admin_peer);
+        let task_err = svc.submit_task(bad_task_req).await.unwrap_err();
         assert_eq!(task_err.code(), tonic::Code::NotFound);
     }
 
@@ -1248,7 +1309,8 @@ mod tests {
             Arc::new(ClusterScheduler::new()),
             artifact_store,
             "http://127.0.0.1:50052".to_string(),
-        );
+        )
+        .with_allow_unauthenticated(true);
         let mut task = make_test_task("t-apk-as-wasm");
         task.wasm_bytecode.clear();
         task.artifact_sha256 = sha;

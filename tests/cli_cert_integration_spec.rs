@@ -182,6 +182,82 @@ fn test_cli_cert_offline_lifecycle_and_json_output() {
     assert!(worker_cert_out.exists());
     assert!(worker_ca_out.exists());
 
+    // 6. Offline cert worker with --format json
+    let worker_out_dir = root.join("cli_worker");
+    let worker_out = Command::new(bin)
+        .args([
+            "--format",
+            "json",
+            "cert",
+            "worker",
+            "--node-id",
+            "node_cli_worker_01",
+            "--ca-dir",
+            pki_dir.to_str().unwrap(),
+            "--out",
+            worker_out_dir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to run cert worker");
+    assert!(
+        worker_out.status.success(),
+        "cert worker failed: {}",
+        String::from_utf8_lossy(&worker_out.stderr)
+    );
+    let worker_stdout = String::from_utf8_lossy(&worker_out.stdout);
+    let worker_stderr = String::from_utf8_lossy(&worker_out.stderr);
+    assert!(
+        !worker_stdout.contains("PRIVATE KEY"),
+        "Private key material must not be logged to stdout"
+    );
+    assert!(
+        !worker_stderr.contains("PRIVATE KEY"),
+        "Private key material must not be logged to stderr"
+    );
+    assert!(
+        worker_stderr.contains("Host-generated worker keypair bypasses hardware attestation"),
+        "Attestation warning must be emitted to stderr"
+    );
+    let worker_json: serde_json::Value =
+        serde_json::from_str(&worker_stdout).expect("worker stdout must be pure JSON");
+    assert_eq!(worker_json["action"], "cert worker");
+    assert_eq!(worker_json["node_id"], "node_cli_worker_01");
+    assert!(worker_out_dir.join("client.crt").exists());
+    assert!(worker_out_dir.join("client.key").exists());
+    assert!(worker_out_dir.join("ca.crt").exists());
+
+    // 7. Verify cert issue worker alias
+    let worker_alias_out_dir = root.join("cli_worker_alias");
+    let worker_alias_out = Command::new(bin)
+        .args([
+            "--format",
+            "json",
+            "cert",
+            "issue",
+            "worker",
+            "--node-id",
+            "node_cli_worker_alias",
+            "--ca-dir",
+            pki_dir.to_str().unwrap(),
+            "--out",
+            worker_alias_out_dir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to run cert issue worker alias");
+    assert!(
+        worker_alias_out.status.success(),
+        "cert issue worker alias failed: {}",
+        String::from_utf8_lossy(&worker_alias_out.stderr)
+    );
+    let worker_alias_stdout = String::from_utf8_lossy(&worker_alias_out.stdout);
+    let worker_alias_json: serde_json::Value =
+        serde_json::from_str(&worker_alias_stdout).expect("worker alias stdout must be pure JSON");
+    assert_eq!(worker_alias_json["action"], "cert worker");
+    assert_eq!(worker_alias_json["node_id"], "node_cli_worker_alias");
+    assert!(worker_alias_out_dir.join("client.crt").exists());
+    assert!(worker_alias_out_dir.join("client.key").exists());
+    assert!(worker_alias_out_dir.join("ca.crt").exists());
+
     let _ = fs::remove_dir_all(&root);
 }
 
@@ -198,8 +274,8 @@ async fn test_generated_pki_completes_live_mtls_handshake() {
         cert_init, cert_issue_csr, CaSource, PkiInitConfig, PkiIssueCsrConfig,
     };
     use androgrid_backend::{
-        build_client_mtls_config, build_server_mtls_config, AdminServiceImpl, ClusterScheduler,
-        ListWorkerNodesRequest,
+        build_client_mtls_config, build_server_mtls_config, require_client_mtls_interceptor,
+        AdminServiceImpl, ClusterScheduler, ListWorkerNodesRequest,
     };
 
     let root = temp_dir("mtls_handshake");
@@ -259,7 +335,10 @@ async fn test_generated_pki_completes_live_mtls_handshake() {
         Server::builder()
             .tls_config(server_tls)
             .unwrap()
-            .add_service(AdminServiceServer::new(admin_service))
+            .add_service(AdminServiceServer::with_interceptor(
+                admin_service,
+                require_client_mtls_interceptor,
+            ))
             .serve_with_incoming(incoming)
             .await
             .unwrap();
@@ -283,7 +362,7 @@ async fn test_generated_pki_completes_live_mtls_handshake() {
         .expect("AdminService with operator cert must succeed");
     assert!(resp.into_inner().nodes.is_empty());
 
-    // 2. CSR-signed worker cert (OU=Edge Compute) also completes the mTLS handshake
+    // 2. CSR-signed worker cert (OU=Edge Compute) completes mTLS handshake but is rejected by RBAC [INV-002]
     let worker_tls = build_client_mtls_config(&worker_cert, &worker_key_pem, &ca_pem, "localhost");
     let worker_channel = Channel::from_shared(endpoint_uri.clone())
         .unwrap()
@@ -293,10 +372,13 @@ async fn test_generated_pki_completes_live_mtls_handshake() {
         .await
         .expect("Worker mTLS handshake must succeed");
     let mut worker_client = AdminServiceClient::new(worker_channel);
-    worker_client
+    let worker_err = worker_client
         .list_worker_nodes(ListWorkerNodesRequest {})
         .await
-        .expect("Worker cert must be accepted by server mTLS trust store");
+        .expect_err(
+            "Worker cert (OU=Edge Compute) must be rejected with PermissionDenied by AdminService",
+        );
+    assert_eq!(worker_err.code(), tonic::Code::PermissionDenied);
 
     // 3. Untrusted self-signed client cert must be rejected by server mTLS
     let rogue_key = KeyPair::generate().unwrap();

@@ -1,0 +1,4 @@
+[target.'cfg(windows)']
+# Windows PE default stack is 1 MB. Expand to 8 MB to prevent STATUS_STACK_OVERFLOW
+# in unoptimized debug builds under deeply nested Tokio, Tonic, and Rustls async futures.
+rustflags = ["-C", "link-arg=/STACK:8388608"]

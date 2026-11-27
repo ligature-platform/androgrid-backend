@@ -116,6 +116,23 @@ pub struct PkiIssueCsrConfig {
     pub force: bool,
 }
 
+/// Parameters for generating a standalone worker P-256 keypair, CSR, and CA-signed client certificate (`cert worker`).
+///
+/// Traces to: AG-SPEC-2026-V2 Section 2.3, ADR-001, [INV-002], [NFR-SEC-001], [REQ-OP-001]
+#[derive(Debug, Clone)]
+pub struct PkiWorkerConfig {
+    /// Resolved source for the Root CA certificate and key.
+    pub ca_source: CaSource,
+    /// Expected worker node identifier (e.g. `node_Pixel_8_84cb0f6d`).
+    pub node_id: String,
+    /// Destination directory where `client.crt`, `client.key`, and `ca.crt` are written.
+    pub out_dir: PathBuf,
+    /// Certificate validity duration in days.
+    pub days: u32,
+    /// Allow overwriting existing certificate or key files.
+    pub force: bool,
+}
+
 /// Structured summary returned by `cert init` and `cert issue` subcommands.
 ///
 /// Never includes private key material.
@@ -235,7 +252,7 @@ pub fn cert_init(config: &PkiInitConfig) -> Result<PkiOperationSummary, PkiError
         sans: server_res.sans,
         cn: Some(config.admin_cn.clone()),
         node_id: None,
-        days_valid: config.days,
+        days_valid: server_res.days_valid,
         not_before: server_res.not_before,
         not_after: server_res.not_after,
     })
@@ -299,8 +316,9 @@ pub fn cert_issue_csr(config: &PkiIssueCsrConfig) -> Result<PkiOperationSummary,
     })?;
 
     let signer = load_ca_signer(&config.ca_source)?;
-    let (_, _, not_before_str, not_after_str) = build_validity_window(config.days)?;
     let signed = signer.sign_worker_csr_with_days(&csr_pem, &config.node_id, config.days)?;
+    let (effective_days, not_before_str, not_after_str) =
+        extract_cert_validity_rfc3339(&signed.client_cert_pem)?;
 
     if let Some(parent) = config.out_path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -339,7 +357,90 @@ pub fn cert_issue_csr(config: &PkiIssueCsrConfig) -> Result<PkiOperationSummary,
         sans: Vec::new(),
         cn: Some(config.node_id.clone()),
         node_id: Some(config.node_id.clone()),
-        days_valid: config.days,
+        days_valid: effective_days,
+        not_before: not_before_str,
+        not_after: not_after_str,
+    })
+}
+
+/// Generates a standalone ECDSA P-256 worker keypair, serializes a PKCS#10 CSR,
+/// signs it offline against the cluster Root CA via `CaSigner`, and writes
+/// `client.crt`, `client.key`, and `ca.crt` into `out_dir`.
+///
+/// Traces to: AG-SPEC-2026-V2 Section 2.3, ADR-001, [INV-002], [NFR-SEC-001], [REQ-OP-001]
+///
+/// # Parameters
+/// - `config`: PKI worker configuration containing CA source, target node ID, output path, and validity.
+///
+/// # Returns
+/// - `Ok(PkiOperationSummary)` detailing generated files, CA fingerprint, and validity timestamps.
+/// - `Err(PkiError)` if input validation fails, CA files cannot be loaded, or file collisions occur.
+///
+/// # Complexity
+/// - O(1) cryptographic key generation and signature operations.
+pub fn cert_worker(config: &PkiWorkerConfig) -> Result<PkiOperationSummary, PkiError> {
+    validate_days(config.days, "days")?;
+    validate_node_id(&config.node_id)?;
+
+    let client_crt_path = config.out_dir.join("client.crt");
+    let client_key_path = config.out_dir.join("client.key");
+    let ca_crt_path = config.out_dir.join("ca.crt");
+
+    if !config.force {
+        for path in [&client_crt_path, &client_key_path, &ca_crt_path] {
+            if path.exists() {
+                return Err(PkiError::AlreadyExists {
+                    path: path.display().to_string(),
+                });
+            }
+        }
+    }
+
+    let key_pair = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)?;
+    let key_pem = key_pair.serialize_pem();
+
+    let mut params = CertificateParams::default();
+    let mut dn = DistinguishedName::new();
+    dn.push(DnType::CommonName, &config.node_id);
+    params.distinguished_name = dn;
+
+    let csr = params.serialize_request(&key_pair)?;
+    let csr_pem = csr.pem()?;
+
+    let signer = load_ca_signer(&config.ca_source)?;
+    let signed = signer.sign_worker_csr_with_days(&csr_pem, &config.node_id, config.days)?;
+    let (effective_days, not_before_str, not_after_str) =
+        extract_cert_validity_rfc3339(&signed.client_cert_pem)?;
+
+    if !config.out_dir.as_os_str().is_empty() {
+        fs::create_dir_all(&config.out_dir).map_err(|e| PkiError::Io {
+            path: config.out_dir.display().to_string(),
+            source: e,
+        })?;
+    }
+
+    write_file_atomic(&client_key_path, key_pem.as_bytes(), true, config.force)?;
+    write_file_atomic(
+        &client_crt_path,
+        signed.client_cert_pem.as_bytes(),
+        false,
+        config.force,
+    )?;
+    let ca_content = format!("{}\n", signed.ca_cert_pem.trim());
+    write_file_atomic(&ca_crt_path, ca_content.as_bytes(), false, config.force)?;
+
+    Ok(PkiOperationSummary {
+        action: "cert worker".to_string(),
+        ca_fingerprint: signer.ca_fingerprint().to_string(),
+        files: vec![
+            ca_crt_path.display().to_string(),
+            client_crt_path.display().to_string(),
+            client_key_path.display().to_string(),
+        ],
+        sans: Vec::new(),
+        cn: Some(config.node_id.clone()),
+        node_id: Some(config.node_id.clone()),
+        days_valid: effective_days,
         not_before: not_before_str,
         not_after: not_after_str,
     })
@@ -372,7 +473,7 @@ fn issue_server_with_signer(
     })?;
 
     let (san_types, san_strings) = build_server_sans(extra_sans, no_default_sans)?;
-    let (not_before, not_after, not_before_str, not_after_str) = build_validity_window(days)?;
+    let (not_before, not_after, _, _) = build_validity_window(days)?;
 
     let mut params = CertificateParams::default();
     params.is_ca = IsCa::NoCa;
@@ -390,6 +491,8 @@ fn issue_server_with_signer(
 
     let server_key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)?;
     let server_cert = signer.sign_leaf_params(params, &server_key)?;
+    let (effective_days, not_before_str, not_after_str) =
+        extract_cert_validity_rfc3339(&server_cert.pem())?;
 
     // Fullchain PEM: leaf certificate followed by Root CA certificate for mobile pinning
     let fullchain_pem = format!(
@@ -412,7 +515,7 @@ fn issue_server_with_signer(
         sans: san_strings,
         cn: Some("localhost".to_string()),
         node_id: None,
-        days_valid: days,
+        days_valid: effective_days,
         not_before: not_before_str,
         not_after: not_after_str,
     })
@@ -443,7 +546,7 @@ fn issue_admin_with_signer(
         source: e,
     })?;
 
-    let (not_before, not_after, not_before_str, not_after_str) = build_validity_window(days)?;
+    let (not_before, not_after, _, _) = build_validity_window(days)?;
 
     let mut params = CertificateParams::default();
     params.is_ca = IsCa::NoCa;
@@ -460,6 +563,8 @@ fn issue_admin_with_signer(
 
     let admin_key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)?;
     let admin_cert = signer.sign_leaf_params(params, &admin_key)?;
+    let (effective_days, not_before_str, not_after_str) =
+        extract_cert_validity_rfc3339(&admin_cert.pem())?;
 
     write_file_atomic(&key_path, admin_key.serialize_pem().as_bytes(), true, true)?;
     write_file_atomic(&cert_path, admin_cert.pem().as_bytes(), false, true)?;
@@ -474,7 +579,7 @@ fn issue_admin_with_signer(
         sans: Vec::new(),
         cn: Some(cn.to_string()),
         node_id: None,
-        days_valid: days,
+        days_valid: effective_days,
         not_before: not_before_str,
         not_after: not_after_str,
     })
@@ -627,10 +732,51 @@ fn build_validity_window(
     Ok((not_before, not_after, not_before_str, not_after_str))
 }
 
+/// Extracts the exact `notBefore` and `notAfter` timestamps directly from a PEM certificate,
+/// computes the effective validity duration in days,
+/// and formats them as RFC 3339 strings to ensure zero clock skew against the issued artifact.
+fn extract_cert_validity_rfc3339(cert_pem: &str) -> Result<(u32, String, String), PkiError> {
+    let pem_blocks: Vec<pem::Pem> = pem::parse_many(cert_pem).map_err(|e| {
+        PkiError::Signer(SignerError::SigningFailed(format!(
+            "Failed to parse certificate PEM: {e}"
+        )))
+    })?;
+    let cert_block = pem_blocks
+        .into_iter()
+        .find(|p| p.tag() == "CERTIFICATE")
+        .ok_or_else(|| {
+            PkiError::Signer(SignerError::SigningFailed(
+                "No CERTIFICATE block found in PEM".to_string(),
+            ))
+        })?;
+    let (_, cert) = x509_parser::parse_x509_certificate(cert_block.contents()).map_err(|e| {
+        PkiError::Signer(SignerError::SigningFailed(format!(
+            "Failed to parse X.509 certificate: {e}"
+        )))
+    })?;
+    let nb_secs = cert.validity().not_before.timestamp();
+    let na_secs = cert.validity().not_after.timestamp();
+    let effective_days = ((na_secs - nb_secs).max(0) / 86_400) as u32;
+    let not_before = OffsetDateTime::from_unix_timestamp(nb_secs)
+        .map_err(|e| PkiError::Signer(SignerError::SigningFailed(e.to_string())))?
+        .format(&Rfc3339)
+        .map_err(|e| PkiError::Signer(SignerError::SigningFailed(e.to_string())))?;
+    let not_after = OffsetDateTime::from_unix_timestamp(na_secs)
+        .map_err(|e| PkiError::Signer(SignerError::SigningFailed(e.to_string())))?
+        .format(&Rfc3339)
+        .map_err(|e| PkiError::Signer(SignerError::SigningFailed(e.to_string())))?;
+    Ok((effective_days, not_before, not_after))
+}
+
 fn validate_days(days: u32, flag_name: &str) -> Result<(), PkiError> {
     if days == 0 {
         return Err(PkiError::InvalidArgument(format!(
             "--{flag_name} must be greater than 0"
+        )));
+    }
+    if days > 36_500 {
+        return Err(PkiError::InvalidArgument(format!(
+            "--{flag_name} must not exceed 36500 days (100 years)"
         )));
     }
     Ok(())
@@ -1124,5 +1270,213 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_cert_worker_creates_valid_keypair_and_signed_cert() {
+        let dir = temp_test_dir("worker");
+        let _init_summary = cert_init(&PkiInitConfig {
+            out_dir: dir.clone(),
+            extra_sans: vec!["127.0.0.1".to_string()],
+            no_default_sans: false,
+            ca_days: 1825,
+            days: 365,
+            admin_cn: "operator".to_string(),
+            force: false,
+        })
+        .unwrap();
+
+        let worker_dir = dir.join("worker_out");
+        let node_id = "node_Pixel_8_84cb0f6d";
+
+        let summary = cert_worker(&PkiWorkerConfig {
+            ca_source: CaSource::Dir(dir.clone()),
+            node_id: node_id.to_string(),
+            out_dir: worker_dir.clone(),
+            days: 365,
+            force: false,
+        })
+        .unwrap();
+
+        assert_eq!(summary.action, "cert worker");
+        assert_eq!(summary.cn.as_deref(), Some(node_id));
+        assert_eq!(summary.node_id.as_deref(), Some(node_id));
+        assert_eq!(summary.days_valid, 365);
+
+        let client_crt = worker_dir.join("client.crt");
+        let client_key = worker_dir.join("client.key");
+        let ca_crt = worker_dir.join("ca.crt");
+
+        assert!(client_crt.exists());
+        assert!(client_key.exists());
+        assert!(ca_crt.exists());
+
+        // Verify X.509 certificate attributes, SANs, and key usages [INV-002], [NFR-SEC-001]
+        let crt_bytes = fs::read(&client_crt).unwrap();
+        let pem_blocks = pem::parse_many(&crt_bytes).unwrap();
+        let cert_block = pem_blocks
+            .into_iter()
+            .find(|p| p.tag() == "CERTIFICATE")
+            .unwrap();
+        let (_, cert) = x509_parser::parse_x509_certificate(cert_block.contents()).unwrap();
+
+        assert!(!cert.is_ca(), "Worker cert must have CA:FALSE");
+        assert!(
+            cert.subject_alternative_name().unwrap().is_none(),
+            "Worker cert must not contain SANs"
+        );
+
+        let cn = cert
+            .subject()
+            .iter_common_name()
+            .next()
+            .unwrap()
+            .as_str()
+            .unwrap();
+        assert_eq!(cn, node_id, "Worker cert CN must match node_id");
+
+        let ou = cert
+            .subject()
+            .iter_organizational_unit()
+            .next()
+            .unwrap()
+            .as_str()
+            .unwrap();
+        assert_eq!(ou, "Edge Compute", "Worker cert OU must be Edge Compute");
+
+        let org = cert
+            .subject()
+            .iter_organization()
+            .next()
+            .unwrap()
+            .as_str()
+            .unwrap();
+        assert_eq!(
+            org, "AndroGrid Worker",
+            "Worker cert O must be AndroGrid Worker"
+        );
+
+        let eku = cert.extended_key_usage().unwrap().unwrap().value;
+        assert!(eku.client_auth, "Worker cert must have EKU ClientAuth");
+        assert!(!eku.server_auth, "Worker cert must not have EKU ServerAuth");
+        assert!(
+            !eku.code_signing,
+            "Worker cert must not have EKU CodeSigning"
+        );
+
+        let ku = cert.key_usage().unwrap().unwrap().value;
+        assert!(
+            ku.digital_signature(),
+            "Worker cert must have KeyUsage DigitalSignature"
+        );
+        assert!(
+            !ku.key_cert_sign(),
+            "Worker cert must not have KeyUsage KeyCertSign"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let meta = fs::metadata(&client_key).unwrap();
+            let mode = meta.permissions().mode() & 0o777;
+            assert_eq!(
+                mode, 0o600,
+                "Private key must be restricted to 0600 on Unix"
+            );
+        }
+
+        // Verify Tonic client mTLS configuration accepts generated client cert and key against CA
+        let _client_tls = build_client_mtls_config(
+            &fs::read(&client_crt).unwrap(),
+            &fs::read(&client_key).unwrap(),
+            &fs::read(&ca_crt).unwrap(),
+            node_id,
+        );
+
+        // Verify refusal to overwrite without force
+        let err = cert_worker(&PkiWorkerConfig {
+            ca_source: CaSource::Dir(dir.clone()),
+            node_id: node_id.to_string(),
+            out_dir: worker_dir.clone(),
+            days: 365,
+            force: false,
+        })
+        .unwrap_err();
+        assert!(matches!(err, PkiError::AlreadyExists { .. }));
+
+        // Verify overwrite with force
+        let force_summary = cert_worker(&PkiWorkerConfig {
+            ca_source: CaSource::Dir(dir.clone()),
+            node_id: node_id.to_string(),
+            out_dir: worker_dir.clone(),
+            days: 180,
+            force: true,
+        })
+        .unwrap();
+        assert_eq!(force_summary.days_valid, 180);
+
+        // Verify invalid node_id validation
+        let invalid_node_err = cert_worker(&PkiWorkerConfig {
+            ca_source: CaSource::Dir(dir.clone()),
+            node_id: "invalid node with spaces".to_string(),
+            out_dir: dir.join("worker_err"),
+            days: 365,
+            force: false,
+        })
+        .unwrap_err();
+        assert!(matches!(invalid_node_err, PkiError::InvalidArgument(_)));
+
+        // Verify invalid days validation
+        let invalid_days_err = cert_worker(&PkiWorkerConfig {
+            ca_source: CaSource::Dir(dir.clone()),
+            node_id: "node_valid_123".to_string(),
+            out_dir: dir.join("worker_err"),
+            days: 0,
+            force: false,
+        })
+        .unwrap_err();
+        assert!(matches!(invalid_days_err, PkiError::InvalidArgument(_)));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_cert_worker_summary_reflects_clamped_days_valid() {
+        let dir = temp_test_dir("worker_clamped");
+        // Create CA with 10 days validity
+        let _init = cert_init(&PkiInitConfig {
+            out_dir: dir.clone(),
+            extra_sans: vec![],
+            no_default_sans: false,
+            admin_cn: "test-admin".to_string(),
+            ca_days: 10,
+            days: 10,
+            force: true,
+        })
+        .unwrap();
+
+        let worker_dir = dir.join("worker");
+        // Request 365 days; should be clamped to CA's remaining ~10 days
+        let summary = cert_worker(&PkiWorkerConfig {
+            ca_source: CaSource::Dir(dir.clone()),
+            node_id: "node_clamped_test".to_string(),
+            out_dir: worker_dir,
+            days: 365,
+            force: true,
+        })
+        .unwrap();
+
+        assert!(
+            summary.days_valid <= 10,
+            "Worker cert validity must be clamped by CA remaining lifetime, got: {}",
+            summary.days_valid
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_validate_days_rejects_exorbitant_values() {
+        let err = validate_days(50_000, "days").unwrap_err();
+        assert!(matches!(err, PkiError::InvalidArgument(_)));
     }
 }

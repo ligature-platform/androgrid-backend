@@ -6,7 +6,7 @@
 //! Traces to: AG-SPEC-2026-V2, [REQ-OP-001], [REQ-OP-004], [INV-002], [NFR-SEC-001], [NFR-PERF-001]
 
 use clap::parser::ValueSource;
-use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
+use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -15,16 +15,17 @@ use std::time::SystemTime;
 use androgrid_backend::admin_service_client::AdminServiceClient;
 use androgrid_backend::{
     build_client_mtls_config, cert_init, cert_issue_admin, cert_issue_csr, cert_issue_server,
-    export_png, render_ansi_qr, ArtifactPackager, AssignNodesToGroupRequest, BenchmarkConfig,
-    BenchmarkDispatcher, BenchmarkFilter, CaSource, CancelTaskGroupRequest, CancelTaskRequest,
-    CreateNodeGroupRequest, DrainNodesRequest, ExecutionEngine, GeneratePairingTokenRequest,
-    GetTaskGroupStatusRequest, GetTaskStatusRequest, ListNodeGroupsRequest, ListTaskGroupsRequest,
-    ListTasksRequest, ListWorkerNodesRequest, NetworkEgressPolicy, PkiInitConfig,
-    PkiIssueAdminConfig, PkiIssueCsrConfig, PkiIssueServerConfig, PkiOperationSummary,
-    ReplaceStrategy, ReplaceTaskGroupRequest, SubmitTaskGroupRequest, SubmitTaskRequest,
-    TaskGroupSpec, TaskGroupState, TaskPartitionSpec, TaskSpec, TaskState, TaskTemplate,
-    TerminalGuard, TuiAction, TuiApp, UpdateNodeGroupRequest, UpgradeNetworkPolicy,
-    UpgradeNodesRequest, UpgradeRolloutStrategy, UploadArtifactRequest, WasiValidator,
+    cert_worker, export_png, render_ansi_qr, ArtifactPackager, AssignNodesToGroupRequest,
+    BenchmarkConfig, BenchmarkDispatcher, BenchmarkFilter, CaSource, CancelTaskGroupRequest,
+    CancelTaskRequest, CreateNodeGroupRequest, DrainNodesRequest, ExecutionEngine,
+    GeneratePairingTokenRequest, GetTaskGroupStatusRequest, GetTaskStatusRequest,
+    ListNodeGroupsRequest, ListTaskGroupsRequest, ListTasksRequest, ListWorkerNodesRequest,
+    NetworkEgressPolicy, PkiInitConfig, PkiIssueAdminConfig, PkiIssueCsrConfig,
+    PkiIssueServerConfig, PkiOperationSummary, PkiWorkerConfig, ReplaceStrategy,
+    ReplaceTaskGroupRequest, SubmitTaskGroupRequest, SubmitTaskRequest, TaskGroupSpec,
+    TaskGroupState, TaskPartitionSpec, TaskSpec, TaskState, TaskTemplate, TerminalGuard, TuiAction,
+    TuiApp, UpdateNodeGroupRequest, UpgradeNetworkPolicy, UpgradeNodesRequest,
+    UpgradeRolloutStrategy, UploadArtifactRequest, WasiValidator,
 };
 
 #[derive(Parser, Debug)]
@@ -564,6 +565,38 @@ enum CertCommands {
         #[command(subcommand)]
         target: CertIssueCommands,
     },
+
+    /// Generate a standalone worker P-256 keypair, CSR, and CA-signed client certificate
+    /// Traces to: [INV-002], [NFR-SEC-001], [REQ-OP-001]
+    Worker(CertWorkerArgs),
+}
+
+/// Command-line arguments for standalone worker PKI generation (`cert worker` and `cert issue worker`).
+#[derive(Args, Debug, Clone)]
+pub struct CertWorkerArgs {
+    /// Expected worker node identifier (e.g. node_Pixel_8_84cb0f6d)
+    #[arg(long)]
+    pub node_id: String,
+
+    /// Directory containing existing CA files (defaults to ./pki when --ca-key is omitted)
+    #[arg(long, conflicts_with = "ca_key")]
+    pub ca_dir: Option<PathBuf>,
+
+    /// Explicit path to Root CA private key PEM (requires --ca-cert)
+    #[arg(long, conflicts_with = "ca_dir")]
+    pub ca_key: Option<PathBuf>,
+
+    /// Output directory for worker PKI hierarchy (writes client.crt, client.key, ca.crt)
+    #[arg(long, default_value = "./pki/worker")]
+    pub out: PathBuf,
+
+    /// Certificate validity in days (default: 365)
+    #[arg(long, default_value_t = 365)]
+    pub days: u32,
+
+    /// Allow overwriting existing output certificate/key file(s)
+    #[arg(long)]
+    pub force: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -660,6 +693,10 @@ enum CertIssueCommands {
         #[arg(long)]
         force: bool,
     },
+
+    /// Generate a standalone worker P-256 keypair, CSR, and CA-signed client certificate
+    /// Traces to: [INV-002], [NFR-SEC-001], [REQ-OP-001]
+    Worker(CertWorkerArgs),
 }
 
 /// Parses KEY=VALUE command-line strings into pairs.
@@ -1715,9 +1752,36 @@ fn handle_cert_command(
                     })?;
                     print_cert_summary(&summary, format, None)?;
                 }
+                CertIssueCommands::Worker(args) => {
+                    handle_cert_worker(args, global_ca_cert, ca_cert_from_cli, format)?;
+                }
             }
         }
+        CertCommands::Worker(args) => {
+            handle_cert_worker(args, global_ca_cert, ca_cert_from_cli, format)?;
+        }
     }
+    Ok(())
+}
+
+fn handle_cert_worker(
+    args: CertWorkerArgs,
+    global_ca_cert: Option<&Path>,
+    ca_cert_from_cli: bool,
+    format: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    eprintln!(
+        "[!] Notice: Host-generated worker keypair bypasses hardware attestation (ADR-009). Intended for testing or headless runtimes."
+    );
+    let ca_source = resolve_ca_source(args.ca_dir, global_ca_cert, ca_cert_from_cli, args.ca_key)?;
+    let summary = cert_worker(&PkiWorkerConfig {
+        ca_source,
+        node_id: args.node_id,
+        out_dir: args.out,
+        days: args.days,
+        force: args.force,
+    })?;
+    print_cert_summary(&summary, format, None)?;
     Ok(())
 }
 
@@ -2849,6 +2913,83 @@ mod tests {
         ])
         .expect("cert issue server with explicit CA files should parse");
         assert_eq!(issue_srv.ca_cert, Some(PathBuf::from("/tmp/ca.crt")));
+
+        let worker_cli = Cli::try_parse_from([
+            "androgrid-cli",
+            "cert",
+            "worker",
+            "--node-id",
+            "node_Pixel_8_84cb0f6d",
+            "--ca-dir",
+            "/tmp/pki",
+            "--out",
+            "/tmp/worker_pki",
+            "--days",
+            "180",
+            "--force",
+        ])
+        .expect("cert worker parse should succeed");
+        match worker_cli.command {
+            Commands::Cert {
+                action:
+                    CertCommands::Worker(CertWorkerArgs {
+                        node_id,
+                        ca_dir,
+                        ca_key,
+                        out,
+                        days,
+                        force,
+                    }),
+            } => {
+                assert_eq!(node_id, "node_Pixel_8_84cb0f6d");
+                assert_eq!(ca_dir, Some(PathBuf::from("/tmp/pki")));
+                assert_eq!(ca_key, None);
+                assert_eq!(out, PathBuf::from("/tmp/worker_pki"));
+                assert_eq!(days, 180);
+                assert!(force);
+            }
+            _ => panic!("Expected Cert Worker"),
+        }
+
+        let issue_worker_cli = Cli::try_parse_from([
+            "androgrid-cli",
+            "cert",
+            "issue",
+            "worker",
+            "--node-id",
+            "node_Redmi_Note_5",
+            "--ca-cert",
+            "/tmp/ca.crt",
+            "--ca-key",
+            "/tmp/ca.key",
+            "--out",
+            "/tmp/redmi_pki",
+        ])
+        .expect("cert issue worker parse should succeed");
+        match issue_worker_cli.command {
+            Commands::Cert {
+                action:
+                    CertCommands::Issue {
+                        target:
+                            CertIssueCommands::Worker(CertWorkerArgs {
+                                node_id,
+                                ca_dir,
+                                ca_key,
+                                out,
+                                days,
+                                force,
+                            }),
+                    },
+            } => {
+                assert_eq!(node_id, "node_Redmi_Note_5");
+                assert_eq!(ca_dir, None);
+                assert_eq!(ca_key, Some(PathBuf::from("/tmp/ca.key")));
+                assert_eq!(out, PathBuf::from("/tmp/redmi_pki"));
+                assert_eq!(days, 365);
+                assert!(!force);
+            }
+            _ => panic!("Expected Cert Issue Worker"),
+        }
     }
 
     #[test]
