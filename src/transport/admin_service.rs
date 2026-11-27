@@ -40,6 +40,8 @@ pub struct AdminServiceImpl {
 
 impl AdminServiceImpl {
     /// Constructs a new AdminServiceImpl with the shared cluster scheduler.
+    ///
+    /// Defaults to fail-closed authorization (`allow_unauthenticated: false`).
     pub fn new(scheduler: Arc<ClusterScheduler>) -> Self {
         Self {
             scheduler,
@@ -48,11 +50,13 @@ impl AdminServiceImpl {
             token_store: Arc::new(PairingTokenStore::default()),
             ca_fingerprint: String::new(),
             cluster_endpoint: "https://127.0.0.1:50051".to_string(),
-            allow_unauthenticated: true,
+            allow_unauthenticated: false,
         }
     }
 
     /// Constructs an AdminServiceImpl with explicit artifact store and base URL injection.
+    ///
+    /// Defaults to fail-closed authorization (`allow_unauthenticated: false`).
     ///
     /// Traces to: [NFR-PERF-001], [REQ-OP-003]
     pub fn with_artifact_store(
@@ -67,11 +71,13 @@ impl AdminServiceImpl {
             token_store: Arc::new(PairingTokenStore::default()),
             ca_fingerprint: String::new(),
             cluster_endpoint: "https://127.0.0.1:50051".to_string(),
-            allow_unauthenticated: true,
+            allow_unauthenticated: false,
         }
     }
 
     /// Constructs an AdminServiceImpl with full artifact and pairing subsystem injection.
+    ///
+    /// Defaults to fail-closed authorization (`allow_unauthenticated: false`).
     ///
     /// Traces to: [INV-002], [NFR-SEC-001], [REQ-OP-001]
     pub fn with_services(
@@ -89,14 +95,14 @@ impl AdminServiceImpl {
             token_store,
             ca_fingerprint,
             cluster_endpoint,
-            allow_unauthenticated: true,
+            allow_unauthenticated: false,
         }
     }
 
     /// Configures whether requests without client mTLS identity are permitted.
     ///
-    /// Defaults to `true` on standalone constructors for unit testing convenience.
-    /// In production deployments, setting this to `false` enforces fail-closed authorization.
+    /// Defaults to `false` (fail-closed secure by default).
+    /// Can be explicitly set to `true` in unauthenticated mock unit tests or plaintext dev mode.
     pub fn with_allow_unauthenticated(mut self, allow: bool) -> Self {
         self.allow_unauthenticated = allow;
         self
@@ -714,9 +720,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_admin_service_defaults_to_fail_closed_unauthenticated() {
+        let scheduler = Arc::new(ClusterScheduler::new());
+        let service = AdminServiceImpl::new(scheduler);
+        let err = service
+            .list_worker_nodes(Request::new(ListWorkerNodesRequest {}))
+            .await
+            .expect_err("Default constructor must reject unauthenticated requests [INV-002]");
+        assert_eq!(err.code(), tonic::Code::Unauthenticated);
+    }
+
+    #[tokio::test]
     async fn test_submit_task_and_get_status() {
         let scheduler = Arc::new(ClusterScheduler::new());
-        let service = AdminServiceImpl::new(Arc::clone(&scheduler));
+        let service = AdminServiceImpl::new(Arc::clone(&scheduler)).with_allow_unauthenticated(true);
 
         let task = make_test_task("task_admin_01");
         let submit_res = service
@@ -741,7 +758,7 @@ mod tests {
     #[tokio::test]
     async fn test_cancel_pending_task() {
         let scheduler = Arc::new(ClusterScheduler::new());
-        let service = AdminServiceImpl::new(Arc::clone(&scheduler));
+        let service = AdminServiceImpl::new(Arc::clone(&scheduler)).with_allow_unauthenticated(true);
 
         let task = make_test_task("task_cancel_01");
         service
@@ -772,7 +789,7 @@ mod tests {
     #[tokio::test]
     async fn test_list_worker_nodes() {
         let scheduler = Arc::new(ClusterScheduler::new());
-        let service = AdminServiceImpl::new(Arc::clone(&scheduler));
+        let service = AdminServiceImpl::new(Arc::clone(&scheduler)).with_allow_unauthenticated(true);
 
         let caps = NodeCapabilities {
             is_rooted: false,
@@ -820,7 +837,8 @@ mod tests {
             Arc::clone(&token_store),
             "fingerprint_12345".to_string(),
             "https://10.0.0.1:50051".to_string(),
-        );
+        )
+        .with_allow_unauthenticated(true);
 
         let req = GeneratePairingTokenRequest {
             node_id: "test-node-pair".to_string(),
@@ -855,7 +873,8 @@ mod tests {
             Arc::clone(&token_store),
             "fp_abc".to_string(),
             "https://10.0.0.1:50051".to_string(),
-        );
+        )
+        .with_allow_unauthenticated(true);
 
         let res_default = service
             .generate_pairing_token(Request::new(GeneratePairingTokenRequest {
@@ -893,7 +912,8 @@ mod tests {
             token_store,
             "fp_abc".to_string(),
             "https://127.0.0.1:50051".to_string(),
-        );
+        )
+        .with_allow_unauthenticated(true);
 
         let missing_sha = "a".repeat(64);
         let err = service
@@ -1028,7 +1048,8 @@ mod tests {
             scheduler,
             artifact_store,
             "http://127.0.0.1:50052".to_string(),
-        );
+        )
+        .with_allow_unauthenticated(true);
 
         let err = svc
             .upload_artifact(Request::new(UploadArtifactRequest {
@@ -1043,7 +1064,7 @@ mod tests {
     #[tokio::test]
     async fn test_submit_task_rejects_caller_group_spoofing() {
         let scheduler = Arc::new(ClusterScheduler::new());
-        let svc = AdminServiceImpl::new(scheduler);
+        let svc = AdminServiceImpl::new(scheduler).with_allow_unauthenticated(true);
         let mut spec = make_test_task("spoof-task");
         spec.group_id = "fake-group".to_string();
         spec.group_epoch = 1;
@@ -1070,7 +1091,8 @@ mod tests {
             scheduler,
             artifact_store,
             "http://127.0.0.1:50052".to_string(),
-        );
+        )
+        .with_allow_unauthenticated(true);
 
         let mut worker_req = Request::new(ListTaskGroupsRequest { state_filter: 0 });
         worker_req.extensions_mut().insert(AuthenticatedPeer {
@@ -1229,30 +1251,33 @@ mod tests {
         );
 
         // Admin peer creates group
-        let mut admin_req = Request::new(CreateNodeGroupRequest {
-            group_id: "rack-1".to_string(),
-            description: "Rack 1".to_string(),
-            label_selector: std::collections::HashMap::new(),
-            initial_node_ids: Vec::new(),
-        });
-        admin_req.extensions_mut().insert(AuthenticatedPeer {
+        let admin_peer = AuthenticatedPeer {
             common_name: Some("ops".to_string()),
             organizational_unit: Some("Control Plane".to_string()),
             not_before_epoch_secs: 0,
             not_after_epoch_secs: i64::MAX,
             leaf_fingerprint_sha256: [0u8; 32],
             spki_der: Vec::new(),
+        };
+        let mut admin_req = Request::new(CreateNodeGroupRequest {
+            group_id: "rack-1".to_string(),
+            description: "Rack 1".to_string(),
+            label_selector: std::collections::HashMap::new(),
+            initial_node_ids: Vec::new(),
         });
+        admin_req.extensions_mut().insert(admin_peer.clone());
         let created = svc.create_node_group(admin_req).await.unwrap().into_inner();
         assert!(created.created);
 
         // SubmitTask with unknown node_group_affinity returns NOT_FOUND
         let mut bad_task = make_test_task("t-missing-grp");
         bad_task.node_group_affinity = "does-not-exist".to_string();
+        let mut bad_task_req = Request::new(SubmitTaskRequest {
+            task: Some(bad_task),
+        });
+        bad_task_req.extensions_mut().insert(admin_peer);
         let task_err = svc
-            .submit_task(Request::new(SubmitTaskRequest {
-                task: Some(bad_task),
-            }))
+            .submit_task(bad_task_req)
             .await
             .unwrap_err();
         assert_eq!(task_err.code(), tonic::Code::NotFound);
@@ -1284,7 +1309,8 @@ mod tests {
             Arc::new(ClusterScheduler::new()),
             artifact_store,
             "http://127.0.0.1:50052".to_string(),
-        );
+        )
+        .with_allow_unauthenticated(true);
         let mut task = make_test_task("t-apk-as-wasm");
         task.wasm_bytecode.clear();
         task.artifact_sha256 = sha;
