@@ -252,7 +252,7 @@ pub fn cert_init(config: &PkiInitConfig) -> Result<PkiOperationSummary, PkiError
         sans: server_res.sans,
         cn: Some(config.admin_cn.clone()),
         node_id: None,
-        days_valid: config.days,
+        days_valid: server_res.days_valid,
         not_before: server_res.not_before,
         not_after: server_res.not_after,
     })
@@ -317,7 +317,8 @@ pub fn cert_issue_csr(config: &PkiIssueCsrConfig) -> Result<PkiOperationSummary,
 
     let signer = load_ca_signer(&config.ca_source)?;
     let signed = signer.sign_worker_csr_with_days(&csr_pem, &config.node_id, config.days)?;
-    let (not_before_str, not_after_str) = extract_cert_validity_rfc3339(&signed.client_cert_pem)?;
+    let (effective_days, not_before_str, not_after_str) =
+        extract_cert_validity_rfc3339(&signed.client_cert_pem)?;
 
     if let Some(parent) = config.out_path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -356,7 +357,7 @@ pub fn cert_issue_csr(config: &PkiIssueCsrConfig) -> Result<PkiOperationSummary,
         sans: Vec::new(),
         cn: Some(config.node_id.clone()),
         node_id: Some(config.node_id.clone()),
-        days_valid: config.days,
+        days_valid: effective_days,
         not_before: not_before_str,
         not_after: not_after_str,
     })
@@ -408,7 +409,8 @@ pub fn cert_worker(config: &PkiWorkerConfig) -> Result<PkiOperationSummary, PkiE
 
     let signer = load_ca_signer(&config.ca_source)?;
     let signed = signer.sign_worker_csr_with_days(&csr_pem, &config.node_id, config.days)?;
-    let (not_before_str, not_after_str) = extract_cert_validity_rfc3339(&signed.client_cert_pem)?;
+    let (effective_days, not_before_str, not_after_str) =
+        extract_cert_validity_rfc3339(&signed.client_cert_pem)?;
 
     if !config.out_dir.as_os_str().is_empty() {
         fs::create_dir_all(&config.out_dir).map_err(|e| PkiError::Io {
@@ -438,7 +440,7 @@ pub fn cert_worker(config: &PkiWorkerConfig) -> Result<PkiOperationSummary, PkiE
         sans: Vec::new(),
         cn: Some(config.node_id.clone()),
         node_id: Some(config.node_id.clone()),
-        days_valid: config.days,
+        days_valid: effective_days,
         not_before: not_before_str,
         not_after: not_after_str,
     })
@@ -471,7 +473,7 @@ fn issue_server_with_signer(
     })?;
 
     let (san_types, san_strings) = build_server_sans(extra_sans, no_default_sans)?;
-    let (not_before, not_after, not_before_str, not_after_str) = build_validity_window(days)?;
+    let (not_before, not_after, _, _) = build_validity_window(days)?;
 
     let mut params = CertificateParams::default();
     params.is_ca = IsCa::NoCa;
@@ -489,6 +491,8 @@ fn issue_server_with_signer(
 
     let server_key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)?;
     let server_cert = signer.sign_leaf_params(params, &server_key)?;
+    let (effective_days, not_before_str, not_after_str) =
+        extract_cert_validity_rfc3339(&server_cert.pem())?;
 
     // Fullchain PEM: leaf certificate followed by Root CA certificate for mobile pinning
     let fullchain_pem = format!(
@@ -511,7 +515,7 @@ fn issue_server_with_signer(
         sans: san_strings,
         cn: Some("localhost".to_string()),
         node_id: None,
-        days_valid: days,
+        days_valid: effective_days,
         not_before: not_before_str,
         not_after: not_after_str,
     })
@@ -542,7 +546,7 @@ fn issue_admin_with_signer(
         source: e,
     })?;
 
-    let (not_before, not_after, not_before_str, not_after_str) = build_validity_window(days)?;
+    let (not_before, not_after, _, _) = build_validity_window(days)?;
 
     let mut params = CertificateParams::default();
     params.is_ca = IsCa::NoCa;
@@ -559,6 +563,8 @@ fn issue_admin_with_signer(
 
     let admin_key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)?;
     let admin_cert = signer.sign_leaf_params(params, &admin_key)?;
+    let (effective_days, not_before_str, not_after_str) =
+        extract_cert_validity_rfc3339(&admin_cert.pem())?;
 
     write_file_atomic(&key_path, admin_key.serialize_pem().as_bytes(), true, true)?;
     write_file_atomic(&cert_path, admin_cert.pem().as_bytes(), false, true)?;
@@ -573,7 +579,7 @@ fn issue_admin_with_signer(
         sans: Vec::new(),
         cn: Some(cn.to_string()),
         node_id: None,
-        days_valid: days,
+        days_valid: effective_days,
         not_before: not_before_str,
         not_after: not_after_str,
     })
@@ -726,9 +732,10 @@ fn build_validity_window(
     Ok((not_before, not_after, not_before_str, not_after_str))
 }
 
-/// Extracts the exact `notBefore` and `notAfter` timestamps directly from a PEM certificate
+/// Extracts the exact `notBefore` and `notAfter` timestamps directly from a PEM certificate,
+/// computes the effective validity duration in days,
 /// and formats them as RFC 3339 strings to ensure zero clock skew against the issued artifact.
-fn extract_cert_validity_rfc3339(cert_pem: &str) -> Result<(String, String), PkiError> {
+fn extract_cert_validity_rfc3339(cert_pem: &str) -> Result<(u32, String, String), PkiError> {
     let pem_blocks: Vec<pem::Pem> = pem::parse_many(cert_pem).map_err(|e| {
         PkiError::Signer(SignerError::SigningFailed(format!(
             "Failed to parse certificate PEM: {e}"
@@ -749,6 +756,7 @@ fn extract_cert_validity_rfc3339(cert_pem: &str) -> Result<(String, String), Pki
     })?;
     let nb_secs = cert.validity().not_before.timestamp();
     let na_secs = cert.validity().not_after.timestamp();
+    let effective_days = ((na_secs - nb_secs).max(0) / 86_400) as u32;
     let not_before = OffsetDateTime::from_unix_timestamp(nb_secs)
         .map_err(|e| PkiError::Signer(SignerError::SigningFailed(e.to_string())))?
         .format(&Rfc3339)
@@ -757,13 +765,18 @@ fn extract_cert_validity_rfc3339(cert_pem: &str) -> Result<(String, String), Pki
         .map_err(|e| PkiError::Signer(SignerError::SigningFailed(e.to_string())))?
         .format(&Rfc3339)
         .map_err(|e| PkiError::Signer(SignerError::SigningFailed(e.to_string())))?;
-    Ok((not_before, not_after))
+    Ok((effective_days, not_before, not_after))
 }
 
 fn validate_days(days: u32, flag_name: &str) -> Result<(), PkiError> {
     if days == 0 {
         return Err(PkiError::InvalidArgument(format!(
             "--{flag_name} must be greater than 0"
+        )));
+    }
+    if days > 36_500 {
+        return Err(PkiError::InvalidArgument(format!(
+            "--{flag_name} must not exceed 36500 days (100 years)"
         )));
     }
     Ok(())
@@ -1425,5 +1438,45 @@ mod tests {
         assert!(matches!(invalid_days_err, PkiError::InvalidArgument(_)));
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_cert_worker_summary_reflects_clamped_days_valid() {
+        let dir = temp_test_dir("worker_clamped");
+        // Create CA with 10 days validity
+        let _init = cert_init(&PkiInitConfig {
+            out_dir: dir.clone(),
+            extra_sans: vec![],
+            no_default_sans: false,
+            admin_cn: "test-admin".to_string(),
+            ca_days: 10,
+            days: 10,
+            force: true,
+        })
+        .unwrap();
+
+        let worker_dir = dir.join("worker");
+        // Request 365 days; should be clamped to CA's remaining ~10 days
+        let summary = cert_worker(&PkiWorkerConfig {
+            ca_source: CaSource::Dir(dir.clone()),
+            node_id: "node_clamped_test".to_string(),
+            out_dir: worker_dir,
+            days: 365,
+            force: true,
+        })
+        .unwrap();
+
+        assert!(
+            summary.days_valid <= 10,
+            "Worker cert validity must be clamped by CA remaining lifetime, got: {}",
+            summary.days_valid
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_validate_days_rejects_exorbitant_values() {
+        let err = validate_days(50_000, "days").unwrap_err();
+        assert!(matches!(err, PkiError::InvalidArgument(_)));
     }
 }

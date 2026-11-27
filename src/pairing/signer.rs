@@ -135,11 +135,23 @@ impl CaSigner {
     }
 
     /// Signs arbitrary leaf [`CertificateParams`] using the loaded Root CA.
+    /// Clamps leaf certificate validity to ensure it does not exceed the Root CA lifetime.
     pub(crate) fn sign_leaf_params(
         &self,
-        params: CertificateParams,
+        mut params: CertificateParams,
         leaf_key: &KeyPair,
     ) -> Result<Certificate, SignerError> {
+        let now_secs = OffsetDateTime::now_utc().unix_timestamp();
+        let ca_remaining_secs = self.ca_not_after_epoch_secs - now_secs;
+        if ca_remaining_secs <= 0 {
+            return Err(SignerError::CaLifetimeInsufficient {
+                ca_remaining_days: ca_remaining_secs.div_euclid(86_400),
+                required_days: 1,
+            });
+        }
+        if let Ok(ca_expiry) = OffsetDateTime::from_unix_timestamp(self.ca_not_after_epoch_secs) {
+            params.not_after = params.not_after.min(ca_expiry);
+        }
         params
             .signed_by(leaf_key, &self.ca_cert, &self.ca_key)
             .map_err(|e| SignerError::SigningFailed(e.to_string()))
