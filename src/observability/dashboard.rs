@@ -89,6 +89,10 @@ pub struct PairingWebResponse {
     pub apk_download_url: String,
     #[serde(default)]
     pub confirmed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direct_ip: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direct_port: Option<u16>,
 }
 
 /// Request body for POST /api/pair/confirm.
@@ -261,12 +265,34 @@ fn build_pairing_response(
         "New worker pairing session initialized; operator confirmation PIN required [NFR-SEC-001]"
     );
 
+    let (direct_ip, direct_port) = {
+        let stripped = crate::pairing::strip_uri_scheme(&state.cluster_endpoint);
+        if let Some((h, p)) = stripped.rsplit_once(':') {
+            if let Ok(port) = p.parse::<u16>() {
+                let host = h.trim_start_matches('[').trim_end_matches(']').to_string();
+                if host != "127.0.0.1" && host != "localhost" && !host.is_empty() {
+                    (Some(host), Some(port))
+                } else if let Some(lan_ip) = crate::config::detect_outbound_lan_ipv4() {
+                    (Some(lan_ip.to_string()), Some(port))
+                } else {
+                    (None, None)
+                }
+            } else {
+                (None, None)
+            }
+        } else {
+            (None, None)
+        }
+    };
+
     let payload = PairingPayload {
         cluster_endpoint: state.cluster_endpoint.clone(),
         ca_fingerprint: state.ca_fingerprint.clone(),
         pairing_token: record.token.clone(),
         node_id: None,
         expires_at_epoch_s: record.expires_at_epoch_s,
+        direct_ip: direct_ip.clone(),
+        direct_port,
     };
 
     let payload_json = payload.to_compact_json().map_err(|_| {
@@ -292,6 +318,8 @@ fn build_pairing_response(
         qr_png_data_url,
         apk_download_url: state.apk_download_url.clone(),
         confirmed: false,
+        direct_ip,
+        direct_port,
     })
 }
 
@@ -560,12 +588,34 @@ async fn handle_pairing_qr_png(
         ));
     }
 
+    let (direct_ip, direct_port) = {
+        let stripped = crate::pairing::strip_uri_scheme(&state.cluster_endpoint);
+        if let Some((h, p)) = stripped.rsplit_once(':') {
+            if let Ok(port) = p.parse::<u16>() {
+                let host = h.trim_start_matches('[').trim_end_matches(']').to_string();
+                if host != "127.0.0.1" && host != "localhost" && !host.is_empty() {
+                    (Some(host), Some(port))
+                } else if let Some(lan_ip) = crate::config::detect_outbound_lan_ipv4() {
+                    (Some(lan_ip.to_string()), Some(port))
+                } else {
+                    (None, None)
+                }
+            } else {
+                (None, None)
+            }
+        } else {
+            (None, None)
+        }
+    };
+
     let payload = PairingPayload {
         cluster_endpoint: state.cluster_endpoint.clone(),
         ca_fingerprint: state.ca_fingerprint.clone(),
         pairing_token: record.token,
         node_id: record.target_node_id,
         expires_at_epoch_s: record.expires_at_epoch_s,
+        direct_ip,
+        direct_port,
     };
     let payload_json = payload.to_compact_json().map_err(|_| {
         (

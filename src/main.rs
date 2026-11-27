@@ -322,10 +322,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             port: config.listen_addr.port(),
             version: env!("CARGO_PKG_VERSION").to_string(),
             ca_fingerprint: ca_fingerprint.clone(),
-            ip: if !config.listen_addr.ip().is_unspecified() {
+            ip: if !config.listen_addr.ip().is_unspecified() && !config.listen_addr.ip().is_loopback() {
                 Some(config.listen_addr.ip().to_string())
+            } else if let Ok(host_ip) = std::env::var("ANDROGRID_HOST_IP") {
+                Some(host_ip)
             } else {
-                std::env::var("ANDROGRID_HOST_IP").ok()
+                androgrid_backend::detect_outbound_lan_ipv4().map(|ip| ip.to_string())
             },
         };
         match MdnsResponder::start(mdns_cfg) {

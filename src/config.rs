@@ -456,7 +456,8 @@ impl ClusterConfig {
     ///
     /// Prefers explicit `cluster_endpoint` (`ANDROGRID_CLUSTER_ENDPOINT`), followed by
     /// `ANDROGRID_HOST_IP` if `listen_addr` uses an unspecified bind address (`0.0.0.0`, `::`),
-    /// falling back to loopback or bound address.
+    /// auto-detecting the primary outbound physical LAN IP if possible, and falling back
+    /// to loopback or bound address.
     ///
     /// Traces to: [REQ-OP-001], [INV-001], [INV-002]
     pub fn resolve_cluster_endpoint(&self) -> String {
@@ -476,6 +477,9 @@ impl ClusterConfig {
                         return format!("{trimmed}:{port}");
                     }
                 }
+                if let Some(lan_ip) = detect_outbound_lan_ipv4() {
+                    return format!("{lan_ip}:{port}");
+                }
                 format!("127.0.0.1:{port}")
             }
             std::net::IpAddr::V6(ip) if ip.is_unspecified() => {
@@ -485,11 +489,27 @@ impl ClusterConfig {
                         return format!("{trimmed}:{port}");
                     }
                 }
+                if let Some(lan_ip) = detect_outbound_lan_ipv4() {
+                    return format!("{lan_ip}:{port}");
+                }
                 format!("[::1]:{port}")
             }
             std::net::IpAddr::V6(ip) => format!("[{ip}]:{port}"),
             std::net::IpAddr::V4(ip) => format!("{ip}:{port}"),
         }
+    }
+}
+
+/// Attempts to determine the host's primary outbound LAN IPv4 address using
+/// an ephemeral UDP routing table query to avoid binding to virtual Hyper-V/WSL/VPN adapters.
+///
+/// Does not transmit any network packets. Traces to: [REQ-OP-001], [INV-001]
+pub fn detect_outbound_lan_ipv4() -> Option<std::net::Ipv4Addr> {
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("8.8.8.8:80").ok()?;
+    match socket.local_addr().ok()?.ip() {
+        std::net::IpAddr::V4(ip) if !ip.is_loopback() && !ip.is_unspecified() => Some(ip),
+        _ => None,
     }
 }
 
@@ -530,11 +550,13 @@ mod tests {
             listen_addr: "0.0.0.0:50051".parse().unwrap(),
             ..Default::default()
         };
-        // Unspecified without host IP env defaults to loopback endpoint
-        assert_eq!(
-            config.resolve_mtls_blob_base_url(),
-            "https://127.0.0.1:50051/v1/blobs"
-        );
+        // Unspecified without host IP env defaults to auto-detected LAN IP or loopback endpoint
+        let expected_base = if let Some(lan_ip) = detect_outbound_lan_ipv4() {
+            format!("https://{lan_ip}:50051/v1/blobs")
+        } else {
+            "https://127.0.0.1:50051/v1/blobs".to_string()
+        };
+        assert_eq!(config.resolve_mtls_blob_base_url(), expected_base);
 
         // When cluster_endpoint or host IP is set, resolve_mtls_blob_base_url respects it
         config.cluster_endpoint = Some("192.168.1.100:50051".to_string());
@@ -573,8 +595,13 @@ mod tests {
             listen_addr: "0.0.0.0:50051".parse().unwrap(),
             ..Default::default()
         };
-        // Unspecified falls back to loopback when no host IP env var
-        assert_eq!(config.resolve_cluster_endpoint(), "127.0.0.1:50051");
+        // Unspecified falls back to auto-detected outbound LAN IP or loopback
+        let resolved = config.resolve_cluster_endpoint();
+        if let Some(lan_ip) = detect_outbound_lan_ipv4() {
+            assert_eq!(resolved, format!("{lan_ip}:50051"));
+        } else {
+            assert_eq!(resolved, "127.0.0.1:50051");
+        }
 
         // Explicit cluster_endpoint override takes precedence
         config.cluster_endpoint = Some("https://node.edge.androgrid:50051/".to_string());
@@ -582,6 +609,14 @@ mod tests {
             config.resolve_cluster_endpoint(),
             "node.edge.androgrid:50051"
         );
+    }
+
+    #[test]
+    fn test_detect_outbound_lan_ipv4_non_loopback() {
+        if let Some(ip) = detect_outbound_lan_ipv4() {
+            assert!(!ip.is_loopback());
+            assert!(!ip.is_unspecified());
+        }
     }
 
     #[test]
