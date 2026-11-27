@@ -733,7 +733,8 @@ mod tests {
     #[tokio::test]
     async fn test_submit_task_and_get_status() {
         let scheduler = Arc::new(ClusterScheduler::new());
-        let service = AdminServiceImpl::new(Arc::clone(&scheduler)).with_allow_unauthenticated(true);
+        let service =
+            AdminServiceImpl::new(Arc::clone(&scheduler)).with_allow_unauthenticated(true);
 
         let task = make_test_task("task_admin_01");
         let submit_res = service
@@ -758,7 +759,8 @@ mod tests {
     #[tokio::test]
     async fn test_cancel_pending_task() {
         let scheduler = Arc::new(ClusterScheduler::new());
-        let service = AdminServiceImpl::new(Arc::clone(&scheduler)).with_allow_unauthenticated(true);
+        let service =
+            AdminServiceImpl::new(Arc::clone(&scheduler)).with_allow_unauthenticated(true);
 
         let task = make_test_task("task_cancel_01");
         service
@@ -789,7 +791,8 @@ mod tests {
     #[tokio::test]
     async fn test_list_worker_nodes() {
         let scheduler = Arc::new(ClusterScheduler::new());
-        let service = AdminServiceImpl::new(Arc::clone(&scheduler)).with_allow_unauthenticated(true);
+        let service =
+            AdminServiceImpl::new(Arc::clone(&scheduler)).with_allow_unauthenticated(true);
 
         let caps = NodeCapabilities {
             is_rooted: false,
@@ -1276,10 +1279,7 @@ mod tests {
             task: Some(bad_task),
         });
         bad_task_req.extensions_mut().insert(admin_peer);
-        let task_err = svc
-            .submit_task(bad_task_req)
-            .await
-            .unwrap_err();
+        let task_err = svc.submit_task(bad_task_req).await.unwrap_err();
         assert_eq!(task_err.code(), tonic::Code::NotFound);
     }
 
