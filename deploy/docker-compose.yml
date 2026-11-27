@@ -26,7 +26,7 @@ services:
       # Rootful Docker runs as UID 10001 (androgrid); ensure server.key is owned by 10001:10001 with 0600 mode
       - ./pki/runtime:/etc/androgrid/pki:ro
     healthcheck:
-      test: ["CMD-SHELL", "nc -z 127.0.0.1 50051 || exit 1"]
+      test: ["CMD", "/usr/local/bin/androgrid-cli", "probe", "--addr", "127.0.0.1:50051"]
       interval: 10s
       timeout: 5s
       retries: 3

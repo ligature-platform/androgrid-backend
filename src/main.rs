@@ -6,7 +6,6 @@
 //! Traces to: AG-SPEC-2026-V2 Section 2.2, Section 2.3, [INV-002], [NFR-SEC-001], [NFR-PERF-001]
 
 use clap::Parser;
-use ring::rand::SecureRandom;
 use std::sync::Arc;
 use tokio::signal;
 use tonic::transport::Server;
@@ -120,38 +119,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let artifact_base_url = config.resolve_artifact_base_url();
 
-    let operator_pin = config.operator_pin.clone().unwrap_or_else(|| {
-        let mut bytes = [0u8; 4];
-        let _ = ring::rand::SystemRandom::new().fill(&mut bytes);
-        let val = u32::from_ne_bytes(bytes) % 1_000_000;
-        format!("{val:06}")
-    });
-
-    info!("================================================================================");
-    info!("==> Ephemeral Operator Pairing PIN: {operator_pin} [NFR-SEC-001]");
-    info!("================================================================================");
+    if let Some(ref pin) = config.operator_pin {
+        info!("================================================================================");
+        info!("==> Ephemeral Operator Pairing PIN override configured: {pin} [NFR-SEC-001]");
+        info!("================================================================================");
+    } else {
+        info!("==> Operator Pairing PIN: per-session dynamic generation and rotation enabled [NFR-SEC-001]");
+    }
 
     let token_store = Arc::new(PairingTokenStore::with_operator_gate(
         config.allow_pairing,
         5,
         true,
-        Some(operator_pin.clone()),
+        config.operator_pin.clone(),
         config.confirmation_token.clone(),
     ));
 
     #[cfg(unix)]
     if let Some(ref ca_key_path) = config.tls_ca_key_path {
         use std::os::unix::fs::PermissionsExt;
-        if let Ok(metadata) = std::fs::metadata(ca_key_path) {
+        if ca_key_path.exists() {
+            let metadata = std::fs::metadata(ca_key_path)?;
             let mut permissions = metadata.permissions();
             let current_mode = permissions.mode() & 0o777;
-            if current_mode != 0o600 {
+            if current_mode & 0o077 != 0 {
                 permissions.set_mode(0o600);
-                if let Err(e) = std::fs::set_permissions(ca_key_path, permissions) {
-                    warn!(path = %ca_key_path.display(), error = %e, "Could not enforce POSIX 0600 permissions on Root CA key");
-                } else {
-                    info!(path = %ca_key_path.display(), "Enforced POSIX 0600 permissions on Root CA key [NFR-SEC-001]");
-                }
+                std::fs::set_permissions(ca_key_path, permissions)?;
+                info!(path = %ca_key_path.display(), "Enforced POSIX 0600 permissions on Root CA key [NFR-SEC-001]");
             }
         }
     }
@@ -278,28 +272,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let (web_shutdown_tx, web_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     if config.enable_web_ui {
+        if !config.web_listen_addr.ip().is_loopback() {
+            warn!(
+                web_addr = %config.web_listen_addr,
+                "Web UI listening on non-loopback address over plaintext HTTP. LAN traffic is unencrypted (RSK-NET-03 residual risk) [NFR-SEC-001]"
+            );
+        }
         let web_listener = tokio::net::TcpListener::bind(config.web_listen_addr).await?;
-        let web_state = WebUiState {
-            scheduler: Arc::clone(&scheduler),
-            token_store: if config.allow_pairing {
+        let web_state = WebUiState::new(
+            Arc::clone(&scheduler),
+            if config.allow_pairing {
                 Some(Arc::clone(&token_store))
             } else {
                 None
             },
-            ca_fingerprint: ca_fingerprint.clone(),
-            cluster_endpoint: cluster_endpoint.clone(),
-            apk_download_url: config.apk_download_url.clone(),
-            pairing_token_ttl_seconds: config.pairing_token_ttl_seconds,
-            operator_pin: Some(operator_pin.clone()),
-            confirmation_token: config.confirmation_token.clone(),
-        };
+            ca_fingerprint.clone(),
+            cluster_endpoint.clone(),
+            config.apk_download_url.clone(),
+            config.pairing_token_ttl_seconds,
+        );
         let web_app = web_ui_router(web_state);
         info!(
             web_addr = %config.web_listen_addr,
             "Starting dedicated Operator Web UI & Pairing Dashboard on port 8080 [REQ-OP-001], [INV-004], [INV-005]"
         );
         tokio::spawn(async move {
-            let server = axum::serve(web_listener, web_app.into_make_service());
+            let server = axum::serve(
+                web_listener,
+                web_app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            );
             tokio::select! {
                 res = server => {
                     if let Err(e) = res {

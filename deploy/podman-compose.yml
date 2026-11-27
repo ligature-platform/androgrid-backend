@@ -28,7 +28,7 @@ services:
     volumes:
       - ./pki/runtime:/etc/androgrid/pki:ro,Z
     healthcheck:
-      test: ["CMD-SHELL", "nc -z 127.0.0.1 50051 || exit 1"]
+      test: ["CMD", "/usr/local/bin/androgrid-cli", "probe", "--addr", "127.0.0.1:50051"]
       interval: 10s
       timeout: 5s
       retries: 3

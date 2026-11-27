@@ -219,10 +219,16 @@ impl PairingTokenStore {
         }
 
         let trimmed_input = pin_or_conf.trim();
-        let matches = trimmed_input == record.confirmation_pin
-            || trimmed_input == record.confirmation_token
-            || self.operator_pin.as_deref() == Some(trimmed_input)
-            || self.confirmation_token.as_deref() == Some(trimmed_input);
+        let matches = constant_time_eq(trimmed_input, &record.confirmation_pin)
+            || constant_time_eq(trimmed_input, &record.confirmation_token)
+            || self
+                .operator_pin
+                .as_deref()
+                .is_some_and(|p| constant_time_eq(trimmed_input, p))
+            || self
+                .confirmation_token
+                .as_deref()
+                .is_some_and(|t| constant_time_eq(trimmed_input, t));
 
         if matches {
             record.is_confirmed = true;
@@ -281,10 +287,10 @@ impl PairingTokenStore {
         let expires_at = now + ttl;
         let token = generate_csprng_token_hex()?;
         let confirmation_token = generate_csprng_token_hex()?;
-        let confirmation_pin = self
-            .operator_pin
-            .clone()
-            .unwrap_or_else(|| generate_6digit_pin().unwrap_or_else(|_| "123456".to_string()));
+        let confirmation_pin = match &self.operator_pin {
+            Some(pin) => pin.clone(),
+            None => generate_6digit_pin()?,
+        };
 
         let record = PairingTokenRecord {
             token: token.clone(),
@@ -356,9 +362,12 @@ impl PairingTokenStore {
             return Err(RedeemActionError::Pairing(PairingError::RateLimitExceeded));
         }
 
-        if self.require_operator_confirmation && !record.is_confirmed {
+        if now > record.expires_at_epoch_s {
             record.failed_attempts += 1;
-            return Err(RedeemActionError::Pairing(PairingError::UnconfirmedToken));
+            return Err(RedeemActionError::Pairing(PairingError::TokenExpired {
+                expired_at_epoch_s: record.expires_at_epoch_s,
+                current_epoch_s: now,
+            }));
         }
 
         if record.is_redeemed {
@@ -368,12 +377,9 @@ impl PairingTokenStore {
             ));
         }
 
-        if now > record.expires_at_epoch_s {
+        if self.require_operator_confirmation && !record.is_confirmed {
             record.failed_attempts += 1;
-            return Err(RedeemActionError::Pairing(PairingError::TokenExpired {
-                expired_at_epoch_s: record.expires_at_epoch_s,
-                current_epoch_s: now,
-            }));
+            return Err(RedeemActionError::Pairing(PairingError::UnconfirmedToken));
         }
 
         if let Some(ref expected_node) = record.target_node_id {
@@ -490,6 +496,12 @@ impl PairingTokenStore {
     pub fn is_enabled(&self) -> bool {
         self.enabled
     }
+}
+
+/// Compares two ASCII/UTF-8 strings in constant time to prevent timing side channels.
+#[allow(deprecated)]
+fn constant_time_eq(a: &str, b: &str) -> bool {
+    ring::constant_time::verify_slices_are_equal(a.as_bytes(), b.as_bytes()).is_ok()
 }
 
 /// Generates a 256-bit cryptographically secure random token encoded as 64 hex chars.

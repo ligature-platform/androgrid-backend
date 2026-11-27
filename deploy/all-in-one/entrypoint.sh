@@ -56,10 +56,25 @@ if [ ! -f "${PKI_DIR}/runtime/server.crt" ] && [ ! -f "${PKI_DIR}/server.crt" ];
 fi
 
 if [ "$NEEDS_PKI" -eq 1 ]; then
-    echo "==> [Auto-PKI] No TLS certificates found in ${PKI_DIR}."
-    echo "==> [Auto-PKI] Initializing ECDSA P-256 TLS 1.3 Root CA and server fullchain with SAN: ${HOST_IP}..."
-    androgrid-cli cert init --out "${PKI_DIR}" --san "${HOST_IP}" --force
-    echo "==> [Auto-PKI] PKI hierarchy successfully generated in ${PKI_DIR}."
+    if [ ! -f "${PKI_DIR}/ca.crt" ] && [ ! -f "${PKI_DIR}/runtime/ca.crt" ]; then
+        echo "==> [Auto-PKI] No TLS certificates found in ${PKI_DIR}."
+        echo "==> [Auto-PKI] Initializing ECDSA P-256 TLS 1.3 Root CA and server fullchain with SAN: ${HOST_IP}..."
+        androgrid-cli cert init --out "${PKI_DIR}" --san "${HOST_IP}" --force
+        echo "==> [Auto-PKI] PKI hierarchy successfully generated in ${PKI_DIR}."
+    else
+        EXISTING_CA_CERT="${PKI_DIR}/runtime/ca.crt"
+        [ -f "${EXISTING_CA_CERT}" ] || EXISTING_CA_CERT="${PKI_DIR}/ca.crt"
+        EXISTING_CA_KEY="${PKI_DIR}/operator/ca.key"
+        [ -f "${EXISTING_CA_KEY}" ] || EXISTING_CA_KEY="${PKI_DIR}/ca.key"
+
+        if [ -f "${EXISTING_CA_KEY}" ]; then
+            echo "==> [Auto-PKI] Existing CA found, issuing server certificate with SAN: ${HOST_IP}..."
+            androgrid-cli cert issue server --ca-key "${EXISTING_CA_KEY}" --ca-cert "${EXISTING_CA_CERT}" --out "${PKI_DIR}/server" --san "${HOST_IP}" --force
+        else
+            echo "ERROR: CA certificate exists at ${EXISTING_CA_CERT} but server certificate and CA key are missing!" >&2
+            exit 1
+        fi
+    fi
 else
     echo "==> Existing PKI certificates detected in ${PKI_DIR}."
 fi
@@ -79,10 +94,10 @@ fi
 
 # Hardening: Lock Root CA private key strictly to POSIX 0600 permissions [NFR-SEC-001]
 if [ -f "${CA_KEY_PATH}" ]; then
-    chmod 0600 "${CA_KEY_PATH}" 2>/dev/null || true
+    chmod 0600 "${CA_KEY_PATH}" || { echo "ERROR: Failed to enforce POSIX 0600 permissions on ${CA_KEY_PATH}" >&2; exit 1; }
 fi
 if [ -f "${SERVER_KEY_PATH}" ]; then
-    chmod 0600 "${SERVER_KEY_PATH}" 2>/dev/null || true
+    chmod 0600 "${SERVER_KEY_PATH}" || { echo "ERROR: Failed to enforce POSIX 0600 permissions on ${SERVER_KEY_PATH}" >&2; exit 1; }
 fi
 
 # Step 4: Seed pre-packaged workloads to artifact store if empty

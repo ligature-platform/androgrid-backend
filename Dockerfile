@@ -12,7 +12,7 @@ COPY proto ./proto
 COPY src ./src
 
 # Compile production binaries with release profile
-RUN cargo build --release --bin androgrid-backend --bin androgrid-cli
+RUN cargo build --release --locked --bin androgrid-backend --bin androgrid-cli
 
 # Stage 2: Hardened, unprivileged runtime image
 FROM debian:bookworm-slim AS runtime

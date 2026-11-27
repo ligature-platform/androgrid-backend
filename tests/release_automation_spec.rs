@@ -244,6 +244,38 @@ fn test_checksum_sha256_reproducibility() {
     assert_eq!(parts[1], "sample_artifact.tar.gz");
 }
 
+/// Asserts that docker-compose.yml and podman-compose.yml use the native
+/// androgrid-cli probe healthcheck command instead of netcat (nc).
+///
+/// Traces to: [NFR-SEC-001], [REQ-OP-001]
+#[test]
+fn test_compose_healthcheck_probe() {
+    let compose_files = [
+        get_project_root().join("deploy").join("docker-compose.yml"),
+        get_project_root().join("deploy").join("podman-compose.yml"),
+    ];
+
+    for file_path in compose_files {
+        assert!(
+            file_path.exists(),
+            "Compose file must exist: {:?}",
+            file_path
+        );
+        let content = fs::read_to_string(&file_path).expect("Failed to read compose file");
+
+        assert!(
+            content.contains("/usr/local/bin/androgrid-cli") && content.contains("probe"),
+            "Compose file {:?} must use 'androgrid-cli probe' healthcheck",
+            file_path
+        );
+        assert!(
+            !content.contains("nc -z"),
+            "Compose file {:?} must not use netcat (nc -z) healthcheck",
+            file_path
+        );
+    }
+}
+
 /// Asserts zero occurrences of Unicode em dashes (U+2014) or en dashes (U+2013)
 /// in release and container automation configuration files.
 ///

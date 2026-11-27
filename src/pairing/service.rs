@@ -153,7 +153,9 @@ impl EnrollmentContext {
         pin_or_confirmation: Option<&str>,
     ) -> Result<SignedWorkerCert, EnrollFailure> {
         if let Some(pin) = pin_or_confirmation {
-            let _ = self.token_store.confirm_token(token, pin);
+            self.token_store
+                .confirm_token(token, pin)
+                .map_err(EnrollFailure::Pairing)?;
         }
 
         self.token_store

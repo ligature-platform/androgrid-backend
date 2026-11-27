@@ -66,6 +66,18 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
+    /// Probe raw TCP connectivity to orchestrator port (container healthcheck)
+    /// Traces to: [REQ-OP-001], [NFR-REL-001]
+    Probe {
+        /// Target socket address (host:port) to verify network connectivity
+        #[arg(long, default_value = "127.0.0.1:50051")]
+        addr: String,
+
+        /// Connection timeout in seconds (default: 2)
+        #[arg(long, default_value_t = 2)]
+        timeout_secs: u64,
+    },
+
     /// Validate and package a WebAssembly module with JSON deployment manifest
     /// Traces to: [INV-006], [REQ-OP-003]
     Pack {
@@ -1140,6 +1152,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
+    if let Commands::Probe { addr, timeout_secs } = cli.command {
+        use std::net::ToSocketAddrs;
+        let addrs: Vec<std::net::SocketAddr> = addr
+            .to_socket_addrs()
+            .map_err(|e| format!("Failed to resolve target address {addr}: {e}"))?
+            .collect();
+        if addrs.is_empty() {
+            eprintln!("Error: no resolved addresses for {addr}");
+            std::process::exit(1);
+        }
+        for target in addrs {
+            if std::net::TcpStream::connect_timeout(
+                &target,
+                std::time::Duration::from_secs(timeout_secs),
+            )
+            .is_ok()
+            {
+                if cli.format != "json" {
+                    println!("OK: TCP handshake successful to {target}");
+                }
+                return Ok(());
+            }
+        }
+        eprintln!("Error: connection refused or timed out connecting to {addr}");
+        std::process::exit(1);
+    }
+
     let channel = create_channel(
         &cli.endpoint,
         cli.ca_cert.as_deref(),
@@ -1151,6 +1190,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut client = AdminServiceClient::new(channel);
 
     match cli.command {
+        Commands::Probe { .. } => unreachable!(),
         Commands::Pack { .. } => unreachable!(),
         Commands::Benchmark { .. } => unreachable!(),
         Commands::Cert { .. } => unreachable!(),

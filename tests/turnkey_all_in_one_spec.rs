@@ -124,16 +124,14 @@ async fn test_web_ui_dashboard_and_pairing_endpoints() {
     let cluster_endpoint = "192.168.1.185:50051".to_string();
     let apk_url = "https://github.com/ligature-platform/androgrid-android/releases/latest/download/androgrid-worker.apk".to_string();
 
-    let web_state = WebUiState {
+    let web_state = WebUiState::new(
         scheduler,
-        token_store: Some(token_store),
-        ca_fingerprint: ca_fingerprint.clone(),
-        cluster_endpoint: cluster_endpoint.clone(),
-        apk_download_url: apk_url.clone(),
-        pairing_token_ttl_seconds: 300,
-        operator_pin: None,
-        confirmation_token: None,
-    };
+        Some(token_store),
+        ca_fingerprint.clone(),
+        cluster_endpoint.clone(),
+        apk_url.clone(),
+        300,
+    );
 
     let app = web_ui_router(web_state);
     let listener = TcpListener::bind("127.0.0.1:0")
@@ -142,9 +140,12 @@ async fn test_web_ui_dashboard_and_pairing_endpoints() {
     let addr = listener.local_addr().unwrap();
 
     tokio::spawn(async move {
-        axum::serve(listener, app.into_make_service())
-            .await
-            .expect("Web UI server run");
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .expect("Web UI server run");
     });
 
     let client = reqwest::Client::new();
@@ -161,9 +162,10 @@ async fn test_web_ui_dashboard_and_pairing_endpoints() {
     assert!(html_body.contains("Device Pairing"));
     assert!(html_body.contains("node-table"));
 
-    // 2.2 POST /api/pair returns JSON pairing payload with QR data URL
+    // 2.2 POST /api/pair returns JSON pairing payload with QR data URL (with anti-CSRF header)
     let pair_resp = client
         .post(format!("http://{addr}/api/pair"))
+        .header("X-Requested-With", "XMLHttpRequest")
         .send()
         .await
         .expect("POST /api/pair must succeed");
@@ -195,7 +197,19 @@ async fn test_web_ui_dashboard_and_pairing_endpoints() {
     // PNG file header magic: 0x89 'P' 'N' 'G'
     assert_eq!(&png_bytes[..4], &[0x89, 0x50, 0x4E, 0x47]);
 
-    // 2.3b Negative validation: non-existent token must yield 404 Not Found
+    // 2.3b Negative validation: missing token query must yield 400 Bad Request
+    let missing_qr_resp = client
+        .get(format!("http://{addr}/api/pair/qr.png"))
+        .send()
+        .await
+        .expect("GET /api/pair/qr.png without token query");
+    assert_eq!(
+        missing_qr_resp.status(),
+        reqwest::StatusCode::BAD_REQUEST,
+        "GET /api/pair/qr.png without token must return 400 Bad Request"
+    );
+
+    // 2.3c Negative validation: non-existent token must yield 404 Not Found
     let fake_token = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     let bad_qr_resp = client
         .get(format!("http://{addr}/api/pair/qr.png?token={fake_token}"))
@@ -203,6 +217,18 @@ async fn test_web_ui_dashboard_and_pairing_endpoints() {
         .await
         .expect("GET /api/pair/qr.png with invalid token must receive response");
     assert_eq!(bad_qr_resp.status(), reqwest::StatusCode::NOT_FOUND);
+
+    // 2.3d Negative validation: POST /api/pair without X-Requested-With must yield 403 Forbidden
+    let csrf_blocked_resp = client
+        .post(format!("http://{addr}/api/pair"))
+        .send()
+        .await
+        .expect("POST /api/pair without CSRF header");
+    assert_eq!(
+        csrf_blocked_resp.status(),
+        reqwest::StatusCode::FORBIDDEN,
+        "POST /api/pair without X-Requested-With must be rejected with 403 Forbidden"
+    );
 
     // 2.4 GET /api/apk-info returns APK download metadata
     let apk_resp = client
@@ -301,29 +327,31 @@ async fn test_end_to_end_worker_pairing_from_web_qr_code() {
     });
 
     // 3. Start Web UI router on ephemeral port
-    let web_state = WebUiState {
-        scheduler: Arc::clone(&scheduler),
-        token_store: Some(Arc::clone(&token_store)),
-        ca_fingerprint: ca_fingerprint.clone(),
-        cluster_endpoint: grpc_addr.to_string(),
-        apk_download_url: "https://example.com/androgrid-worker.apk".to_string(),
-        pairing_token_ttl_seconds: 300,
-        operator_pin: Some(operator_pin.clone()),
-        confirmation_token: None,
-    };
+    let web_state = WebUiState::new(
+        Arc::clone(&scheduler),
+        Some(Arc::clone(&token_store)),
+        ca_fingerprint.clone(),
+        grpc_addr.to_string(),
+        "https://example.com/androgrid-worker.apk".to_string(),
+        300,
+    );
     let web_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let web_addr = web_listener.local_addr().unwrap();
 
     tokio::spawn(async move {
-        axum::serve(web_listener, web_ui_router(web_state).into_make_service())
-            .await
-            .expect("Web UI run");
+        axum::serve(
+            web_listener,
+            web_ui_router(web_state).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .expect("Web UI run");
     });
 
     // 4. Operator fetches pairing QR code from Web UI via POST /api/pair
     let http_client = reqwest::Client::new();
     let pair_res: PairingWebResponse = http_client
         .post(format!("http://{web_addr}/api/pair"))
+        .header("X-Requested-With", "XMLHttpRequest")
         .send()
         .await
         .unwrap()
@@ -341,6 +369,7 @@ async fn test_end_to_end_worker_pairing_from_web_qr_code() {
     // 4b. Operator confirms pairing session via POST /api/pair/confirm with 6-digit console PIN
     let confirm_res = http_client
         .post(format!("http://{web_addr}/api/pair/confirm"))
+        .header("X-Requested-With", "XMLHttpRequest")
         .json(&serde_json::json!({
             "token": pair_res.pairing_token,
             "pin": operator_pin,
@@ -538,22 +567,23 @@ async fn test_ephemeral_operator_confirmation_gate_security_lifecycle() {
     });
 
     // Spin up Web UI dashboard router (port B)
-    let web_state = WebUiState {
-        scheduler: Arc::clone(&scheduler),
-        token_store: Some(Arc::clone(&token_store)),
-        ca_fingerprint: ca_fingerprint.clone(),
-        cluster_endpoint: enroll_addr.to_string(),
-        apk_download_url: "https://example.com/worker.apk".to_string(),
-        pairing_token_ttl_seconds: 300,
-        operator_pin: Some(operator_pin.clone()),
-        confirmation_token: None,
-    };
+    let web_state = WebUiState::new(
+        Arc::clone(&scheduler),
+        Some(Arc::clone(&token_store)),
+        ca_fingerprint.clone(),
+        enroll_addr.to_string(),
+        "https://example.com/worker.apk".to_string(),
+        300,
+    );
     let web_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let web_addr = web_listener.local_addr().unwrap();
     tokio::spawn(async move {
-        axum::serve(web_listener, web_ui_router(web_state).into_make_service())
-            .await
-            .expect("Web UI server");
+        axum::serve(
+            web_listener,
+            web_ui_router(web_state).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .expect("Web UI server");
     });
 
     let client = reqwest::Client::new();
@@ -561,6 +591,7 @@ async fn test_ephemeral_operator_confirmation_gate_security_lifecycle() {
     // 1. Unauthenticated client calls POST /api/pair on Web UI
     let pair_resp = client
         .post(format!("http://{web_addr}/api/pair"))
+        .header("X-Requested-With", "XMLHttpRequest")
         .send()
         .await
         .unwrap()
@@ -611,6 +642,7 @@ async fn test_ephemeral_operator_confirmation_gate_security_lifecycle() {
     // 3. Confirm with wrong PIN -> MUST fail with HTTP 401 Unauthorized
     let bad_confirm_resp = client
         .post(format!("http://{web_addr}/api/pair/confirm"))
+        .header("X-Requested-With", "XMLHttpRequest")
         .json(&serde_json::json!({
             "token": token,
             "pin": "000000",
@@ -628,6 +660,7 @@ async fn test_ephemeral_operator_confirmation_gate_security_lifecycle() {
     // 4. Confirm with valid operator PIN -> MUST succeed with HTTP 200 OK
     let good_confirm_resp = client
         .post(format!("http://{web_addr}/api/pair/confirm"))
+        .header("X-Requested-With", "XMLHttpRequest")
         .json(&serde_json::json!({
             "token": token,
             "pin": operator_pin,
@@ -663,23 +696,106 @@ async fn test_ephemeral_operator_confirmation_gate_security_lifecycle() {
     assert!(!enroll_data.client_cert_pem.is_empty());
     assert!(!enroll_data.ca_cert_pem.is_empty());
 
-    // 6. Test expired token rejection with HTTP 410 Gone
-    let expired_token_str = "expired-token-for-test-gate-000000000000000000000000000000000000";
-    {
-        let confirm_expired_resp = client
-            .post(format!("http://{web_addr}/api/pair/confirm"))
-            .json(&serde_json::json!({
-                "token": expired_token_str,
-                "pin": operator_pin,
-            }))
-            .send()
-            .await
-            .unwrap();
-        assert!(
-            confirm_expired_resp.status() == reqwest::StatusCode::NOT_FOUND
-                || confirm_expired_resp.status() == reqwest::StatusCode::GONE
-        );
-    }
+    // 6. Test expired token rejection with HTTP 410 Gone (strict 1s TTL + 2.2s sleep)
+    let expired_record = token_store
+        .generate_token(None, Some(1))
+        .expect("Generate 1s TTL token");
+    tokio::time::sleep(tokio::time::Duration::from_millis(2200)).await;
+    let confirm_expired_resp = client
+        .post(format!("http://{web_addr}/api/pair/confirm"))
+        .header("X-Requested-With", "XMLHttpRequest")
+        .json(&serde_json::json!({
+            "token": expired_record.token,
+            "pin": operator_pin,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        confirm_expired_resp.status(),
+        reqwest::StatusCode::GONE,
+        "Expired token confirmation must strictly return HTTP 410 Gone"
+    );
 
     let _ = std::fs::remove_dir_all(&pki_out);
+}
+
+/// 6. Verifies that AdminService::generate_pairing_token marks the issued pairing token
+/// as pre-confirmed, allowing instant worker enrollment without secondary operator confirmation.
+///
+/// Traces to: [REQ-OP-001], [INV-002], [NFR-SEC-001]
+#[tokio::test]
+async fn test_admin_service_generates_preconfirmed_pairing_token() {
+    use androgrid_backend::proto::androgrid::v1::admin_service_server::AdminService;
+    use androgrid_backend::proto::androgrid::v1::GeneratePairingTokenRequest;
+
+    let pki = PkiInitConfig {
+        out_dir: std::env::temp_dir().join(format!(
+            "androgrid_admin_test_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        )),
+        extra_sans: vec!["localhost".to_string()],
+        no_default_sans: false,
+        ca_days: 365,
+        days: 90,
+        admin_cn: "operator".to_string(),
+        force: true,
+    };
+    cert_init(&pki).unwrap();
+
+    let ca_cert_pem = std::fs::read_to_string(pki.out_dir.join("runtime/ca.crt")).unwrap();
+    let ca_key_pem = std::fs::read_to_string(pki.out_dir.join("operator/ca.key")).unwrap();
+    let ca_signer = Arc::new(CaSigner::from_pem(&ca_cert_pem, &ca_key_pem).unwrap());
+
+    // Operator confirmation gate is enabled on the token store
+    let token_store = Arc::new(PairingTokenStore::with_operator_gate(
+        true,
+        5,
+        true,
+        Some("123456".to_string()),
+        None,
+    ));
+
+    let scheduler = Arc::new(ClusterScheduler::new());
+    let artifact_store = Arc::new(ArtifactStore::new());
+    let admin_service = androgrid_backend::AdminServiceImpl::with_services(
+        Arc::clone(&scheduler),
+        Arc::clone(&artifact_store),
+        "http://127.0.0.1:50052".to_string(),
+        Arc::clone(&token_store),
+        ca_signer.ca_fingerprint().to_string(),
+        "localhost:50051".to_string(),
+    )
+    .with_allow_unauthenticated(true);
+
+    let req = tonic::Request::new(GeneratePairingTokenRequest {
+        node_id: "preconfirmed-worker-node".to_string(),
+        expires_in_seconds: 60,
+        san: String::new(),
+    });
+
+    let resp = admin_service
+        .generate_pairing_token(req)
+        .await
+        .expect("AdminService generate_pairing_token must succeed")
+        .into_inner();
+
+    // Verify token can be directly redeemed by worker without secondary operator confirmation
+    let redeemed = token_store
+        .redeem_token(&resp.pairing_token, "preconfirmed-worker-node")
+        .expect("Pre-confirmed token from AdminService must be directly redeemable");
+
+    assert!(
+        redeemed.is_confirmed,
+        "Tokens generated via AdminService must be pre-confirmed [NFR-SEC-001]"
+    );
+    assert!(
+        redeemed.is_redeemed,
+        "Tokens redeemed must be marked as redeemed [INV-002]"
+    );
+
+    let _ = std::fs::remove_dir_all(&pki.out_dir);
 }

@@ -225,7 +225,7 @@ pub fn build_bootstrap_rustls_server_config(
         .allow_unauthenticated()
         .build()?;
 
-    let mut cfg = ServerConfig::builder()
+    let mut cfg = ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
         .with_client_cert_verifier(verifier)
         .with_single_cert(certs, key)?;
     cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
@@ -413,5 +413,72 @@ mod dual_plane_tls_tests {
             .await
             .expect("server should drain cleanly")
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_serve_dual_plane_tls_rejects_tls12_client_hello() {
+        use tokio::io::AsyncWriteExt;
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let cert_pem = certified.cert.pem().into_bytes();
+        let key_pem = certified.key_pair.serialize_pem().into_bytes();
+        let tls_cfg = build_bootstrap_rustls_server_config(&cert_pem, &key_pem, &cert_pem).unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+
+        let server_task = tokio::spawn(serve_dual_plane_tls_with_limits(
+            listener,
+            tls_cfg,
+            Router::new(),
+            async move {
+                let _ = rx.await;
+            },
+            Duration::from_secs(1),
+            4,
+            Duration::from_millis(200),
+        ));
+
+        // Connect raw TCP and send a synthetic TLS 1.2 ClientHello record (legacy_version 0x0303, no TLS 1.3 supported_versions extension)
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        // Minimal standard TLS 1.2 ClientHello
+        let tls12_client_hello = [
+            0x16, // Handshake record
+            0x03, 0x03, // TLS 1.2 record layer version
+            0x00, 0x2f, // Record length: 47 bytes
+            0x01, // Handshake type: ClientHello
+            0x00, 0x00, 0x2b, // Handshake length: 43 bytes
+            0x03, 0x03, // Client version: TLS 1.2
+            // 32 bytes random:
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
+            0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c,
+            0x1d, 0x1e, 0x1f, 0x20, 0x00, // Session ID length: 0
+            0x00, 0x02, // Cipher suites length: 2
+            0x00, 0x9c, // TLS_RSA_WITH_AES_128_GCM_SHA256
+            0x01, 0x00, // Compression methods: 1 byte (null)
+            0x00, 0x00, // Extensions length: 0 (No TLS 1.3 supported_versions extension)
+        ];
+
+        client.write_all(&tls12_client_hello).await.unwrap();
+
+        // Server must close connection or send a TLS Alert rejecting the handshake
+        let mut response = [0u8; 128];
+        let bytes_read = tokio::time::timeout(Duration::from_secs(2), client.read(&mut response))
+            .await
+            .expect("server must respond or close connection promptly")
+            .unwrap_or(0);
+
+        if bytes_read > 0 {
+            // If bytes were returned, it must be a TLS alert (ContentType 0x15 = 21)
+            assert_eq!(response[0], 0x15, "server response must be a TLS Alert");
+        } else {
+            // Connection closed immediately by server on TLS 1.2 ClientHello
+            assert_eq!(bytes_read, 0);
+        }
+
+        let _ = tx.send(());
+        let _ = server_task.await;
     }
 }

@@ -697,10 +697,10 @@
         <div id="operatorGateBox" style="margin-top: 10px; padding: 10px; background: rgba(255, 255, 255, 0.03); border: 1px solid var(--border-color); border-radius: 6px;">
           <div style="font-size: 12px; font-weight: 600; margin-bottom: 4px;">Operator Confirmation Gate [NFR-SEC-001]</div>
           <div style="font-size: 11px; color: var(--text-muted); margin-bottom: 6px;">
-            Enter 6-digit Console PIN to authorize worker CSR signing:
+            Enter 6-digit Console PIN (or 64-char token) to authorize worker CSR signing:
           </div>
           <div style="display: flex; gap: 8px; align-items: center;">
-            <input type="password" id="inputOperatorPin" placeholder="PIN" maxlength="6" style="width: 90px; padding: 4px 8px; font-family: monospace; font-size: 13px; letter-spacing: 2px; border: 1px solid var(--border-color); background: rgba(0,0,0,0.3); color: var(--text-color); border-radius: 4px;" />
+            <input type="password" id="inputOperatorPin" placeholder="PIN / Token" maxlength="64" style="width: 140px; padding: 4px 8px; font-family: monospace; font-size: 13px; letter-spacing: 1px; border: 1px solid var(--border-color); background: rgba(0,0,0,0.3); color: var(--text-color); border-radius: 4px;" />
             <button class="btn btn-secondary" style="padding: 4px 10px; font-size: 12px;" onclick="confirmCurrentPairing()">Authorize</button>
           </div>
           <div id="pinFeedback" style="font-size: 11px; margin-top: 4px;"></div>
@@ -811,6 +811,7 @@
     let logEntriesCount = 0;
     let pairingExpiresAtEpochS = 0;
     let pairingTimerInterval = null;
+    let currentPairingToken = '';
 
     function togglePairingSection() {
       const el = document.getElementById('pairingSection');
@@ -908,8 +909,10 @@
         else if (node.thermal_status >= 1) thermalClass = 'badge-thermal-moderate';
 
         let batteryFillClass = '';
-        if (node.battery_level_pct <= 20) batteryFillClass = 'danger';
-        else if (node.battery_level_pct <= 50) batteryFillClass = 'warn';
+        const rawBattery = parseInt(node.battery_level_pct, 10);
+        const batteryPct = isNaN(rawBattery) ? 0 : Math.min(100, Math.max(0, rawBattery));
+        if (batteryPct <= 20) batteryFillClass = 'danger';
+        else if (batteryPct <= 50) batteryFillClass = 'warn';
 
         const chargingIcon = node.is_charging ? '&#9889; ' : '';
         const activeTasks = getActiveTasksCountForNode(node.node_id);
@@ -928,10 +931,10 @@
           <div class="battery-container">
             <div class="battery-header">
               <span>Battery Level</span>
-              <span>${chargingIcon}${node.battery_level_pct}%</span>
+              <span>${chargingIcon}${batteryPct}%</span>
             </div>
             <div class="battery-bar-bg">
-              <div class="battery-bar-fill ${batteryFillClass}" style="width: ${node.battery_level_pct}%"></div>
+              <div class="battery-bar-fill ${batteryFillClass}" style="width: ${batteryPct}%"></div>
             </div>
           </div>
           <div class="node-meta">
@@ -951,7 +954,7 @@
           <td>${escapeHtml(node.abi || 'arm64-v8a')}</td>
           <td>${node.cpu_cores}</td>
           <td>${node.ram_mb} MB</td>
-          <td>${chargingIcon}${node.battery_level_pct}%</td>
+          <td>${chargingIcon}${batteryPct}%</td>
           <td>Android ${escapeHtml(node.os_version)}</td>
           <td><strong style="color: ${activeTasks > 0 ? 'var(--accent-cyan)' : 'var(--text-muted)'}">${activeTasks}</strong></td>
           <td><span class="badge ${transClass}">${escapeHtml(node.transport)}</span></td>
@@ -972,9 +975,10 @@
         const card = document.createElement('div');
         card.className = 'task-card';
 
+        const allowedStates = ['pending', 'leased', 'running', 'preempted', 'completed', 'failed'];
         const stateStr = task.state || 'Pending';
         const stateLower = stateStr.toLowerCase();
-        const stateClass = 'state-' + stateLower;
+        const stateClass = allowedStates.includes(stateLower) ? 'state-' + stateLower : 'state-pending';
 
         let extraMeta = '';
         if (task.execution_duration_ms !== null && task.execution_duration_ms !== undefined) {
@@ -1061,20 +1065,28 @@
 
     async function fetchPairingInfo(method = 'POST') {
       try {
-        const resp = await fetch('/api/pair', { method });
+        const resp = await fetch('/api/pair', {
+          method,
+          headers: { 'X-Requested-With': 'XMLHttpRequest' }
+        });
         if (!resp.ok) throw new Error('HTTP ' + resp.status);
         const data = await resp.json();
 
+        currentPairingToken = data.pairing_token || '';
         document.getElementById('valEndpoint').innerText = data.cluster_endpoint || 'Unavailable';
         document.getElementById('valFingerprint').innerText = data.ca_fingerprint || 'Unavailable';
-        document.getElementById('valToken').innerText = data.pairing_token || 'Unavailable';
+        document.getElementById('valToken').innerText = currentPairingToken || 'Unavailable';
 
         if (data.qr_png_data_url) {
           document.getElementById('pairingQrImg').src = data.qr_png_data_url;
         }
 
         if (data.apk_download_url) {
-          document.getElementById('btnApkDirectDownload').href = data.apk_download_url;
+          if (data.apk_download_url.startsWith('https://') || data.apk_download_url.startsWith('http://')) {
+            document.getElementById('btnApkDirectDownload').href = data.apk_download_url;
+          } else {
+            console.warn('Rejected invalid APK download URL schema');
+          }
         }
 
         if (data.confirmed) {
@@ -1101,11 +1113,11 @@
 
     async function confirmCurrentPairing() {
       const pin = document.getElementById('inputOperatorPin').value.trim();
-      const token = document.getElementById('valToken').innerText.trim();
+      const token = currentPairingToken || document.getElementById('valToken').innerText.trim();
       const feedback = document.getElementById('pinFeedback');
 
-      if (!pin || pin.length < 6) {
-        feedback.innerText = 'Please enter a 6-digit PIN.';
+      if (!pin || (pin.length !== 6 && pin.length !== 64)) {
+        feedback.innerText = 'Please enter a 6-digit PIN or 64-char token.';
         feedback.style.color = 'var(--accent-red)';
         return;
       }
@@ -1113,7 +1125,10 @@
       try {
         const resp = await fetch('/api/pair/confirm', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Requested-With': 'XMLHttpRequest'
+          },
           body: JSON.stringify({ token, pin })
         });
         const data = await resp.json();
