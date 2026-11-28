@@ -6,7 +6,8 @@
     control plane gRPC (50051) and mDNS discovery (5353 UDP).
     Requires explicit operator consent before applying changes.
     Enforces least privilege: scopes to Private profile and LocalSubnet by default.
-    Purges obsolete wildcard and plaintext rules during migration.
+    Web UI (8080) remains host-local loopback by default; for LAN access, use Caddy TLS proxy.
+    Purges obsolete wildcard, broad, and plaintext rules during migration.
     Traces to: [REQ-OP-001], [INV-001], [INV-002], [NFR-SEC-001], Gate L-02
 .PARAMETER Action
     Action to perform: 'Check', 'Preview', 'Apply', 'Configure', 'Remove'. Default is 'Check'.
@@ -14,8 +15,6 @@
     Target Windows network connection profile: 'Private' (default), 'Domain', 'Public', or 'Any'.
 .PARAMETER RemoteAddress
     Remote IP or subnet filter: 'LocalSubnet' (default) or custom CIDR / 'Any'.
-.PARAMETER ExposeWebUI
-    Optional switch to open port 8080 for Operator Web UI on LAN. Default is false (host-local only).
 .PARAMETER Unattended
     Executes in non-interactive mode without interactive confirmation prompts.
 .PARAMETER Force
@@ -30,8 +29,6 @@ param (
     [string]$Profile = "Private",
 
     [string]$RemoteAddress = "LocalSubnet",
-
-    [switch]$ExposeWebUI = $false,
 
     [switch]$Unattended = $false,
 
@@ -60,22 +57,16 @@ $targetRules = @(
     }
 )
 
-if ($ExposeWebUI) {
-    $targetRules += @{
-        Name        = "AndroGrid-Web-UI"
-        DisplayName = "AndroGrid Operator Web UI & Pairing Dashboard"
-        Protocol    = "TCP"
-        Port        = 8080
-        Description = "AndroGrid Operator Dashboard (Scoped to LAN) [INV-002]"
-        Required    = $false
-    }
-}
-
 # Obsolete rules from legacy iterations to migrate/purge
 $obsoleteRuleNames = @(
     "AndroGrid-Orchestrator-App",
     "AndroGrid-Artifact-HTTP",
-    "AndroGrid-mDNS-Multicast"
+    "AndroGrid-mDNS-Multicast",
+    "AndroGrid-gRPC-50051",
+    "AndroGrid-Artifacts-50052",
+    "AndroGrid-WebUI-8080",
+    "AndroGrid-mDNS-5353",
+    "AndroGrid-Web-UI"
 )
 
 function Test-IsAdmin {
@@ -90,7 +81,7 @@ function Show-Preview {
     Write-Host "================================================================================" -ForegroundColor Cyan
     Write-Host "Target Profile:         $Profile" -ForegroundColor Yellow
     Write-Host "Remote Address Scope:   $RemoteAddress" -ForegroundColor Yellow
-    Write-Host "Web UI LAN Ingress:     $(if ($ExposeWebUI) { 'ENABLED (Port 8080)' } else { 'DISABLED (Host-Local Only)' })" -ForegroundColor Yellow
+    Write-Host "Web UI LAN Ingress:     DISABLED (Host-Local 127.0.0.1:8080 only; use Caddy for TLS proxy)" -ForegroundColor Yellow
     Write-Host ""
     Write-Host "Inbound Rules to be Configured / Replaced:" -ForegroundColor Green
     foreach ($r in $targetRules) {
@@ -225,7 +216,7 @@ switch ($Action) {
         if (-not (Test-IsAdmin)) {
             Write-Host "Administrative elevation required to apply firewall changes." -ForegroundColor Yellow
             Write-Host "Requesting elevation..." -ForegroundColor Cyan
-            $argsList = "-ExecutionPolicy Bypass -File `"$PSCommandPath`" -Action Apply -Profile $Profile -RemoteAddress `"$RemoteAddress`" $(if ($ExposeWebUI) { '-ExposeWebUI' }) -Unattended"
+            $argsList = "-ExecutionPolicy Bypass -File `"$PSCommandPath`" -Action Apply -Profile $Profile -RemoteAddress `"$RemoteAddress`" -Unattended"
             $proc = Start-Process powershell -Verb RunAs -ArgumentList $argsList -PassThru -Wait
             exit $proc.ExitCode
         }

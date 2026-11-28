@@ -61,6 +61,7 @@ pub struct ClusterScheduler {
     inner: Arc<RwLock<SchedulerInner>>,
     event_sender: tokio::sync::broadcast::Sender<crate::observability::ClusterEvent>,
     rollout_store: Arc<crate::scheduler::rollout_store::RolloutStore>,
+    admission_store: Arc<crate::scheduler::admission_store::DurableAdmissionStore>,
 }
 
 /// Canonical approved onboarding version baseline.
@@ -114,7 +115,6 @@ struct SchedulerInner {
     node_groups: HashMap<String, NodeGroupRecord>,
     pending_cancellations: HashMap<String, Vec<String>>,
     active_rollouts: HashMap<String, UpgradeRolloutRecord>,
-    admitted_nodes: HashSet<String>,
     allow_insecure_root_tasks: bool,
     thermal_policy: ThermalPolicy,
 }
@@ -129,10 +129,11 @@ impl ClusterScheduler {
     ///
     /// Traces to: [INV-006], [NFR-POW-001]
     pub fn with_options(allow_insecure_root_tasks: bool, thermal_policy: ThermalPolicy) -> Self {
-        Self::with_options_and_store(
+        Self::with_options_and_stores(
             allow_insecure_root_tasks,
             thermal_policy,
             Arc::new(crate::scheduler::rollout_store::RolloutStore::new()),
+            Arc::new(crate::scheduler::admission_store::DurableAdmissionStore::new_in_memory()),
         )
     }
 
@@ -142,7 +143,12 @@ impl ClusterScheduler {
     pub fn with_rollout_store(
         rollout_store: Arc<crate::scheduler::rollout_store::RolloutStore>,
     ) -> Self {
-        Self::with_options_and_store(false, ThermalPolicy::default(), rollout_store)
+        Self::with_options_and_stores(
+            false,
+            ThermalPolicy::default(),
+            rollout_store,
+            Arc::new(crate::scheduler::admission_store::DurableAdmissionStore::new_in_memory()),
+        )
     }
 
     /// Creates a cluster scheduler with explicit options and a dedicated durable rollout store.
@@ -153,18 +159,24 @@ impl ClusterScheduler {
         thermal_policy: ThermalPolicy,
         rollout_store: Arc<crate::scheduler::rollout_store::RolloutStore>,
     ) -> Self {
+        Self::with_options_and_stores(
+            allow_insecure_root_tasks,
+            thermal_policy,
+            rollout_store,
+            Arc::new(crate::scheduler::admission_store::DurableAdmissionStore::new_in_memory()),
+        )
+    }
+
+    /// Creates a cluster scheduler with explicit options, rollout store, and durable admission store.
+    ///
+    /// Traces to: ADR-010, ADR-012, [INV-002], [REQ-OP-001], [REQ-VER-001], Gate L-02
+    pub fn with_options_and_stores(
+        allow_insecure_root_tasks: bool,
+        thermal_policy: ThermalPolicy,
+        rollout_store: Arc<crate::scheduler::rollout_store::RolloutStore>,
+        admission_store: Arc<crate::scheduler::admission_store::DurableAdmissionStore>,
+    ) -> Self {
         let (event_sender, _) = tokio::sync::broadcast::channel(1024);
-        let mut admitted_nodes = HashSet::new();
-        if let Some(dir) = rollout_store.storage_dir() {
-            let path = dir.join("admitted_nodes.json");
-            if path.exists() {
-                if let Ok(data) = std::fs::read_to_string(&path) {
-                    if let Ok(nodes) = serde_json::from_str::<HashSet<String>>(&data) {
-                        admitted_nodes = nodes;
-                    }
-                }
-            }
-        }
         Self {
             inner: Arc::new(RwLock::new(SchedulerInner {
                 tasks: HashMap::new(),
@@ -173,31 +185,34 @@ impl ClusterScheduler {
                 node_groups: HashMap::new(),
                 pending_cancellations: HashMap::new(),
                 active_rollouts: HashMap::new(),
-                admitted_nodes,
                 allow_insecure_root_tasks,
                 thermal_policy,
             })),
             event_sender,
             rollout_store,
+            admission_store,
         }
     }
 
     /// Checks if a node_id was already admitted to this cluster.
     pub fn is_node_admitted(&self, node_id: &str) -> bool {
         let inner = self.inner.read().expect("RwLock read lock poisoned");
-        inner.workers.contains_key(node_id) || inner.admitted_nodes.contains(node_id)
+        inner.workers.contains_key(node_id) || self.admission_store.is_admitted(node_id)
+    }
+
+    /// Returns a reference to the durable admission store.
+    pub fn admission_store(&self) -> &Arc<crate::scheduler::admission_store::DurableAdmissionStore> {
+        &self.admission_store
     }
 
     /// Manually marks a node_id as admitted (used in test fixtures and seed data).
     pub fn mark_node_admitted(&self, node_id: &str) {
-        let mut inner = self.inner.write().expect("RwLock write lock poisoned");
-        inner.admitted_nodes.insert(node_id.to_string());
-        if let Some(dir) = self.rollout_store.storage_dir() {
-            let path = dir.join("admitted_nodes.json");
-            if let Ok(json) = serde_json::to_string(&inner.admitted_nodes) {
-                let _ = std::fs::write(path, json);
-            }
-        }
+        let _ = self.admission_store.commit_admission(
+            node_id,
+            APPROVED_ONBOARDING_BASELINE,
+            0,
+            crate::scheduler::admission_store::AdmissionSource::AdminSeeded,
+        );
     }
 
     /// Subscribes to real-time cluster broadcast events.
@@ -317,7 +332,7 @@ impl ClusterScheduler {
         // Existing members reconnecting are preserved without forced upgrade or eviction.
         // Traces to: [REQ-VER-001], [REQ-OP-001], Gate L-02
         let is_existing_member =
-            inner.workers.contains_key(&node_id) || inner.admitted_nodes.contains(&node_id);
+            inner.workers.contains_key(&node_id) || self.admission_store.is_admitted(&node_id);
         if !is_existing_member {
             if compare_client_versions(&client_version, APPROVED_ONBOARDING_BASELINE)
                 == std::cmp::Ordering::Less
@@ -333,21 +348,24 @@ impl ClusterScheduler {
                     min_version: APPROVED_ONBOARDING_BASELINE.to_string(),
                 });
             }
-            inner.admitted_nodes.insert(node_id.clone());
-            if let Some(dir) = self.rollout_store.storage_dir() {
-                let path = dir.join("admitted_nodes.json");
-                if let Ok(json) = serde_json::to_string(&inner.admitted_nodes) {
-                    let _ = std::fs::write(path, json);
-                }
-            }
-        } else if !inner.admitted_nodes.contains(&node_id) {
-            inner.admitted_nodes.insert(node_id.clone());
-            if let Some(dir) = self.rollout_store.storage_dir() {
-                let path = dir.join("admitted_nodes.json");
-                if let Ok(json) = serde_json::to_string(&inner.admitted_nodes) {
-                    let _ = std::fs::write(path, json);
-                }
-            }
+            // Commit to durable admission store OUTSIDE the scheduler's central write lock
+            drop(inner);
+            self.admission_store.commit_admission(
+                &node_id,
+                &client_version,
+                now_epoch_ms,
+                crate::scheduler::admission_store::AdmissionSource::FreshOnboarded,
+            )?;
+            inner = self.inner.write().expect("RwLock write lock poisoned");
+        } else if !self.admission_store.is_admitted(&node_id) {
+            drop(inner);
+            let _ = self.admission_store.commit_admission(
+                &node_id,
+                &client_version,
+                now_epoch_ms,
+                crate::scheduler::admission_store::AdmissionSource::FreshOnboarded,
+            );
+            inner = self.inner.write().expect("RwLock write lock poisoned");
         }
 
         // Enforce [INV-006]: If device is unrooted, filter supported engines to exclude RootShell
@@ -6192,9 +6210,16 @@ mod tests {
     fn test_admitted_nodes_persists_across_restart() {
         let temp_dir = std::env::temp_dir().join(format!("androgrid-admit-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&temp_dir);
-        let store = Arc::new(crate::scheduler::rollout_store::RolloutStore::with_directory(&temp_dir));
+        let db_path = temp_dir.join("admission.redb");
+        let store = Arc::new(crate::scheduler::admission_store::DurableAdmissionStore::open(&db_path).unwrap());
+        let rollout_store = Arc::new(crate::scheduler::rollout_store::RolloutStore::new());
 
-        let scheduler1 = ClusterScheduler::with_rollout_store(store.clone());
+        let scheduler1 = ClusterScheduler::with_options_and_stores(
+            false,
+            ThermalPolicy::default(),
+            rollout_store.clone(),
+            store.clone(),
+        );
         let caps = make_test_capabilities(false, false);
 
         // Register node with 0.0.1-alpha.6
@@ -6209,10 +6234,16 @@ mod tests {
         assert!(scheduler1.is_node_admitted("persisted-worker"));
 
         drop(scheduler1);
+        drop(store);
 
-        // Create new scheduler instance with the same storage directory
-        let store2 = Arc::new(crate::scheduler::rollout_store::RolloutStore::with_directory(&temp_dir));
-        let scheduler2 = ClusterScheduler::with_rollout_store(store2);
+        // Create new scheduler instance with the same storage database
+        let store2 = Arc::new(crate::scheduler::admission_store::DurableAdmissionStore::open(&db_path).unwrap());
+        let scheduler2 = ClusterScheduler::with_options_and_stores(
+            false,
+            ThermalPolicy::default(),
+            rollout_store,
+            store2,
+        );
         assert!(scheduler2.is_node_admitted("persisted-worker"));
 
         // Persisted worker reconnects with 0.0.1-alpha.5; recognized as admitted

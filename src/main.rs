@@ -88,10 +88,52 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Arc::new(RolloutStore::new())
     };
 
-    let scheduler = Arc::new(ClusterScheduler::with_options_and_store(
+    let admission_db_path = config.resolve_admission_db_path();
+    let admission_store = match androgrid_backend::DurableAdmissionStore::open(&admission_db_path) {
+        Ok(store) => Arc::new(store),
+        Err(e) => {
+            warn!(
+                path = %admission_db_path.display(),
+                error = %e,
+                "Failed to open redb admission store; falling back to ephemeral in-memory store"
+            );
+            Arc::new(androgrid_backend::DurableAdmissionStore::new_in_memory())
+        }
+    };
+
+    // Load administrator-confirmed historical membership inventory or environment seeds
+    if let Some(ref inv_path) = config.admission_inventory_path {
+        if inv_path.exists() {
+            match admission_store.load_inventory_file(inv_path, "0.0.1-alpha.5", 0) {
+                Ok(count) => info!(count = count, path = %inv_path.display(), "Loaded historical membership inventory"),
+                Err(e) => warn!(path = %inv_path.display(), error = %e, "Failed to load historical membership inventory"),
+            }
+        }
+    } else {
+        let default_inv = std::path::Path::new("androgrid-data").join("admitted_nodes.inventory");
+        if default_inv.exists() {
+            if let Ok(count) = admission_store.load_inventory_file(&default_inv, "0.0.1-alpha.5", 0) {
+                info!(count = count, "Loaded historical membership inventory from default path");
+            }
+        }
+    }
+
+    if let Some(ref seeded) = config.seeded_admitted_nodes {
+        let node_ids: Vec<String> = seeded
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if let Ok(count) = admission_store.seed_migration_batch(&node_ids, "0.0.1-alpha.5", 0) {
+            info!(count = count, "Seeded pre-configured admitted worker node IDs");
+        }
+    }
+
+    let scheduler = Arc::new(ClusterScheduler::with_options_and_stores(
         config.allow_insecure_root_tasks,
         ThermalPolicy::default(),
         rollout_store,
+        admission_store,
     ));
     if let Err(e) = scheduler.reconcile_rollouts_from_store() {
         warn!(error = %e, "Failed to reconcile active rollouts from durable store on startup");
@@ -316,19 +358,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Initialize mDNS DNS-SD service responder
     let mdns_responder = if config.enable_mdns {
+        let (direct_ip, _) =
+            androgrid_backend::resolve_direct_pairing_endpoint(&config.resolve_cluster_endpoint());
         let mdns_cfg = MdnsConfig {
             instance_name: config.mdns_service_name.clone(),
             host_name: "androgrid.local.".to_string(),
             port: config.listen_addr.port(),
             version: env!("CARGO_PKG_VERSION").to_string(),
             ca_fingerprint: ca_fingerprint.clone(),
-            ip: if !config.listen_addr.ip().is_unspecified() && !config.listen_addr.ip().is_loopback() {
-                Some(config.listen_addr.ip().to_string())
-            } else if let Ok(host_ip) = std::env::var("ANDROGRID_HOST_IP") {
-                Some(host_ip)
-            } else {
-                androgrid_backend::detect_outbound_lan_ipv4().map(|ip| ip.to_string())
-            },
+            ip: direct_ip,
         };
         match MdnsResponder::start(mdns_cfg) {
             Ok(resp) => {

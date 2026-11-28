@@ -1,0 +1,46 @@
+# Caddyfile: Secure Authenticated HTTPS Reverse Proxy for AndroGrid Operator Web UI
+#
+# Provides TLS encryption and authentication for LAN access to the Operator Web UI,
+# which binds exclusively to 127.0.0.1:8080 by default to prevent plaintext credential exposure.
+#
+# Traces to: [INV-002], [NFR-SEC-001], Gate L-02
+#
+# Usage:
+#   caddy run --config Caddyfile
+
+{
+    # Enable internal certificate authority for local LAN access
+    local_certs
+}
+
+# Bind to port 8443 with HTTPS
+:8443 {
+    # Internal TLS certificate generation
+    tls internal
+
+    # Optional HTTP Basic Authentication (uncomment and replace hash with `caddy hash-password`)
+    # basicauth {
+    #     admin $2a$14$Zkx19XLiW6VYouLHR5NmfOFU0z2GTNmpkT/5qqR78UbQjHsAbD.NS
+    # }
+
+    # Reverse proxy to loopback-only AndroGrid Operator Web UI
+    reverse_proxy 127.0.0.1:8080 {
+        header_up Host {host}
+        header_up X-Real-IP {remote_host}
+        header_up X-Forwarded-For {remote_host}
+        header_up X-Forwarded-Proto https
+    }
+
+    # Security headers
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "DENY"
+        Referrer-Policy "strict-origin-when-cross-origin"
+    }
+
+    log {
+        output stdout
+        format console
+    }
+}

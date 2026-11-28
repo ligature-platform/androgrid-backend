@@ -106,6 +106,22 @@ pub struct ClusterConfig {
     /// Traces to: ADR-010, [REQ-OP-001], [NFR-REL-001]
     pub rollout_storage_dir: Option<PathBuf>,
 
+    /// Optional persistent state directory for cluster operational data.
+    /// Traces to: [REQ-OP-001], Gate L-02
+    pub state_dir: Option<PathBuf>,
+
+    /// Explicit path to the embedded transactional admission database (`admission.redb`).
+    /// Traces to: [REQ-OP-001], [REQ-VER-001], Gate L-02
+    pub admission_db_path: Option<PathBuf>,
+
+    /// Optional path to an administrator-confirmed historical membership inventory file.
+    /// Traces to: [REQ-OP-001], Gate L-02
+    pub admission_inventory_path: Option<PathBuf>,
+
+    /// Optional comma-separated list of pre-seeded admitted worker node IDs.
+    /// Traces to: [REQ-OP-001], Gate L-02
+    pub seeded_admitted_nodes: Option<String>,
+
     /// Maximum allowed byte length for uploaded APK artifacts (default: 128 MB).
     /// Traces to: [NFR-PERF-001]
     pub max_apk_bytes: usize,
@@ -180,6 +196,10 @@ impl Default for ClusterConfig {
             artifact_base_url: None,
             artifact_storage_dir: None,
             rollout_storage_dir: None,
+            state_dir: None,
+            admission_db_path: None,
+            admission_inventory_path: None,
+            seeded_admitted_nodes: None,
             max_apk_bytes: 128 * 1024 * 1024,
             enforce_hardware_attestation: false,
             require_attestation_challenge: false,
@@ -314,6 +334,22 @@ impl ClusterConfig {
             config.rollout_storage_dir = Some(PathBuf::from(val));
         }
 
+        if let Ok(val) = std::env::var("ANDROGRID_STATE_DIR") {
+            config.state_dir = Some(PathBuf::from(val));
+        }
+
+        if let Ok(val) = std::env::var("ANDROGRID_ADMISSION_DB") {
+            config.admission_db_path = Some(PathBuf::from(val));
+        }
+
+        if let Ok(val) = std::env::var("ANDROGRID_ADMISSION_INVENTORY") {
+            config.admission_inventory_path = Some(PathBuf::from(val));
+        }
+
+        if let Ok(val) = std::env::var("ANDROGRID_SEEDED_ADMITTED_NODES") {
+            config.seeded_admitted_nodes = Some(val);
+        }
+
         if let Ok(val) = std::env::var("ANDROGRID_MAX_APK_BYTES") {
             config.max_apk_bytes =
                 val.parse::<usize>()
@@ -401,6 +437,25 @@ impl ClusterConfig {
     /// Resolves the base URL for worker artifact downloads.
     ///
     /// Traces to: [NFR-PERF-001], [REQ-OP-003]
+    /// Resolves the canonical database path for the embedded transactional admission store.
+    ///
+    /// Traces to: [REQ-OP-001], [REQ-VER-001], Gate L-02
+    pub fn resolve_admission_db_path(&self) -> PathBuf {
+        if let Some(ref p) = self.admission_db_path {
+            return p.clone();
+        }
+        if let Some(ref state_dir) = self.state_dir {
+            return state_dir.join("admission.redb");
+        }
+        if let Some(ref rollout_dir) = self.rollout_storage_dir {
+            return rollout_dir.join("admission.redb");
+        }
+        if let Some(ref artifact_dir) = self.artifact_storage_dir {
+            return artifact_dir.join("admission.redb");
+        }
+        PathBuf::from("androgrid-data").join("state").join("admission.redb")
+    }
+
     pub fn resolve_artifact_base_url(&self) -> String {
         if let Some(ref base) = self.artifact_base_url {
             base.trim_end_matches('/').to_string()

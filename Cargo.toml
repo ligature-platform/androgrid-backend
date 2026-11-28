@@ -39,6 +39,7 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 mdns-sd = "0.22.0"
 base64 = "0.22"
 subtle = "2.6"
+redb = "2.1"
 
 
 [features]

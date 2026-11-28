@@ -238,6 +238,8 @@ impl ArtifactServer {
                 if magic_buf.len() == expected_magic.len() {
                     if magic_buf.as_slice() != expected_magic {
                         drop(writer);
+                        // Drain remaining incoming stream to prevent TCP RST abort on client
+                        while let Some(Ok(_)) = stream.next().await {}
                         return (
                             StatusCode::UNPROCESSABLE_ENTITY,
                             format!("Payload magic bytes do not match kind '{}'", kind.as_str()),
