@@ -61,6 +61,40 @@ pub struct ClusterScheduler {
     inner: Arc<RwLock<SchedulerInner>>,
     event_sender: tokio::sync::broadcast::Sender<crate::observability::ClusterEvent>,
     rollout_store: Arc<crate::scheduler::rollout_store::RolloutStore>,
+    admission_store: Arc<crate::scheduler::admission_store::DurableAdmissionStore>,
+}
+
+/// Canonical approved onboarding version baseline.
+///
+/// Any newly joining worker node reporting a client version lower than this baseline
+/// is refused admission and blocked from receiving compute work until upgraded.
+/// Existing already-admitted workers reconnecting are preserved without forced upgrade.
+///
+/// Traces to: [REQ-VER-001], [REQ-OP-001], Gate L-02
+pub const APPROVED_ONBOARDING_BASELINE: &str = "0.0.1-alpha.6";
+
+/// Parses a client version string into a SemVer 2.0.0 Version.
+///
+/// Strips leading 'v' or 'V' prefixes and whitespace. Rejects malformed version strings.
+/// Traces to: [REQ-VER-001]
+pub fn parse_client_version(v: &str) -> Result<semver::Version, SchedulingError> {
+    let trimmed = v.trim().trim_start_matches(|c| c == 'v' || c == 'V');
+    semver::Version::parse(trimmed).map_err(|e| {
+        SchedulingError::InvalidClientVersion(format!("Invalid SemVer client version '{v}': {e}"))
+    })
+}
+
+/// Compares two client version strings according to SemVer 2.0.0 precedence rules.
+///
+/// Build metadata (+...) is ignored during precedence comparison as per SemVer 2.0.0 Section 10.
+/// Traces to: [REQ-VER-001]
+pub fn compare_client_versions(v1: &str, v2: &str) -> Result<std::cmp::Ordering, SchedulingError> {
+    let mut p1 = parse_client_version(v1)?;
+    let mut p2 = parse_client_version(v2)?;
+    // SemVer 2.0.0 Section 10: Build metadata MUST be ignored when determining version precedence
+    p1.build = semver::BuildMetadata::EMPTY;
+    p2.build = semver::BuildMetadata::EMPTY;
+    Ok(p1.cmp(&p2))
 }
 
 impl Default for ClusterScheduler {
@@ -91,10 +125,11 @@ impl ClusterScheduler {
     ///
     /// Traces to: [INV-006], [NFR-POW-001]
     pub fn with_options(allow_insecure_root_tasks: bool, thermal_policy: ThermalPolicy) -> Self {
-        Self::with_options_and_store(
+        Self::with_options_and_stores(
             allow_insecure_root_tasks,
             thermal_policy,
             Arc::new(crate::scheduler::rollout_store::RolloutStore::new()),
+            Arc::new(crate::scheduler::admission_store::DurableAdmissionStore::new_in_memory()),
         )
     }
 
@@ -104,7 +139,12 @@ impl ClusterScheduler {
     pub fn with_rollout_store(
         rollout_store: Arc<crate::scheduler::rollout_store::RolloutStore>,
     ) -> Self {
-        Self::with_options_and_store(false, ThermalPolicy::default(), rollout_store)
+        Self::with_options_and_stores(
+            false,
+            ThermalPolicy::default(),
+            rollout_store,
+            Arc::new(crate::scheduler::admission_store::DurableAdmissionStore::new_in_memory()),
+        )
     }
 
     /// Creates a cluster scheduler with explicit options and a dedicated durable rollout store.
@@ -114,6 +154,23 @@ impl ClusterScheduler {
         allow_insecure_root_tasks: bool,
         thermal_policy: ThermalPolicy,
         rollout_store: Arc<crate::scheduler::rollout_store::RolloutStore>,
+    ) -> Self {
+        Self::with_options_and_stores(
+            allow_insecure_root_tasks,
+            thermal_policy,
+            rollout_store,
+            Arc::new(crate::scheduler::admission_store::DurableAdmissionStore::new_in_memory()),
+        )
+    }
+
+    /// Creates a cluster scheduler with explicit options, rollout store, and durable admission store.
+    ///
+    /// Traces to: ADR-010, ADR-012, [INV-002], [REQ-OP-001], [REQ-VER-001], Gate L-02
+    pub fn with_options_and_stores(
+        allow_insecure_root_tasks: bool,
+        thermal_policy: ThermalPolicy,
+        rollout_store: Arc<crate::scheduler::rollout_store::RolloutStore>,
+        admission_store: Arc<crate::scheduler::admission_store::DurableAdmissionStore>,
     ) -> Self {
         let (event_sender, _) = tokio::sync::broadcast::channel(1024);
         Self {
@@ -129,7 +186,31 @@ impl ClusterScheduler {
             })),
             event_sender,
             rollout_store,
+            admission_store,
         }
+    }
+
+    /// Checks if a node_id was already admitted to this cluster.
+    pub fn is_node_admitted(&self, node_id: &str) -> bool {
+        let inner = self.inner.read().expect("RwLock read lock poisoned");
+        inner.workers.contains_key(node_id) || self.admission_store.is_admitted(node_id)
+    }
+
+    /// Returns a reference to the durable admission store.
+    pub fn admission_store(
+        &self,
+    ) -> &Arc<crate::scheduler::admission_store::DurableAdmissionStore> {
+        &self.admission_store
+    }
+
+    /// Manually marks a node_id as admitted (used in test fixtures and seed data).
+    pub fn mark_node_admitted(&self, node_id: &str) {
+        let _ = self.admission_store.commit_admission(
+            node_id,
+            APPROVED_ONBOARDING_BASELINE,
+            0,
+            crate::scheduler::admission_store::AdmissionSource::AdminSeeded,
+        );
     }
 
     /// Subscribes to real-time cluster broadcast events.
@@ -244,6 +325,45 @@ impl ClusterScheduler {
         }
         let validated_labels = validate_labels(&labels, false)?;
         let mut inner = self.inner.write().expect("RwLock write lock poisoned");
+
+        // Enforce onboarding version baseline gate: newly joining workers must meet or exceed APPROVED_ONBOARDING_BASELINE.
+        // Existing members reconnecting are preserved without forced upgrade or eviction.
+        // Traces to: [REQ-VER-001], [REQ-OP-001], Gate L-02
+        let is_existing_member =
+            inner.workers.contains_key(&node_id) || self.admission_store.is_admitted(&node_id);
+        if !is_existing_member {
+            let ordering = compare_client_versions(&client_version, APPROVED_ONBOARDING_BASELINE)?;
+            if ordering == std::cmp::Ordering::Less {
+                tracing::warn!(
+                    node_id = %node_id,
+                    client_version = %client_version,
+                    baseline = %APPROVED_ONBOARDING_BASELINE,
+                    "Refusing admission to new node below baseline version"
+                );
+                return Err(SchedulingError::OnboardingVersionBelowBaseline {
+                    client_version,
+                    min_version: APPROVED_ONBOARDING_BASELINE.to_string(),
+                });
+            }
+            // Commit to durable admission store OUTSIDE the scheduler's central write lock
+            drop(inner);
+            self.admission_store.commit_admission(
+                &node_id,
+                &client_version,
+                now_epoch_ms,
+                crate::scheduler::admission_store::AdmissionSource::FreshOnboarded,
+            )?;
+            inner = self.inner.write().expect("RwLock write lock poisoned");
+        } else if !self.admission_store.is_admitted(&node_id) {
+            drop(inner);
+            let _ = self.admission_store.commit_admission(
+                &node_id,
+                &client_version,
+                now_epoch_ms,
+                crate::scheduler::admission_store::AdmissionSource::FreshOnboarded,
+            );
+            inner = self.inner.write().expect("RwLock write lock poisoned");
+        }
 
         // Enforce [INV-006]: If device is unrooted, filter supported engines to exclude RootShell
         if !capabilities.is_rooted {
@@ -5984,6 +6104,180 @@ mod tests {
         assert_eq!(node1_done.desired_client_version, "");
         assert!(node2_promoted.draining);
         assert_eq!(node2_promoted.desired_client_version, "0.2.0");
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// Verifies version string comparison across pre-release and general release identifiers.
+    ///
+    /// Traces to: [REQ-VER-001], Gate L-02
+    #[test]
+    fn test_compare_client_versions() {
+        assert_eq!(
+            compare_client_versions("0.0.1-alpha.5", "0.0.1-alpha.6").unwrap(),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            compare_client_versions("0.0.1-alpha.6", "0.0.1-alpha.6").unwrap(),
+            std::cmp::Ordering::Equal
+        );
+        assert_eq!(
+            compare_client_versions("0.0.1-alpha.7", "0.0.1-alpha.6").unwrap(),
+            std::cmp::Ordering::Greater
+        );
+        assert_eq!(
+            compare_client_versions("0.1.0", "0.0.1-alpha.6").unwrap(),
+            std::cmp::Ordering::Greater
+        );
+        assert_eq!(
+            compare_client_versions("1.0.0", "0.0.1-alpha.6").unwrap(),
+            std::cmp::Ordering::Greater
+        );
+        assert_eq!(
+            compare_client_versions("v0.0.1-alpha.6", "0.0.1-alpha.6").unwrap(),
+            std::cmp::Ordering::Equal
+        );
+        assert_eq!(
+            compare_client_versions("0.0.1-alpha.6+build.100", "0.0.1-alpha.6+build.200").unwrap(),
+            std::cmp::Ordering::Equal
+        );
+        // Numeric prerelease has lower precedence than alphanumeric prerelease (0 < alpha)
+        assert_eq!(
+            compare_client_versions("0.0.1-0", "0.0.1-alpha.6").unwrap(),
+            std::cmp::Ordering::Less
+        );
+        // Prerelease precedence: alpha < beta < rc
+        assert_eq!(
+            compare_client_versions("0.0.1-alpha.1", "0.0.1-beta.1").unwrap(),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            compare_client_versions("0.0.1-beta.1", "0.0.1-rc.1").unwrap(),
+            std::cmp::Ordering::Less
+        );
+        // Malformed versions return Err
+        assert!(compare_client_versions("0.bad.0.1-alpha.6", "0.0.1-alpha.6").is_err());
+        assert!(parse_client_version("not-a-version").is_err());
+    }
+
+    /// Verifies newly joining workers reporting client version below baseline are rejected.
+    ///
+    /// Traces to: [REQ-VER-001], [REQ-OP-001], Gate L-02
+    #[test]
+    fn test_register_node_rejects_new_worker_below_onboarding_baseline() {
+        let scheduler = ClusterScheduler::new();
+        let caps = make_test_capabilities(false, false);
+
+        // First attempt with 0.0.1-alpha.5 must fail admission
+        let err = scheduler
+            .register_node(
+                "new-node-alpha5".to_string(),
+                caps.clone(),
+                "0.0.1-alpha.5".to_string(),
+                1000,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            SchedulingError::OnboardingVersionBelowBaseline {
+                client_version,
+                min_version,
+            } if client_version == "0.0.1-alpha.5" && min_version == "0.0.1-alpha.6"
+        ));
+
+        // Attempt with baseline version 0.0.1-alpha.6 must succeed
+        let reg = scheduler
+            .register_node(
+                "new-node-alpha6".to_string(),
+                caps,
+                "0.0.1-alpha.6".to_string(),
+                1001,
+            )
+            .unwrap();
+        assert!(reg.session_token.contains("new-node-alpha6"));
+    }
+
+    /// Verifies existing admitted workers are permitted to reconnect even below baseline.
+    ///
+    /// Traces to: [REQ-VER-001], [REQ-OP-001], Gate L-02
+    #[test]
+    fn test_register_node_permits_existing_worker_below_onboarding_baseline() {
+        let scheduler = ClusterScheduler::new();
+        let caps = make_test_capabilities(false, false);
+
+        // Pre-mark node as admitted (simulating prior admission before gate was raised)
+        scheduler.mark_node_admitted("legacy-worker");
+        assert!(scheduler.is_node_admitted("legacy-worker"));
+
+        // Legacy worker reconnects with 0.0.1-alpha.5; must succeed without rejection or eviction
+        let reg = scheduler
+            .register_node(
+                "legacy-worker".to_string(),
+                caps,
+                "0.0.1-alpha.5".to_string(),
+                1000,
+            )
+            .unwrap();
+        assert!(reg.session_token.contains("legacy-worker"));
+    }
+
+    /// Verifies admitted node membership persists across scheduler instance restarts.
+    ///
+    /// Traces to: [REQ-VER-001], [REQ-OP-001], Gate L-02
+    #[test]
+    fn test_admitted_nodes_persists_across_restart() {
+        let temp_dir = std::env::temp_dir().join(format!("androgrid-admit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let db_path = temp_dir.join("admission.redb");
+        let store = Arc::new(
+            crate::scheduler::admission_store::DurableAdmissionStore::open(&db_path).unwrap(),
+        );
+        let rollout_store = Arc::new(crate::scheduler::rollout_store::RolloutStore::new());
+
+        let scheduler1 = ClusterScheduler::with_options_and_stores(
+            false,
+            ThermalPolicy::default(),
+            rollout_store.clone(),
+            store.clone(),
+        );
+        let caps = make_test_capabilities(false, false);
+
+        // Register node with 0.0.1-alpha.6
+        scheduler1
+            .register_node(
+                "persisted-worker".to_string(),
+                caps.clone(),
+                "0.0.1-alpha.6".to_string(),
+                1000,
+            )
+            .unwrap();
+        assert!(scheduler1.is_node_admitted("persisted-worker"));
+
+        drop(scheduler1);
+        drop(store);
+
+        // Create new scheduler instance with the same storage database
+        let store2 = Arc::new(
+            crate::scheduler::admission_store::DurableAdmissionStore::open(&db_path).unwrap(),
+        );
+        let scheduler2 = ClusterScheduler::with_options_and_stores(
+            false,
+            ThermalPolicy::default(),
+            rollout_store,
+            store2,
+        );
+        assert!(scheduler2.is_node_admitted("persisted-worker"));
+
+        // Persisted worker reconnects with 0.0.1-alpha.5; recognized as admitted
+        let reg = scheduler2
+            .register_node(
+                "persisted-worker".to_string(),
+                caps,
+                "0.0.1-alpha.5".to_string(),
+                2000,
+            )
+            .unwrap();
+        assert!(reg.session_token.contains("persisted-worker"));
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

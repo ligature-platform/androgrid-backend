@@ -182,6 +182,18 @@ impl From<SchedulingError> for Status {
             SchedulingError::InvalidNetworkEgress(msg) => {
                 Status::invalid_argument(format!("INVALID_NETWORK_EGRESS: {}", msg))
             }
+
+            // Traces to: [REQ-VER-001], [REQ-OP-001]
+            SchedulingError::OnboardingVersionBelowBaseline {
+                client_version,
+                min_version,
+            } => Status::failed_precondition(format!(
+                "ONBOARDING_VERSION_BELOW_BASELINE: worker client version '{client_version}' is below approved onboarding baseline '{min_version}'. Manual APK upgrade required before first admission."
+            )),
+
+            SchedulingError::InvalidClientVersion(msg) => {
+                Status::invalid_argument(format!("INVALID_ARGUMENT: {msg}"))
+            }
         }
     }
 }

@@ -110,6 +110,47 @@ pub fn normalize_cluster_endpoint(endpoint: &str, default_port: u16) -> Result<S
     }
 }
 
+/// Resolves direct connection IP/hostname and port for pairing payloads.
+///
+/// Priority:
+/// 1. If cluster endpoint host is a reachable non-loopback, non-unspecified IP/hostname, use it.
+/// 2. If cluster endpoint is loopback or unspecified:
+///    a. Check `ANDROGRID_HOST_IP` environment variable override.
+///    b. Fallback to `detect_outbound_lan_ipv4()`.
+///
+/// Traces to: [REQ-OP-001], [INV-001], [INV-002], Gate L-02
+pub fn resolve_direct_pairing_endpoint(cluster_endpoint: &str) -> (Option<String>, Option<u16>) {
+    let stripped = strip_uri_scheme(cluster_endpoint);
+    if let Some((h, p)) = stripped.rsplit_once(':') {
+        if let Ok(port) = p.parse::<u16>() {
+            let host = h.trim_start_matches('[').trim_end_matches(']').to_string();
+            // 1. Check explicit override ANDROGRID_HOST_IP first
+            if let Ok(host_ip) = std::env::var("ANDROGRID_HOST_IP") {
+                let trimmed = host_ip.trim();
+                if !trimmed.is_empty() {
+                    return (Some(trimmed.to_string()), Some(port));
+                }
+            }
+            // 2. If cluster endpoint host is non-loopback, non-unspecified IP/hostname, use it
+            if host != "127.0.0.1"
+                && host != "localhost"
+                && host != "::1"
+                && host != "0.0.0.0"
+                && host != "::"
+                && !host.is_empty()
+            {
+                return (Some(host), Some(port));
+            }
+            // 3. Fallback to outbound LAN route detection
+            if let Some(lan_ip) = crate::config::detect_outbound_lan_ipv4() {
+                return (Some(lan_ip.to_string()), Some(port));
+            }
+            return (None, Some(port));
+        }
+    }
+    (None, None)
+}
+
 /// Compact device pairing payload scanned by the Android worker.
 ///
 /// Traces to: [INV-002], [NFR-SEC-001], [REQ-OP-001]
@@ -130,18 +171,73 @@ pub struct PairingPayload {
 
     /// Expiration timestamp in epoch seconds.
     pub expires_at_epoch_s: u64,
+
+    /// Direct reachable host IP address for manual or fallback pairing (optional).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direct_ip: Option<String>,
+
+    /// Direct reachable host port for manual or fallback pairing (optional).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direct_port: Option<u16>,
 }
 
 impl PairingPayload {
+    /// Constructs a PairingPayload builder with explicit direct endpoint IP and port.
+    pub fn with_direct_endpoint(mut self, ip: impl Into<String>, port: u16) -> Self {
+        self.direct_ip = Some(ip.into());
+        self.direct_port = Some(port);
+        self
+    }
+
+    /// Resolves direct host and port components, preferring direct_ip and direct_port
+    /// if present, or deriving them from cluster_endpoint.
+    pub fn parse_endpoint(&self, default_port: u16) -> (String, u16) {
+        if let (Some(ref ip), Some(port)) = (&self.direct_ip, self.direct_port) {
+            return (ip.clone(), port);
+        }
+        let stripped = strip_uri_scheme(&self.cluster_endpoint);
+        if let Some((h, p)) = stripped.rsplit_once(':') {
+            let port = p.parse::<u16>().unwrap_or(default_port);
+            (
+                h.trim_start_matches('[').trim_end_matches(']').to_string(),
+                port,
+            )
+        } else {
+            (stripped, default_port)
+        }
+    }
+
     /// Serializes the pairing payload to a compact JSON string, normalizing `cluster_endpoint`
-    /// to canonical `host:port` format without URI scheme prefixes.
+    /// to canonical `host:port` format without URI scheme prefixes and encoding direct endpoint.
     pub fn to_compact_json(&self) -> Result<String, QrError> {
+        let (derived_ip, derived_port) = if self.direct_ip.is_some() && self.direct_port.is_some() {
+            (self.direct_ip.clone(), self.direct_port)
+        } else {
+            let stripped = strip_uri_scheme(&self.cluster_endpoint);
+            if let Some((h, p)) = stripped.rsplit_once(':') {
+                if let Ok(port) = p.parse::<u16>() {
+                    let host = h.trim_start_matches('[').trim_end_matches(']').to_string();
+                    if host != "127.0.0.1" && host != "localhost" && !host.is_empty() {
+                        (Some(host), Some(port))
+                    } else {
+                        (None, None)
+                    }
+                } else {
+                    (None, None)
+                }
+            } else {
+                (None, None)
+            }
+        };
+
         let normalized = PairingPayload {
             cluster_endpoint: strip_uri_scheme(&self.cluster_endpoint),
             ca_fingerprint: self.ca_fingerprint.clone(),
             pairing_token: self.pairing_token.clone(),
             node_id: self.node_id.clone(),
             expires_at_epoch_s: self.expires_at_epoch_s,
+            direct_ip: derived_ip,
+            direct_port: derived_port,
         };
         serde_json::to_string(&normalized).map_err(|e| QrError::Serialization(e.to_string()))
     }
@@ -256,6 +352,8 @@ mod tests {
             pairing_token: "abcd1234efgh5678".to_string(),
             node_id: Some("worker-node-alpha".to_string()),
             expires_at_epoch_s: 1700000300,
+            direct_ip: None,
+            direct_port: None,
         };
 
         let json = payload
@@ -271,6 +369,32 @@ mod tests {
         let deserialized = PairingPayload::from_json(&json).expect("Deserialization must succeed");
         assert_eq!(deserialized.cluster_endpoint, "192.168.1.50:50051");
         assert_eq!(deserialized.pairing_token, payload.pairing_token);
+        assert_eq!(deserialized.direct_ip.as_deref(), Some("192.168.1.50"));
+        assert_eq!(deserialized.direct_port, Some(50051));
+    }
+
+    #[test]
+    fn test_pairing_payload_with_explicit_direct_endpoint() {
+        let payload = PairingPayload {
+            cluster_endpoint: "cluster.internal:50051".to_string(),
+            ca_fingerprint: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                .to_string(),
+            pairing_token: "tok123".to_string(),
+            node_id: None,
+            expires_at_epoch_s: 1800000000,
+            direct_ip: None,
+            direct_port: None,
+        }
+        .with_direct_endpoint("10.100.102.6", 50051);
+
+        let json = payload.to_compact_json().expect("to_compact_json");
+        let decoded = PairingPayload::from_json(&json).expect("from_json");
+        assert_eq!(decoded.direct_ip.as_deref(), Some("10.100.102.6"));
+        assert_eq!(decoded.direct_port, Some(50051));
+        assert_eq!(
+            decoded.parse_endpoint(50051),
+            ("10.100.102.6".to_string(), 50051)
+        );
     }
 
     #[test]
@@ -349,5 +473,27 @@ mod tests {
         let data_url = render_png_data_url(content).expect("render_png_data_url must succeed");
         assert!(data_url.starts_with("data:image/png;base64,"));
         assert!(data_url.len() > 150);
+    }
+
+    #[test]
+    fn test_resolve_direct_pairing_endpoint_honors_override_and_routable_hosts() {
+        // Explicit physical endpoint
+        let (ip, port) = resolve_direct_pairing_endpoint("192.168.1.50:50051");
+        assert_eq!(ip.as_deref(), Some("192.168.1.50"));
+        assert_eq!(port, Some(50051));
+
+        // Loopback with explicit ANDROGRID_HOST_IP override
+        std::env::set_var("ANDROGRID_HOST_IP", "10.200.1.5");
+        let (ip_overridden, port_overridden) = resolve_direct_pairing_endpoint("127.0.0.1:50051");
+        assert_eq!(ip_overridden.as_deref(), Some("10.200.1.5"));
+        assert_eq!(port_overridden, Some(50051));
+        std::env::remove_var("ANDROGRID_HOST_IP");
+
+        // Loopback without override falls back to detect_outbound_lan_ipv4 or None
+        let (ip_fallback, port_fallback) = resolve_direct_pairing_endpoint("127.0.0.1:50051");
+        assert_eq!(port_fallback, Some(50051));
+        if let Some(lan) = crate::config::detect_outbound_lan_ipv4() {
+            assert_eq!(ip_fallback.as_deref(), Some(lan.to_string().as_str()));
+        }
     }
 }

@@ -468,12 +468,17 @@ impl AdminService for AdminServiceImpl {
             .generate_token_with_preconfirmation(target_node_id.clone(), ttl, true)
             .map_err(|e| Status::failed_precondition(e.to_string()))?;
 
+        let (direct_ip, direct_port) =
+            crate::pairing::resolve_direct_pairing_endpoint(&cluster_endpoint);
+
         let payload = PairingPayload {
             cluster_endpoint: cluster_endpoint.clone(),
             ca_fingerprint: self.ca_fingerprint.clone(),
             pairing_token: record.token.clone(),
             node_id: target_node_id.clone(),
             expires_at_epoch_s: record.expires_at_epoch_s,
+            direct_ip,
+            direct_port,
         };
 
         let payload_json = payload

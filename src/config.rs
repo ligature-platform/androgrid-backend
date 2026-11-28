@@ -106,6 +106,26 @@ pub struct ClusterConfig {
     /// Traces to: ADR-010, [REQ-OP-001], [NFR-REL-001]
     pub rollout_storage_dir: Option<PathBuf>,
 
+    /// Optional persistent state directory for cluster operational data.
+    /// Traces to: [REQ-OP-001], Gate L-02
+    pub state_dir: Option<PathBuf>,
+
+    /// Explicit path to the embedded transactional admission database (`admission.redb`).
+    /// Traces to: [REQ-OP-001], [REQ-VER-001], Gate L-02
+    pub admission_db_path: Option<PathBuf>,
+
+    /// Optional path to an administrator-confirmed historical membership inventory file.
+    /// Traces to: [REQ-OP-001], Gate L-02
+    pub admission_inventory_path: Option<PathBuf>,
+
+    /// Optional comma-separated list of pre-seeded admitted worker node IDs.
+    /// Traces to: [REQ-OP-001], Gate L-02
+    pub seeded_admitted_nodes: Option<String>,
+
+    /// Whether explicit initialization of the admission database is authorized (default: false).
+    /// Traces to: [REQ-OP-001], Gate L-02
+    pub init_admission_db: bool,
+
     /// Maximum allowed byte length for uploaded APK artifacts (default: 128 MB).
     /// Traces to: [NFR-PERF-001]
     pub max_apk_bytes: usize,
@@ -180,6 +200,11 @@ impl Default for ClusterConfig {
             artifact_base_url: None,
             artifact_storage_dir: None,
             rollout_storage_dir: None,
+            state_dir: None,
+            admission_db_path: None,
+            admission_inventory_path: None,
+            seeded_admitted_nodes: None,
+            init_admission_db: false,
             max_apk_bytes: 128 * 1024 * 1024,
             enforce_hardware_attestation: false,
             require_attestation_challenge: false,
@@ -314,6 +339,26 @@ impl ClusterConfig {
             config.rollout_storage_dir = Some(PathBuf::from(val));
         }
 
+        if let Ok(val) = std::env::var("ANDROGRID_STATE_DIR") {
+            config.state_dir = Some(PathBuf::from(val));
+        }
+
+        if let Ok(val) = std::env::var("ANDROGRID_ADMISSION_DB") {
+            config.admission_db_path = Some(PathBuf::from(val));
+        }
+
+        if let Ok(val) = std::env::var("ANDROGRID_ADMISSION_INVENTORY") {
+            config.admission_inventory_path = Some(PathBuf::from(val));
+        }
+
+        if let Ok(val) = std::env::var("ANDROGRID_SEEDED_ADMITTED_NODES") {
+            config.seeded_admitted_nodes = Some(val);
+        }
+
+        if let Ok(val) = std::env::var("ANDROGRID_INIT_ADMISSION_DB") {
+            config.init_admission_db = parse_env_bool("ANDROGRID_INIT_ADMISSION_DB", &val)?;
+        }
+
         if let Ok(val) = std::env::var("ANDROGRID_MAX_APK_BYTES") {
             config.max_apk_bytes =
                 val.parse::<usize>()
@@ -401,6 +446,27 @@ impl ClusterConfig {
     /// Resolves the base URL for worker artifact downloads.
     ///
     /// Traces to: [NFR-PERF-001], [REQ-OP-003]
+    /// Resolves the canonical database path for the embedded transactional admission store.
+    ///
+    /// Traces to: [REQ-OP-001], [REQ-VER-001], Gate L-02
+    pub fn resolve_admission_db_path(&self) -> PathBuf {
+        if let Some(ref p) = self.admission_db_path {
+            return p.clone();
+        }
+        if let Some(ref state_dir) = self.state_dir {
+            return state_dir.join("admission.redb");
+        }
+        if let Some(ref rollout_dir) = self.rollout_storage_dir {
+            return rollout_dir.join("admission.redb");
+        }
+        if let Some(ref artifact_dir) = self.artifact_storage_dir {
+            return artifact_dir.join("admission.redb");
+        }
+        PathBuf::from("androgrid-data")
+            .join("state")
+            .join("admission.redb")
+    }
+
     pub fn resolve_artifact_base_url(&self) -> String {
         if let Some(ref base) = self.artifact_base_url {
             base.trim_end_matches('/').to_string()
@@ -456,7 +522,8 @@ impl ClusterConfig {
     ///
     /// Prefers explicit `cluster_endpoint` (`ANDROGRID_CLUSTER_ENDPOINT`), followed by
     /// `ANDROGRID_HOST_IP` if `listen_addr` uses an unspecified bind address (`0.0.0.0`, `::`),
-    /// falling back to loopback or bound address.
+    /// auto-detecting the primary outbound physical LAN IP if possible, and falling back
+    /// to loopback or bound address.
     ///
     /// Traces to: [REQ-OP-001], [INV-001], [INV-002]
     pub fn resolve_cluster_endpoint(&self) -> String {
@@ -476,6 +543,9 @@ impl ClusterConfig {
                         return format!("{trimmed}:{port}");
                     }
                 }
+                if let Some(lan_ip) = detect_outbound_lan_ipv4() {
+                    return format!("{lan_ip}:{port}");
+                }
                 format!("127.0.0.1:{port}")
             }
             std::net::IpAddr::V6(ip) if ip.is_unspecified() => {
@@ -485,11 +555,27 @@ impl ClusterConfig {
                         return format!("{trimmed}:{port}");
                     }
                 }
+                if let Some(lan_ip) = detect_outbound_lan_ipv4() {
+                    return format!("{lan_ip}:{port}");
+                }
                 format!("[::1]:{port}")
             }
             std::net::IpAddr::V6(ip) => format!("[{ip}]:{port}"),
             std::net::IpAddr::V4(ip) => format!("{ip}:{port}"),
         }
+    }
+}
+
+/// Attempts to determine the host's primary outbound LAN IPv4 address using
+/// an ephemeral UDP routing table query to avoid binding to virtual Hyper-V/WSL/VPN adapters.
+///
+/// Does not transmit any network packets. Traces to: [REQ-OP-001], [INV-001]
+pub fn detect_outbound_lan_ipv4() -> Option<std::net::Ipv4Addr> {
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("8.8.8.8:80").ok()?;
+    match socket.local_addr().ok()?.ip() {
+        std::net::IpAddr::V4(ip) if !ip.is_loopback() && !ip.is_unspecified() => Some(ip),
+        _ => None,
     }
 }
 
@@ -530,11 +616,13 @@ mod tests {
             listen_addr: "0.0.0.0:50051".parse().unwrap(),
             ..Default::default()
         };
-        // Unspecified without host IP env defaults to loopback endpoint
-        assert_eq!(
-            config.resolve_mtls_blob_base_url(),
-            "https://127.0.0.1:50051/v1/blobs"
-        );
+        // Unspecified without host IP env defaults to auto-detected LAN IP or loopback endpoint
+        let expected_base = if let Some(lan_ip) = detect_outbound_lan_ipv4() {
+            format!("https://{lan_ip}:50051/v1/blobs")
+        } else {
+            "https://127.0.0.1:50051/v1/blobs".to_string()
+        };
+        assert_eq!(config.resolve_mtls_blob_base_url(), expected_base);
 
         // When cluster_endpoint or host IP is set, resolve_mtls_blob_base_url respects it
         config.cluster_endpoint = Some("192.168.1.100:50051".to_string());
@@ -573,8 +661,13 @@ mod tests {
             listen_addr: "0.0.0.0:50051".parse().unwrap(),
             ..Default::default()
         };
-        // Unspecified falls back to loopback when no host IP env var
-        assert_eq!(config.resolve_cluster_endpoint(), "127.0.0.1:50051");
+        // Unspecified falls back to auto-detected outbound LAN IP or loopback
+        let resolved = config.resolve_cluster_endpoint();
+        if let Some(lan_ip) = detect_outbound_lan_ipv4() {
+            assert_eq!(resolved, format!("{lan_ip}:50051"));
+        } else {
+            assert_eq!(resolved, "127.0.0.1:50051");
+        }
 
         // Explicit cluster_endpoint override takes precedence
         config.cluster_endpoint = Some("https://node.edge.androgrid:50051/".to_string());
@@ -582,6 +675,14 @@ mod tests {
             config.resolve_cluster_endpoint(),
             "node.edge.androgrid:50051"
         );
+    }
+
+    #[test]
+    fn test_detect_outbound_lan_ipv4_non_loopback() {
+        if let Some(ip) = detect_outbound_lan_ipv4() {
+            assert!(!ip.is_loopback());
+            assert!(!ip.is_unspecified());
+        }
     }
 
     #[test]

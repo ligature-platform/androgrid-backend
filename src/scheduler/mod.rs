@@ -4,14 +4,17 @@
 //! [REQ-OP-001], [REQ-OP-002], [REQ-OP-003], [REQ-OP-004],
 //! [INV-004], [INV-005], [INV-006], [ANTI-003], [NFR-REL-001]
 
+pub mod admission_store;
 pub mod engine;
 pub mod errors;
 pub mod rollout_store;
 pub mod state;
 pub mod thermal;
 
+pub use admission_store::{AdmissionRecordProto, AdmissionSource, DurableAdmissionStore};
 pub use engine::{
-    ClusterScheduler, DEFAULT_HEARTBEAT_INTERVAL_SECONDS, DEFAULT_NODE_LEASE_TIMEOUT_SECONDS,
+    compare_client_versions, parse_client_version, ClusterScheduler, APPROVED_ONBOARDING_BASELINE,
+    DEFAULT_HEARTBEAT_INTERVAL_SECONDS, DEFAULT_NODE_LEASE_TIMEOUT_SECONDS,
     MAX_CELLULAR_DURATION_SECONDS, MIN_CELLULAR_BATTERY_PCT,
 };
 pub use errors::SchedulingError;

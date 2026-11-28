@@ -25,6 +25,7 @@ jobs:
       - name: Install Rust Toolchain
         uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
         with:
+          toolchain: 1.100.1
           components: clippy, rustfmt
           targets: wasm32-wasip1
 

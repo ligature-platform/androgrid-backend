@@ -238,6 +238,19 @@ impl ArtifactServer {
                 if magic_buf.len() == expected_magic.len() {
                     if magic_buf.as_slice() != expected_magic {
                         drop(writer);
+                        // Drain remaining incoming stream to prevent TCP RST abort on client,
+                        // bounded by 64 KiB and 2000 ms timeout to prevent resource starvation.
+                        let _ =
+                            tokio::time::timeout(std::time::Duration::from_millis(2000), async {
+                                let mut drained: usize = 0;
+                                while let Some(Ok(chunk)) = stream.next().await {
+                                    drained += chunk.len();
+                                    if drained >= 64 * 1024 {
+                                        break;
+                                    }
+                                }
+                            })
+                            .await;
                         return (
                             StatusCode::UNPROCESSABLE_ENTITY,
                             format!("Payload magic bytes do not match kind '{}'", kind.as_str()),

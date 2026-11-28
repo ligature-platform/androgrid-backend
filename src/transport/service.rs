@@ -26,6 +26,7 @@ pub struct AndroGridServiceImpl {
     scheduler: Arc<ClusterScheduler>,
     artifact_store: Arc<ArtifactStore>,
     renewal_manager: Arc<CertRenewalManager>,
+    admission_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 impl AndroGridServiceImpl {
@@ -36,6 +37,7 @@ impl AndroGridServiceImpl {
             scheduler,
             artifact_store: Arc::new(ArtifactStore::new()),
             renewal_manager: Arc::new(CertRenewalManager::new(None, CertRenewalPolicy::default())),
+            admission_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
         }
     }
 
@@ -48,6 +50,7 @@ impl AndroGridServiceImpl {
             scheduler,
             artifact_store,
             renewal_manager: Arc::new(CertRenewalManager::new(None, CertRenewalPolicy::default())),
+            admission_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
         }
     }
 
@@ -63,6 +66,7 @@ impl AndroGridServiceImpl {
             scheduler,
             artifact_store,
             renewal_manager,
+            admission_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
         }
     }
 
@@ -113,19 +117,70 @@ impl AndroGridService for AndroGridServiceImpl {
         let req_node_id = request.get_ref().node_id.clone();
         Self::verify_peer_identity(&request, &req_node_id)?;
         let req = request.into_inner();
+
+        // Inexpensive syntax and identity validation before queueing
+        let trimmed_id = req.node_id.trim();
+        if trimmed_id.is_empty() {
+            return Err(Status::invalid_argument(
+                "node_id must not be empty or whitespace",
+            ));
+        }
         let capabilities = req
             .capabilities
             .ok_or_else(|| Status::invalid_argument("NodeCapabilities must be provided"))?;
 
-        let now_ms = Self::now_epoch_ms();
-        let response = self.scheduler.register_node_full(
-            req.node_id,
-            capabilities,
-            req.client_version,
-            req.labels,
-            req.last_upgrade_outcome,
-            now_ms,
-        )?;
+        // Early SemVer syntax validation before acquiring admission semaphore
+        let _ = crate::scheduler::parse_client_version(&req.client_version)
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+
+        let is_existing = self.scheduler.is_node_admitted(&req.node_id);
+        let scheduler = self.scheduler.clone();
+
+        let response = if is_existing {
+            let now_ms = Self::now_epoch_ms();
+            scheduler.register_node_full(
+                req.node_id,
+                capabilities,
+                req.client_version,
+                req.labels,
+                req.last_upgrade_outcome,
+                now_ms,
+            )?
+        } else {
+            // New worker admission involves durable disk I/O; isolate on blocking pool guarded by single-permit semaphore
+            // Bound admission wait with a 5000ms timeout returning retryable unavailable status
+            let permit = match tokio::time::timeout(
+                std::time::Duration::from_millis(5000),
+                self.admission_semaphore.clone().acquire_owned(),
+            )
+            .await
+            {
+                Ok(Ok(p)) => p,
+                Ok(Err(_)) => return Err(Status::internal("Admission semaphore closed")),
+                Err(_) => {
+                    return Err(Status::unavailable(
+                        "ADMISSION_QUEUE_BUSY: Registration queue wait timeout exceeded; retry with backoff",
+                    ));
+                }
+            };
+
+            tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                // Compute registration time when the work actually begins
+                let work_start_ms = Self::now_epoch_ms();
+                scheduler.register_node_full(
+                    req.node_id,
+                    capabilities,
+                    req.client_version,
+                    req.labels,
+                    req.last_upgrade_outcome,
+                    work_start_ms,
+                )
+            })
+            .await
+            .map_err(|e| Status::internal(format!("Admission task panicked: {e}")))?
+            .map_err(Status::from)?
+        };
 
         Ok(Response::new(response))
     }

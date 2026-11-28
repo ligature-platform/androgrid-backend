@@ -70,6 +70,7 @@ pub struct ProcessedTile {
 /// Calculates the optimal 2D grid layout (columns, rows) for a given tile count.
 ///
 /// Traces to: [REQ-OP-004]
+#[allow(clippy::manual_is_multiple_of)]
 pub fn calculate_optimal_grid(tile_count: u32) -> (u32, u32) {
     if tile_count <= 1 {
         return (1, 1);
