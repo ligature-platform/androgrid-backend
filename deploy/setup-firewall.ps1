@@ -126,11 +126,11 @@ switch ($Action) {
                 $portFilter = $rule | Get-NetFirewallPortFilter
                 $addressFilter = $rule | Get-NetFirewallAddressFilter
                 $enabled = $rule.Enabled -eq "True"
-                $action = $rule.Action
+                $ruleAction = $rule.Action
                 $direction = $rule.Direction
                 $ruleProfile = $rule.Profile
 
-                $statusStr = if ($enabled -and $action -eq "Allow" -and $direction -eq "Inbound") { "ACTIVE" } else { "MISCONFIGURED" }
+                $statusStr = if ($enabled -and $ruleAction -eq "Allow" -and $direction -eq "Inbound") { "ACTIVE" } else { "MISCONFIGURED" }
                 $color = if ($statusStr -eq "ACTIVE") { "Green" } else { "Red" }
 
                 Write-Host "  [$statusStr] $($r.DisplayName) ($($r.Protocol) Port $($portFilter.LocalPort))" -ForegroundColor $color
