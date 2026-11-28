@@ -453,7 +453,9 @@ impl ClusterConfig {
         if let Some(ref artifact_dir) = self.artifact_storage_dir {
             return artifact_dir.join("admission.redb");
         }
-        PathBuf::from("androgrid-data").join("state").join("admission.redb")
+        PathBuf::from("androgrid-data")
+            .join("state")
+            .join("admission.redb")
     }
 
     pub fn resolve_artifact_base_url(&self) -> String {

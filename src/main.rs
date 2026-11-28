@@ -105,15 +105,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(ref inv_path) = config.admission_inventory_path {
         if inv_path.exists() {
             match admission_store.load_inventory_file(inv_path, "0.0.1-alpha.5", 0) {
-                Ok(count) => info!(count = count, path = %inv_path.display(), "Loaded historical membership inventory"),
-                Err(e) => warn!(path = %inv_path.display(), error = %e, "Failed to load historical membership inventory"),
+                Ok(count) => {
+                    info!(count = count, path = %inv_path.display(), "Loaded historical membership inventory")
+                }
+                Err(e) => {
+                    warn!(path = %inv_path.display(), error = %e, "Failed to load historical membership inventory")
+                }
             }
         }
     } else {
         let default_inv = std::path::Path::new("androgrid-data").join("admitted_nodes.inventory");
         if default_inv.exists() {
-            if let Ok(count) = admission_store.load_inventory_file(&default_inv, "0.0.1-alpha.5", 0) {
-                info!(count = count, "Loaded historical membership inventory from default path");
+            if let Ok(count) = admission_store.load_inventory_file(&default_inv, "0.0.1-alpha.5", 0)
+            {
+                info!(
+                    count = count,
+                    "Loaded historical membership inventory from default path"
+                );
             }
         }
     }
@@ -125,7 +133,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .filter(|s| !s.is_empty())
             .collect();
         if let Ok(count) = admission_store.seed_migration_batch(&node_ids, "0.0.1-alpha.5", 0) {
-            info!(count = count, "Seeded pre-configured admitted worker node IDs");
+            info!(
+                count = count,
+                "Seeded pre-configured admitted worker node IDs"
+            );
         }
     }
 

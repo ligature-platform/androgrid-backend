@@ -124,7 +124,13 @@ pub fn resolve_direct_pairing_endpoint(cluster_endpoint: &str) -> (Option<String
     if let Some((h, p)) = stripped.rsplit_once(':') {
         if let Ok(port) = p.parse::<u16>() {
             let host = h.trim_start_matches('[').trim_end_matches(']').to_string();
-            if host != "127.0.0.1" && host != "localhost" && host != "::1" && host != "0.0.0.0" && host != "::" && !host.is_empty() {
+            if host != "127.0.0.1"
+                && host != "localhost"
+                && host != "::1"
+                && host != "0.0.0.0"
+                && host != "::"
+                && !host.is_empty()
+            {
                 return (Some(host), Some(port));
             }
             // Check explicit override
@@ -191,7 +197,10 @@ impl PairingPayload {
         let stripped = strip_uri_scheme(&self.cluster_endpoint);
         if let Some((h, p)) = stripped.rsplit_once(':') {
             let port = p.parse::<u16>().unwrap_or(default_port);
-            (h.trim_start_matches('[').trim_end_matches(']').to_string(), port)
+            (
+                h.trim_start_matches('[').trim_end_matches(']').to_string(),
+                port,
+            )
         } else {
             (stripped, default_port)
         }
@@ -367,7 +376,8 @@ mod tests {
     fn test_pairing_payload_with_explicit_direct_endpoint() {
         let payload = PairingPayload {
             cluster_endpoint: "cluster.internal:50051".to_string(),
-            ca_fingerprint: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_string(),
+            ca_fingerprint: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                .to_string(),
             pairing_token: "tok123".to_string(),
             node_id: None,
             expires_at_epoch_s: 1800000000,
@@ -380,7 +390,10 @@ mod tests {
         let decoded = PairingPayload::from_json(&json).expect("from_json");
         assert_eq!(decoded.direct_ip.as_deref(), Some("10.100.102.6"));
         assert_eq!(decoded.direct_port, Some(50051));
-        assert_eq!(decoded.parse_endpoint(50051), ("10.100.102.6".to_string(), 50051));
+        assert_eq!(
+            decoded.parse_endpoint(50051),
+            ("10.100.102.6".to_string(), 50051)
+        );
     }
 
     #[test]

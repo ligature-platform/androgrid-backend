@@ -196,7 +196,12 @@ fn test_spike_durability_and_restart_recovery() {
         for i in 0..100 {
             let node_id = format!("worker-node-{:04}", i);
             store
-                .commit_admission(&node_id, "0.0.1-alpha.6", 1000 + i as u64, AdmissionSource::FreshOnboarded)
+                .commit_admission(
+                    &node_id,
+                    "0.0.1-alpha.6",
+                    1000 + i as u64,
+                    AdmissionSource::FreshOnboarded,
+                )
                 .expect("commit admission");
             assert!(store.is_admitted(&node_id));
         }
@@ -224,7 +229,8 @@ fn test_spike_durability_and_restart_recovery() {
 
 #[test]
 fn test_spike_interrupted_transaction_rollback() {
-    let temp_dir = std::env::temp_dir().join(format!("androgrid-spike-rollback-{}", std::process::id()));
+    let temp_dir =
+        std::env::temp_dir().join(format!("androgrid-spike-rollback-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&temp_dir);
     let db_path = temp_dir.join("admissions.redb");
 
@@ -232,7 +238,12 @@ fn test_spike_interrupted_transaction_rollback() {
 
     // Commit baseline node
     store
-        .commit_admission("baseline-node", "0.0.1-alpha.6", 1000, AdmissionSource::FreshOnboarded)
+        .commit_admission(
+            "baseline-node",
+            "0.0.1-alpha.6",
+            1000,
+            AdmissionSource::FreshOnboarded,
+        )
         .expect("commit baseline");
     assert!(store.is_admitted("baseline-node"));
 
@@ -269,7 +280,8 @@ fn test_spike_interrupted_transaction_rollback() {
 
 #[test]
 fn test_spike_migration_batch_seeding() {
-    let temp_dir = std::env::temp_dir().join(format!("androgrid-spike-migration-{}", std::process::id()));
+    let temp_dir =
+        std::env::temp_dir().join(format!("androgrid-spike-migration-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&temp_dir);
     let db_path = temp_dir.join("admissions.redb");
 
@@ -302,7 +314,10 @@ fn test_spike_migration_batch_seeding() {
 
     let records = store2.export_records().expect("export");
     assert_eq!(records.len(), 3);
-    assert_eq!(records[0].admission_source, AdmissionSource::LegacyMigrated as i32);
+    assert_eq!(
+        records[0].admission_source,
+        AdmissionSource::LegacyMigrated as i32
+    );
     assert_eq!(records[0].initial_client_version, "0.0.1-alpha.5");
 
     let _ = std::fs::remove_dir_all(&temp_dir);
@@ -310,7 +325,8 @@ fn test_spike_migration_batch_seeding() {
 
 #[test]
 fn test_spike_density_and_concurrent_sync_throughput() {
-    let temp_dir = std::env::temp_dir().join(format!("androgrid-spike-density-{}", std::process::id()));
+    let temp_dir =
+        std::env::temp_dir().join(format!("androgrid-spike-density-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&temp_dir);
     let db_path = temp_dir.join("admissions.redb");
 
@@ -319,7 +335,9 @@ fn test_spike_density_and_concurrent_sync_throughput() {
     // Pre-populate 1,000 workers
     let batch_nodes: Vec<String> = (0..1000).map(|i| format!("worker-{:05}", i)).collect();
     let seed_start = Instant::now();
-    store.seed_migration_batch(&batch_nodes, "0.0.1-alpha.5", 1000).unwrap();
+    store
+        .seed_migration_batch(&batch_nodes, "0.0.1-alpha.5", 1000)
+        .unwrap();
     let seed_duration = seed_start.elapsed();
     println!("Seeded 1,000 legacy workers in {:?}", seed_duration);
 
@@ -346,7 +364,12 @@ fn test_spike_density_and_concurrent_sync_throughput() {
     for i in 1000..1050 {
         let new_node = format!("new-worker-{:05}", i);
         store
-            .commit_admission(&new_node, "0.0.1-alpha.6", 2000, AdmissionSource::FreshOnboarded)
+            .commit_admission(
+                &new_node,
+                "0.0.1-alpha.6",
+                2000,
+                AdmissionSource::FreshOnboarded,
+            )
             .unwrap();
     }
     let burst_duration = burst_start.elapsed();
@@ -364,7 +387,10 @@ fn test_spike_density_and_concurrent_sync_throughput() {
         "Concurrent in-memory worker sync queries completed during join burst: {}",
         total_syncs
     );
-    assert!(total_syncs > 1000, "In-memory sync lookups must stay blisteringly fast during disk writes");
+    assert!(
+        total_syncs > 1000,
+        "In-memory sync lookups must stay blisteringly fast during disk writes"
+    );
 
     let _ = std::fs::remove_dir_all(&temp_dir);
 }

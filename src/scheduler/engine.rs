@@ -201,7 +201,9 @@ impl ClusterScheduler {
     }
 
     /// Returns a reference to the durable admission store.
-    pub fn admission_store(&self) -> &Arc<crate::scheduler::admission_store::DurableAdmissionStore> {
+    pub fn admission_store(
+        &self,
+    ) -> &Arc<crate::scheduler::admission_store::DurableAdmissionStore> {
         &self.admission_store
     }
 
@@ -6211,7 +6213,9 @@ mod tests {
         let temp_dir = std::env::temp_dir().join(format!("androgrid-admit-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&temp_dir);
         let db_path = temp_dir.join("admission.redb");
-        let store = Arc::new(crate::scheduler::admission_store::DurableAdmissionStore::open(&db_path).unwrap());
+        let store = Arc::new(
+            crate::scheduler::admission_store::DurableAdmissionStore::open(&db_path).unwrap(),
+        );
         let rollout_store = Arc::new(crate::scheduler::rollout_store::RolloutStore::new());
 
         let scheduler1 = ClusterScheduler::with_options_and_stores(
@@ -6237,7 +6241,9 @@ mod tests {
         drop(store);
 
         // Create new scheduler instance with the same storage database
-        let store2 = Arc::new(crate::scheduler::admission_store::DurableAdmissionStore::open(&db_path).unwrap());
+        let store2 = Arc::new(
+            crate::scheduler::admission_store::DurableAdmissionStore::open(&db_path).unwrap(),
+        );
         let scheduler2 = ClusterScheduler::with_options_and_stores(
             false,
             ThermalPolicy::default(),

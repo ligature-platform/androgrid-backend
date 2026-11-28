@@ -265,7 +265,8 @@ fn build_pairing_response(
         "New worker pairing session initialized; operator confirmation PIN required [NFR-SEC-001]"
     );
 
-    let (direct_ip, direct_port) = crate::pairing::resolve_direct_pairing_endpoint(&state.cluster_endpoint);
+    let (direct_ip, direct_port) =
+        crate::pairing::resolve_direct_pairing_endpoint(&state.cluster_endpoint);
 
     let payload = PairingPayload {
         cluster_endpoint: state.cluster_endpoint.clone(),
@@ -570,7 +571,8 @@ async fn handle_pairing_qr_png(
         ));
     }
 
-    let (direct_ip, direct_port) = crate::pairing::resolve_direct_pairing_endpoint(&state.cluster_endpoint);
+    let (direct_ip, direct_port) =
+        crate::pairing::resolve_direct_pairing_endpoint(&state.cluster_endpoint);
 
     let payload = PairingPayload {
         cluster_endpoint: state.cluster_endpoint.clone(),

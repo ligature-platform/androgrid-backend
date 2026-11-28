@@ -63,7 +63,10 @@ impl std::fmt::Debug for DurableAdmissionStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DurableAdmissionStore")
             .field("db_path", &self.db_path)
-            .field("admitted_count", &self.in_memory_index.read().map(|i| i.len()).unwrap_or(0))
+            .field(
+                "admitted_count",
+                &self.in_memory_index.read().map(|i| i.len()).unwrap_or(0),
+            )
             .finish()
     }
 }
@@ -91,12 +94,16 @@ impl DurableAdmissionStore {
         let db_path = path.as_ref().to_path_buf();
         if let Some(parent) = db_path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| {
-                SchedulingError::StorageError(format!("Failed to create admission DB directory: {e}"))
+                SchedulingError::StorageError(format!(
+                    "Failed to create admission DB directory: {e}"
+                ))
             })?;
         }
 
         let db = Database::create(&db_path).map_err(|e| {
-            SchedulingError::StorageError(format!("Failed to open/create redb admission database: {e}"))
+            SchedulingError::StorageError(format!(
+                "Failed to open/create redb admission database: {e}"
+            ))
         })?;
 
         let mut index = HashSet::new();
@@ -117,7 +124,9 @@ impl DurableAdmissionStore {
         // Ensure table exists via short write transaction
         {
             let write_txn = db.begin_write().map_err(|e| {
-                SchedulingError::StorageError(format!("Failed to begin init write transaction: {e}"))
+                SchedulingError::StorageError(format!(
+                    "Failed to begin init write transaction: {e}"
+                ))
             })?;
             {
                 let _ = write_txn.open_table(ADMISSION_TABLE).map_err(|e| {
@@ -125,7 +134,9 @@ impl DurableAdmissionStore {
                 })?;
             }
             write_txn.commit().map_err(|e| {
-                SchedulingError::StorageError(format!("Failed to commit init write transaction: {e}"))
+                SchedulingError::StorageError(format!(
+                    "Failed to commit init write transaction: {e}"
+                ))
             })?;
         }
 
@@ -183,7 +194,9 @@ impl DurableAdmissionStore {
         // 1. Transactional commit to redb (if disk-backed)
         if let Some(ref db) = self.db {
             let write_txn = db.begin_write().map_err(|e| {
-                SchedulingError::StorageError(format!("Failed to begin admission write transaction: {e}"))
+                SchedulingError::StorageError(format!(
+                    "Failed to begin admission write transaction: {e}"
+                ))
             })?;
             {
                 let mut table = write_txn.open_table(ADMISSION_TABLE).map_err(|e| {
@@ -194,7 +207,9 @@ impl DurableAdmissionStore {
                 })?;
             }
             write_txn.commit().map_err(|e| {
-                SchedulingError::StorageError(format!("Failed to commit admission transaction: {e}"))
+                SchedulingError::StorageError(format!(
+                    "Failed to commit admission transaction: {e}"
+                ))
             })?;
         }
 
@@ -219,7 +234,9 @@ impl DurableAdmissionStore {
         let mut count = 0;
         if let Some(ref db) = self.db {
             let write_txn = db.begin_write().map_err(|e| {
-                SchedulingError::StorageError(format!("Failed to begin migration write transaction: {e}"))
+                SchedulingError::StorageError(format!(
+                    "Failed to begin migration write transaction: {e}"
+                ))
             })?;
             {
                 let mut table = write_txn.open_table(ADMISSION_TABLE).map_err(|e| {
@@ -239,23 +256,32 @@ impl DurableAdmissionStore {
                     };
                     let mut buf = Vec::with_capacity(record.encoded_len());
                     record.encode(&mut buf).map_err(|e| {
-                        SchedulingError::StorageError(format!("Failed to encode migration record: {e}"))
+                        SchedulingError::StorageError(format!(
+                            "Failed to encode migration record: {e}"
+                        ))
                     })?;
                     table.insert(trimmed, buf.as_slice()).map_err(|e| {
-                        SchedulingError::StorageError(format!("Failed to insert migration record: {e}"))
+                        SchedulingError::StorageError(format!(
+                            "Failed to insert migration record: {e}"
+                        ))
                     })?;
                     count += 1;
                 }
             }
             write_txn.commit().map_err(|e| {
-                SchedulingError::StorageError(format!("Failed to commit migration transaction: {e}"))
+                SchedulingError::StorageError(format!(
+                    "Failed to commit migration transaction: {e}"
+                ))
             })?;
         } else {
             count = node_ids.len();
         }
 
         // Update in-memory index
-        let mut index = self.in_memory_index.write().expect("in_memory_index write lock");
+        let mut index = self
+            .in_memory_index
+            .write()
+            .expect("in_memory_index write lock");
         for node_id in node_ids {
             let trimmed = node_id.trim();
             if !trimmed.is_empty() {
@@ -313,12 +339,14 @@ impl DurableAdmissionStore {
                 SchedulingError::StorageError(format!("Failed to open admission table: {e}"))
             })?;
             let mut records = Vec::new();
-            let mut iter = table.iter().map_err(|e| {
+            let iter = table.iter().map_err(|e| {
                 SchedulingError::StorageError(format!("Failed to iterate admission table: {e}"))
             })?;
-            while let Some(item) = iter.next() {
+            for item in iter {
                 let (_, value) = item.map_err(|e| {
-                    SchedulingError::StorageError(format!("Failed to read admission table entry: {e}"))
+                    SchedulingError::StorageError(format!(
+                        "Failed to read admission table entry: {e}"
+                    ))
                 })?;
                 if let Ok(record) = AdmissionRecordProto::decode(value.value()) {
                     records.push(record);
