@@ -43,6 +43,15 @@ We establish two distinct trust domains for ephemeral worker pairing:
 - **Loopback Default:** In strict accordance with `[INV-002]`, the Operator Web UI defaults exclusively to loopback binding (`127.0.0.1:8080`).
 - **TLS Fronting Mandate:** Plaintext network pairing is explicitly not an accepted architecture or residual risk. Any binding to non-loopback interfaces for multi-host or remote operation must be fronted by a TLS reverse proxy or ingress controller terminating TLS 1.3.
 
+### 5. Direct Pairing Endpoint Resolution & Onboarding Baseline Admission (Issue #30 / Gate L-02)
+- **Unified Endpoint Advertisement:** `resolve_direct_pairing_endpoint()` unifies advertised host/port across mDNS TXT records, Web UI pairing responses (`POST /api/pair`), Web UI QR PNG endpoints (`GET /api/pair/qr`), and `AdminService::GeneratePairingToken`. Precedence is strictly enforced:
+  1. Explicit `ANDROGRID_HOST_IP` environment variable override (e.g. for multi-homed hosts, VPNs, or explicit Wi-Fi adapters).
+  2. Auto-detected physical outbound non-loopback LAN IPv4 (`detect_outbound_lan_ipv4()`), cleanly bypassing virtual Hyper-V and WSL switches.
+  3. Bound listener IP.
+- **Direct Payload Attributes:** Direct IP and port (`direct_ip`, `direct_port`) are encoded into pairing payloads and QR data, enabling Android workers to connect directly in topologies where router station isolation or mDNS filtering blocks zero-config multicast discovery.
+- **Canonical Firewall Automation:** Canonical host firewall management scripts are maintained in `androgrid-backend/deploy/setup-firewall.ps1` (Windows Defender with Preview, Check, Apply, Remove, and Private profile targeting) and `androgrid-backend/deploy/setup-firewall.sh` (Linux ufw, firewalld, iptables).
+- **First-Admission Version Baseline Gate:** The cluster scheduler enforces `APPROVED_ONBOARDING_BASELINE = "0.0.1-alpha.6"`. Newly onboarding worker nodes joining the cluster below this version baseline are rejected with `FAILED_PRECONDITION` (`OnboardingVersionBelowBaseline`). Existing admitted members reconnecting below baseline are preserved and never evicted or force-upgraded. Admitted membership is durably persisted across control-plane restarts.
+
 ---
 
 ## Consequences

@@ -135,4 +135,11 @@ pub enum SchedulingError {
     /// Traces to: [INV-006], [ANTI-003], [NFR-SEC-001], ADR-011
     #[error("Invalid network egress policy: {0}")]
     InvalidNetworkEgress(String),
+
+    /// Traces to: [REQ-VER-001], [REQ-OP-001]
+    #[error("Worker client version '{client_version}' is below approved onboarding baseline '{min_version}'")]
+    OnboardingVersionBelowBaseline {
+        client_version: String,
+        min_version: String,
+    },
 }

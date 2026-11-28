@@ -256,7 +256,7 @@ async fn test_http_benchmark_orchestrator_submission_and_lifecycle() {
     let reg_req = RegisterNodeRequest {
         node_id: "operator".to_string(),
         capabilities: Some(worker_caps.clone()),
-        client_version: "0.0.1-alpha.5".to_string(),
+        client_version: "0.0.1-alpha.6".to_string(),
         labels: Default::default(),
         last_upgrade_outcome: None,
     };
@@ -534,7 +534,7 @@ fn test_allowlist_task_single_attempt_finality_and_no_requeue() {
         .register_node(
             "wifi-node-1".to_string(),
             worker_caps.clone(),
-            "0.0.1-alpha.5".to_string(),
+            "0.0.1-alpha.6".to_string(),
             1000,
         )
         .expect("Registration succeeds");
@@ -606,7 +606,7 @@ fn test_allowlist_task_single_attempt_finality_and_no_requeue() {
         .register_node(
             "wifi-node-2".to_string(),
             worker_caps,
-            "0.0.1-alpha.5".to_string(),
+            "0.0.1-alpha.6".to_string(),
             1003,
         )
         .expect("Registration succeeds");

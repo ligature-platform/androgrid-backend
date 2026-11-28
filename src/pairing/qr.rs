@@ -110,6 +110,40 @@ pub fn normalize_cluster_endpoint(endpoint: &str, default_port: u16) -> Result<S
     }
 }
 
+/// Resolves direct connection IP/hostname and port for pairing payloads.
+///
+/// Priority:
+/// 1. If cluster endpoint host is a reachable non-loopback, non-unspecified IP/hostname, use it.
+/// 2. If cluster endpoint is loopback or unspecified:
+///    a. Check `ANDROGRID_HOST_IP` environment variable override.
+///    b. Fallback to `detect_outbound_lan_ipv4()`.
+///
+/// Traces to: [REQ-OP-001], [INV-001], [INV-002], Gate L-02
+pub fn resolve_direct_pairing_endpoint(cluster_endpoint: &str) -> (Option<String>, Option<u16>) {
+    let stripped = strip_uri_scheme(cluster_endpoint);
+    if let Some((h, p)) = stripped.rsplit_once(':') {
+        if let Ok(port) = p.parse::<u16>() {
+            let host = h.trim_start_matches('[').trim_end_matches(']').to_string();
+            if host != "127.0.0.1" && host != "localhost" && host != "::1" && host != "0.0.0.0" && host != "::" && !host.is_empty() {
+                return (Some(host), Some(port));
+            }
+            // Check explicit override
+            if let Ok(host_ip) = std::env::var("ANDROGRID_HOST_IP") {
+                let trimmed = host_ip.trim();
+                if !trimmed.is_empty() {
+                    return (Some(trimmed.to_string()), Some(port));
+                }
+            }
+            // Fallback to route detection
+            if let Some(lan_ip) = crate::config::detect_outbound_lan_ipv4() {
+                return (Some(lan_ip.to_string()), Some(port));
+            }
+            return (None, Some(port));
+        }
+    }
+    (None, None)
+}
+
 /// Compact device pairing payload scanned by the Android worker.
 ///
 /// Traces to: [INV-002], [NFR-SEC-001], [REQ-OP-001]
@@ -425,5 +459,27 @@ mod tests {
         let data_url = render_png_data_url(content).expect("render_png_data_url must succeed");
         assert!(data_url.starts_with("data:image/png;base64,"));
         assert!(data_url.len() > 150);
+    }
+
+    #[test]
+    fn test_resolve_direct_pairing_endpoint_honors_override_and_routable_hosts() {
+        // Explicit physical endpoint
+        let (ip, port) = resolve_direct_pairing_endpoint("192.168.1.50:50051");
+        assert_eq!(ip.as_deref(), Some("192.168.1.50"));
+        assert_eq!(port, Some(50051));
+
+        // Loopback with explicit ANDROGRID_HOST_IP override
+        std::env::set_var("ANDROGRID_HOST_IP", "10.200.1.5");
+        let (ip_overridden, port_overridden) = resolve_direct_pairing_endpoint("127.0.0.1:50051");
+        assert_eq!(ip_overridden.as_deref(), Some("10.200.1.5"));
+        assert_eq!(port_overridden, Some(50051));
+        std::env::remove_var("ANDROGRID_HOST_IP");
+
+        // Loopback without override falls back to detect_outbound_lan_ipv4 or None
+        let (ip_fallback, port_fallback) = resolve_direct_pairing_endpoint("127.0.0.1:50051");
+        assert_eq!(port_fallback, Some(50051));
+        if let Some(lan) = crate::config::detect_outbound_lan_ipv4() {
+            assert_eq!(ip_fallback.as_deref(), Some(lan.to_string().as_str()));
+        }
     }
 }

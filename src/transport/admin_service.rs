@@ -468,25 +468,8 @@ impl AdminService for AdminServiceImpl {
             .generate_token_with_preconfirmation(target_node_id.clone(), ttl, true)
             .map_err(|e| Status::failed_precondition(e.to_string()))?;
 
-        let (direct_ip, direct_port) = {
-            let stripped = crate::pairing::strip_uri_scheme(&cluster_endpoint);
-            if let Some((h, p)) = stripped.rsplit_once(':') {
-                if let Ok(port) = p.parse::<u16>() {
-                    let host = h.trim_start_matches('[').trim_end_matches(']').to_string();
-                    if host != "127.0.0.1" && host != "localhost" && !host.is_empty() {
-                        (Some(host), Some(port))
-                    } else if let Some(lan_ip) = crate::config::detect_outbound_lan_ipv4() {
-                        (Some(lan_ip.to_string()), Some(port))
-                    } else {
-                        (None, None)
-                    }
-                } else {
-                    (None, None)
-                }
-            } else {
-                (None, None)
-            }
-        };
+        let (direct_ip, direct_port) =
+            crate::pairing::resolve_direct_pairing_endpoint(&cluster_endpoint);
 
         let payload = PairingPayload {
             cluster_endpoint: cluster_endpoint.clone(),

@@ -114,6 +114,11 @@ impl RolloutStore {
         }
     }
 
+    /// Returns the optional root persistent storage directory.
+    pub fn storage_dir(&self) -> Option<&PathBuf> {
+        self.storage_dir.as_ref()
+    }
+
     /// Creates a disk-backed rollout store rooted at `storage_dir`.
     pub fn with_directory<P: AsRef<Path>>(dir: P) -> Self {
         let path = dir.as_ref().to_path_buf();
