@@ -130,14 +130,24 @@ switch ($Action) {
                 $direction = $rule.Direction
                 $ruleProfile = $rule.Profile
 
-                $portMatches = $portFilter.LocalPort -eq "$($r.Port)"
-                $protocolMatches = $rule.Protocol -eq $r.Protocol
-                $statusStr = if ($enabled -and $ruleAction -eq "Allow" -and $direction -eq "Inbound" -and $portMatches -and $protocolMatches) { "ACTIVE" } else { "MISCONFIGURED" }
+                $mismatches = @()
+                if (-not $enabled) { $mismatches += "Enabled=$enabled" }
+                if ($ruleAction -ne "Allow") { $mismatches += "Action=$ruleAction (expected Allow)" }
+                if ($direction -ne "Inbound") { $mismatches += "Direction=$direction (expected Inbound)" }
+                if ($portFilter.LocalPort -ne "$($r.Port)") { $mismatches += "Port=$($portFilter.LocalPort) (expected $($r.Port))" }
+                if ($portFilter.Protocol -ne $r.Protocol) { $mismatches += "Protocol=$($portFilter.Protocol) (expected $($r.Protocol))" }
+                if ($ruleProfile -ne $Profile) { $mismatches += "Profile=$ruleProfile (expected $Profile)" }
+                if ($addressFilter.RemoteAddress -ne $RemoteAddress) { $mismatches += "RemoteAddress=$($addressFilter.RemoteAddress) (expected $RemoteAddress)" }
+
+                $statusStr = if ($mismatches.Count -eq 0) { "ACTIVE" } else { "MISCONFIGURED" }
                 $color = if ($statusStr -eq "ACTIVE") { "Green" } else { "Red" }
 
-                Write-Host "  [$statusStr] $($r.DisplayName) ($($r.Protocol) Port $($portFilter.LocalPort))" -ForegroundColor $color
+                Write-Host "  [$statusStr] $($r.DisplayName) ($($portFilter.Protocol) Port $($portFilter.LocalPort))" -ForegroundColor $color
                 Write-Host "      Profile: $ruleProfile | RemoteAddress: $($addressFilter.RemoteAddress) | Enabled: $enabled" -ForegroundColor DarkGray
-                if ($statusStr -ne "ACTIVE") { $allConfigured = $false }
+                if ($mismatches.Count -gt 0) {
+                    Write-Host "      Mismatches: $($mismatches -join ', ')" -ForegroundColor Red
+                    $allConfigured = $false
+                }
             } else {
                 Write-Host "  [MISSING] $($r.DisplayName) ($($r.Protocol) Port $($r.Port)): Not configured" -ForegroundColor Red
                 $allConfigured = $false
@@ -181,10 +191,21 @@ switch ($Action) {
     }
 
     "Remove" {
+        Show-Preview
+
+        if (-not $Unattended -and -not $Force) {
+            Write-Host ""
+            $confirmation = Read-Host "Do you want to proceed with removing these AndroGrid firewall rules? [y/N]"
+            if ($confirmation -notmatch "^[yY]([eE][sS])?$") {
+                Write-Host "Operation cancelled by operator." -ForegroundColor Yellow
+                exit 0
+            }
+        }
+
         if (-not (Test-IsAdmin)) {
             Write-Host "Administrative elevation required to remove firewall rules." -ForegroundColor Red
             Write-Host "Re-launching with elevation..." -ForegroundColor Yellow
-            $proc = Start-Process powershell -Verb RunAs -ArgumentList "-ExecutionPolicy Bypass -File `"$PSCommandPath`" -Action Remove" -PassThru -Wait
+            $proc = Start-Process powershell -Verb RunAs -ArgumentList "-ExecutionPolicy Bypass -File `"$PSCommandPath`" -Action Remove -Unattended" -PassThru -Wait
             exit $proc.ExitCode
         }
 
@@ -197,6 +218,18 @@ switch ($Action) {
             Write-Host "  Purging legacy rule '$oldName'..."
             Remove-NetFirewallRule -Name $oldName -ErrorAction SilentlyContinue
         }
+
+        # Verify truthful absence of owned rules
+        $remaining = @()
+        foreach ($r in $targetRules) {
+            $existing = Get-NetFirewallRule -Name $r.Name -ErrorAction SilentlyContinue
+            if ($existing) { $remaining += $r.Name }
+        }
+        if ($remaining.Count -gt 0) {
+            Write-Host "Error: Failed to remove rules: $($remaining -join ', ')" -ForegroundColor Red
+            exit 1
+        }
+
         Write-Host "All AndroGrid firewall rules removed successfully." -ForegroundColor Green
         exit 0
     }

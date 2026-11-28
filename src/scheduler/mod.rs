@@ -13,7 +13,8 @@ pub mod thermal;
 
 pub use admission_store::{AdmissionRecordProto, AdmissionSource, DurableAdmissionStore};
 pub use engine::{
-    ClusterScheduler, DEFAULT_HEARTBEAT_INTERVAL_SECONDS, DEFAULT_NODE_LEASE_TIMEOUT_SECONDS,
+    compare_client_versions, parse_client_version, ClusterScheduler, APPROVED_ONBOARDING_BASELINE,
+    DEFAULT_HEARTBEAT_INTERVAL_SECONDS, DEFAULT_NODE_LEASE_TIMEOUT_SECONDS,
     MAX_CELLULAR_DURATION_SECONDS, MIN_CELLULAR_BATTERY_PCT,
 };
 pub use errors::SchedulingError;

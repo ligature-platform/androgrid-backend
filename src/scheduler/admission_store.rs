@@ -87,11 +87,27 @@ impl DurableAdmissionStore {
         }
     }
 
-    /// Opens or creates an embedded transactional database at the specified path.
+    /// Opens an embedded transactional database at the specified path.
     ///
+    /// Requires an existing database unless authorized via `open_or_create`.
     /// Traces to: [REQ-OP-001], [REQ-VER-001], Gate L-02
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, SchedulingError> {
+        Self::open_or_create(path, false)
+    }
+
+    /// Opens or explicitly creates an embedded transactional database at the specified path.
+    ///
+    /// When `allow_create` is false, returns an error if the database file does not already exist,
+    /// preventing ordinary startup from silently creating an empty database when established state is expected.
+    /// Traces to: [REQ-OP-001], [REQ-VER-001], Gate L-02
+    pub fn open_or_create<P: AsRef<Path>>(path: P, allow_create: bool) -> Result<Self, SchedulingError> {
         let db_path = path.as_ref().to_path_buf();
+        if !allow_create && !db_path.exists() {
+            return Err(SchedulingError::StorageError(format!(
+                "Admission database not found at '{}'. Refusing to silently create an empty database during ordinary startup; pass --init-admission-db or set ANDROGRID_INIT_ADMISSION_DB=1 to initialize a new database.",
+                db_path.display()
+            )));
+        }
         if let Some(parent) = db_path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| {
                 SchedulingError::StorageError(format!(
@@ -127,7 +143,7 @@ impl DurableAdmissionStore {
 
         let mut index = HashSet::new();
 
-        // Hydrate in-memory index from existing committed records, propagating errors
+        // Hydrate in-memory index from existing committed records, validating and propagating errors
         {
             let read_txn = db.begin_read().map_err(|e| {
                 SchedulingError::StorageError(format!(
@@ -145,11 +161,24 @@ impl DurableAdmissionStore {
                 ))
             })?;
             for item in iter {
-                let (key, _) = item.map_err(|e| {
+                let (key, value) = item.map_err(|e| {
                     SchedulingError::StorageError(format!(
                         "Failed to read hydration item from admission table: {e}"
                     ))
                 })?;
+                let record = AdmissionRecordProto::decode(value.value()).map_err(|e| {
+                    SchedulingError::StorageError(format!(
+                        "Corrupted or invalid protobuf payload in admission table entry for key '{}': {e}",
+                        key.value()
+                    ))
+                })?;
+                if record.node_id != key.value() {
+                    return Err(SchedulingError::StorageError(format!(
+                        "Admission record identity mismatch: table key '{}' does not match record.node_id '{}'",
+                        key.value(),
+                        record.node_id
+                    )));
+                }
                 index.insert(key.value().to_string());
             }
         }
@@ -369,20 +398,18 @@ impl DurableAdmissionStore {
                 SchedulingError::StorageError(format!("Failed to iterate admission table: {e}"))
             })?;
             for item in iter {
-                let (_, value) = item.map_err(|e| {
+                let (key, value) = item.map_err(|e| {
                     SchedulingError::StorageError(format!(
                         "Failed to read admission table entry: {e}"
                     ))
                 })?;
-                match AdmissionRecordProto::decode(value.value()) {
-                    Ok(record) => records.push(record),
-                    Err(e) => {
-                        tracing::warn!(
-                            error = %e,
-                            "Corrupted or invalid protobuf payload in admission table entry"
-                        );
-                    }
-                }
+                let record = AdmissionRecordProto::decode(value.value()).map_err(|e| {
+                    SchedulingError::StorageError(format!(
+                        "Corrupted or invalid protobuf payload in admission table entry for key '{}': {e}",
+                        key.value()
+                    ))
+                })?;
+                records.push(record);
             }
             Ok(records)
         } else {

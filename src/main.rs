@@ -34,6 +34,10 @@ struct ServerArgs {
     /// Allow scheduling of insecure root shell tasks (diagnostic / laboratory mode)
     #[arg(long, env = "ANDROGRID_ALLOW_INSECURE_ROOT_TASKS")]
     allow_insecure_root_tasks: bool,
+
+    /// Explicitly allow initializing a new empty admission database if one does not exist
+    #[arg(long, env = "ANDROGRID_INIT_ADMISSION_DB")]
+    init_admission_db: bool,
 }
 
 #[tokio::main]
@@ -59,6 +63,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if args.allow_insecure_root_tasks {
         config.allow_insecure_root_tasks = true;
+    }
+    if args.init_admission_db {
+        config.init_admission_db = true;
     }
 
     if config.allow_insecure_root_tasks {
@@ -90,7 +97,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let admission_db_path = config.resolve_admission_db_path();
     let admission_store = Arc::new(
-        androgrid_backend::DurableAdmissionStore::open(&admission_db_path).map_err(|e| {
+        androgrid_backend::DurableAdmissionStore::open_or_create(
+            &admission_db_path,
+            config.init_admission_db,
+        )
+        .map_err(|e| {
             error!(
                 path = %admission_db_path.display(),
                 error = %e,
@@ -102,16 +113,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Load administrator-confirmed historical membership inventory or environment seeds
     if let Some(ref inv_path) = config.admission_inventory_path {
-        if inv_path.exists() {
-            match admission_store.load_inventory_file(inv_path, "0.0.1-alpha.5", 0) {
-                Ok(count) => {
-                    info!(count = count, path = %inv_path.display(), "Loaded historical membership inventory")
-                }
-                Err(e) => {
-                    warn!(path = %inv_path.display(), error = %e, "Failed to load historical membership inventory")
-                }
-            }
+        if !inv_path.exists() {
+            return Err(format!(
+                "Configured admission inventory path does not exist: {}",
+                inv_path.display()
+            )
+            .into());
         }
+        let count = admission_store
+            .load_inventory_file(inv_path, "0.0.1-alpha.5", 0)
+            .map_err(|e| {
+                format!(
+                    "Failed to load configured historical membership inventory '{}': {e}",
+                    inv_path.display()
+                )
+            })?;
+        info!(
+            count = count,
+            path = %inv_path.display(),
+            "Loaded historical membership inventory"
+        );
     } else {
         let default_inv = std::path::Path::new("androgrid-data").join("admitted_nodes.inventory");
         if default_inv.exists() {
@@ -131,12 +152,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .collect();
-        if let Ok(count) = admission_store.seed_migration_batch(&node_ids, "0.0.1-alpha.5", 0) {
-            info!(
-                count = count,
-                "Seeded pre-configured admitted worker node IDs"
-            );
-        }
+        let count = admission_store
+            .seed_migration_batch(&node_ids, "0.0.1-alpha.5", 0)
+            .map_err(|e| format!("Failed to seed pre-configured admitted nodes: {e}"))?;
+        info!(
+            count = count,
+            "Seeded pre-configured admitted worker node IDs"
+        );
     }
 
     let scheduler = Arc::new(ClusterScheduler::with_options_and_stores(
@@ -368,43 +390,61 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Initialize mDNS DNS-SD service responder
     let mdns_responder = if config.enable_mdns {
-        let (direct_ip_or_host, _) =
-            androgrid_backend::resolve_direct_pairing_endpoint(&config.resolve_cluster_endpoint());
-        let validated_ip = match direct_ip_or_host {
-            Some(ref ip_or_host) if ip_or_host.parse::<std::net::IpAddr>().is_ok() => {
-                Some(ip_or_host.clone())
+        // Resolve validated numeric LAN IP:
+        // 1. Explicit override ANDROGRID_HOST_IP
+        // 2. Direct pairing endpoint if numeric IP
+        // 3. Fallback to outbound LAN IPv4 detection
+        let direct_lan_ip = if let Ok(host_ip) = std::env::var("ANDROGRID_HOST_IP") {
+            let trimmed = host_ip.trim();
+            if !trimmed.is_empty() && trimmed.parse::<std::net::IpAddr>().is_ok() {
+                Some(trimmed.to_string())
+            } else {
+                None
             }
-            Some(ref host) => match androgrid_backend::detect_outbound_lan_ipv4() {
-                Some(lan_ip) => Some(lan_ip.to_string()),
-                None => {
-                    warn!(
-                        endpoint = %host,
-                        "Cluster endpoint hostname is not a numeric IP and outbound LAN IPv4 was not detected; mDNS responder omitted direct IP"
-                    );
-                    None
+        } else {
+            None
+        };
+
+        let validated_ip = direct_lan_ip.or_else(|| {
+            let (direct_ip_or_host, _) =
+                androgrid_backend::resolve_direct_pairing_endpoint(&config.resolve_cluster_endpoint());
+            match direct_ip_or_host {
+                Some(ref ip_or_host) if ip_or_host.parse::<std::net::IpAddr>().is_ok() => {
+                    Some(ip_or_host.clone())
                 }
-            },
-            None => androgrid_backend::detect_outbound_lan_ipv4().map(|ip| ip.to_string()),
-        };
-        let mdns_cfg = MdnsConfig {
-            instance_name: config.mdns_service_name.clone(),
-            host_name: "androgrid.local.".to_string(),
-            port: config.listen_addr.port(),
-            version: env!("CARGO_PKG_VERSION").to_string(),
-            ca_fingerprint: ca_fingerprint.clone(),
-            ip: validated_ip,
-        };
-        match MdnsResponder::start(mdns_cfg) {
-            Ok(resp) => {
-                info!(
-                    service = resp.full_service_name(),
-                    "Multicast DNS zero-config responder active on port {} [REQ-OP-001]",
-                    config.listen_addr.port()
-                );
-                Some(Arc::new(resp))
+                _ => androgrid_backend::detect_outbound_lan_ipv4().map(|ip| ip.to_string()),
             }
-            Err(e) => {
-                warn!(error = %e, "Failed to start mDNS responder; continuing without LAN discovery");
+        });
+
+        match validated_ip {
+            Some(ip) => {
+                let mdns_cfg = MdnsConfig {
+                    instance_name: config.mdns_service_name.clone(),
+                    host_name: "androgrid.local.".to_string(),
+                    port: config.listen_addr.port(),
+                    version: env!("CARGO_PKG_VERSION").to_string(),
+                    ca_fingerprint: ca_fingerprint.clone(),
+                    ip: Some(ip),
+                };
+                match MdnsResponder::start(mdns_cfg) {
+                    Ok(resp) => {
+                        info!(
+                            service = resp.full_service_name(),
+                            "Multicast DNS zero-config responder active on port {} [REQ-OP-001]",
+                            config.listen_addr.port()
+                        );
+                        Some(Arc::new(resp))
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "Failed to start mDNS responder; continuing without LAN discovery");
+                        None
+                    }
+                }
+            }
+            None => {
+                warn!(
+                    "No valid numeric LAN IP available (ANDROGRID_HOST_IP unset and route detection found no LAN IP); mDNS zero-config responder disabled (discovery unavailable) [REQ-OP-001]"
+                );
                 None
             }
         }

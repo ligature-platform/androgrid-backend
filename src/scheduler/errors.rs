@@ -142,4 +142,8 @@ pub enum SchedulingError {
         client_version: String,
         min_version: String,
     },
+
+    /// Traces to: [REQ-VER-001], Gate L-02
+    #[error("Invalid client version '{0}': version string does not conform to valid SemVer 2.0.0 format")]
+    InvalidClientVersion(String),
 }

@@ -79,27 +79,69 @@ case "$ACTION" in
 
     check)
         echo "[Audit] Checking existing firewall rules with manager: $MANAGER..."
+        PASS=1
         case "$MANAGER" in
             ufw)
-                ufw status verbose | grep -E "50051|5353" || echo "No AndroGrid specific rules active in ufw."
+                if ! ufw status verbose | grep -E "50051.*ALLOW" >/dev/null; then
+                    echo "  [MISSING] Port 50051/tcp not permitted in ufw."
+                    PASS=0
+                fi
+                if ! ufw status verbose | grep -E "5353.*ALLOW" >/dev/null; then
+                    echo "  [MISSING] Port 5353/udp not permitted in ufw."
+                    PASS=0
+                fi
                 ;;
             firewalld)
-                firewall-cmd --list-ports | grep -E "50051|5353" || echo "Ports 50051/5353 not open in active firewalld zone."
+                ZONE="$(firewall-cmd --get-default-zone 2>/dev/null || echo 'public')"
+                PORTS="$(firewall-cmd --zone="$ZONE" --list-ports 2>/dev/null || true)"
+                RICH="$(firewall-cmd --zone="$ZONE" --list-rich-rules 2>/dev/null || true)"
+                if ! echo "$PORTS $RICH" | grep -q "50051"; then
+                    echo "  [MISSING] Port 50051/tcp not found in firewalld zone $ZONE."
+                    PASS=0
+                fi
+                if ! echo "$PORTS $RICH" | grep -q "5353"; then
+                    echo "  [MISSING] Port 5353/udp not found in firewalld zone $ZONE."
+                    PASS=0
+                fi
                 ;;
             iptables)
-                iptables -L INPUT -n -v | grep -E "50051|5353" || echo "No iptables INPUT rules matching 50051/5353."
+                RULES="$(iptables -L INPUT -n -v 2>/dev/null || true)"
+                if ! echo "$RULES" | grep -E "50051" | grep -q "AndroGrid"; then
+                    echo "  [MISSING] Port 50051 TCP rule with AndroGrid comment not found in iptables."
+                    PASS=0
+                fi
+                if ! echo "$RULES" | grep -E "5353" | grep -q "AndroGrid"; then
+                    echo "  [MISSING] Port 5353 UDP rule with AndroGrid comment not found in iptables."
+                    PASS=0
+                fi
+                ;;
+            nftables)
+                echo "Error: nftables is active but automated rule management is not supported."
+                exit 2
                 ;;
             *)
-                echo "No supported active firewall manager detected (ufw, firewalld, nftables, iptables)."
+                echo "No supported active firewall manager detected (ufw, firewalld, iptables)."
                 echo "Ensure ports 50051 TCP and 5353 UDP are permitted on your host network interface."
-                exit 0
+                exit 2
                 ;;
         esac
-        exit 0
+
+        if [ "$PASS" -eq 1 ]; then
+            echo "Firewall audit PASSED: Inbound rules are properly configured."
+            exit 0
+        else
+            echo "Firewall audit INCOMPLETE: Run ./setup-firewall.sh --apply to configure."
+            exit 2
+        fi
         ;;
 
     apply)
         show_preview
+
+        if [ "$MANAGER" = "nftables" ]; then
+            echo "Error: nftables is detected but automated rule management is not yet supported. Please configure nftables rules manually or use iptables-nft translation layer." >&2
+            exit 1
+        fi
 
         if [ "$UNATTENDED" -eq 0 ]; then
             read -r -p "Do you want to proceed with applying these firewall rule changes? [y/N]: " confirm
@@ -143,13 +185,13 @@ case "$ACTION" in
                 ;;
             iptables)
                 echo "Configuring iptables rules..."
-                # Clean prior rules
-                iptables -D INPUT -p tcp --dport 50051 -m comment --comment "AndroGrid Control Plane gRPC" -j ACCEPT 2>/dev/null || true
-                iptables -D INPUT -p udp --dport 5353 -m comment --comment "AndroGrid mDNS Responder" -j ACCEPT 2>/dev/null || true
-                iptables -D INPUT -p tcp --dport 8080 -m comment --comment "AndroGrid Operator Dashboard" -j ACCEPT 2>/dev/null || true
-                iptables -D INPUT -p tcp --dport 50051 -j ACCEPT 2>/dev/null || true
-                iptables -D INPUT -p udp --dport 5353 -j ACCEPT 2>/dev/null || true
-                iptables -D INPUT -p tcp --dport 8080 -j ACCEPT 2>/dev/null || true
+                # Idempotently clean prior owned rules in a loop to avoid duplicate accumulation
+                while iptables -D INPUT -p tcp --dport 50051 -m comment --comment "AndroGrid Control Plane gRPC" -j ACCEPT 2>/dev/null; do :; done
+                while iptables -D INPUT -p udp --dport 5353 -m comment --comment "AndroGrid mDNS Responder" -j ACCEPT 2>/dev/null; do :; done
+                if [ -n "$SUBNET" ]; then
+                    while iptables -D INPUT -s "$SUBNET" -p tcp --dport 50051 -m comment --comment "AndroGrid Control Plane gRPC" -j ACCEPT 2>/dev/null; do :; done
+                    while iptables -D INPUT -s "$SUBNET" -p udp --dport 5353 -m comment --comment "AndroGrid mDNS Responder" -j ACCEPT 2>/dev/null; do :; done
+                fi
 
                 if [ -n "$SUBNET" ]; then
                     iptables -A INPUT -s "$SUBNET" -p tcp --dport 50051 -m comment --comment "AndroGrid Control Plane gRPC" -j ACCEPT
@@ -169,6 +211,21 @@ case "$ACTION" in
         ;;
 
     remove)
+        show_preview
+
+        if [ "$MANAGER" = "nftables" ]; then
+            echo "Error: nftables is detected but automated rule management is not yet supported." >&2
+            exit 1
+        fi
+
+        if [ "$UNATTENDED" -eq 0 ]; then
+            read -r -p "Do you want to proceed with removing these AndroGrid firewall rules? [y/N]: " confirm
+            case "$confirm" in
+                [yY][eE][sS]|[yY]) ;;
+                *) echo "Operation cancelled by operator."; exit 0 ;;
+            esac
+        fi
+
         if [ "$(id -u)" -ne 0 ]; then
             echo "Error: Root privileges (sudo) required to remove Linux firewall rules." >&2
             exit 1
@@ -198,16 +255,12 @@ case "$ACTION" in
                 ;;
             iptables)
                 echo "Removing iptables rules..."
+                while iptables -D INPUT -p tcp --dport 50051 -m comment --comment "AndroGrid Control Plane gRPC" -j ACCEPT 2>/dev/null; do :; done
+                while iptables -D INPUT -p udp --dport 5353 -m comment --comment "AndroGrid mDNS Responder" -j ACCEPT 2>/dev/null; do :; done
                 if [ -n "$SUBNET" ]; then
-                    iptables -D INPUT -s "$SUBNET" -p tcp --dport 50051 -m comment --comment "AndroGrid Control Plane gRPC" -j ACCEPT 2>/dev/null || true
-                    iptables -D INPUT -s "$SUBNET" -p udp --dport 5353 -m comment --comment "AndroGrid mDNS Responder" -j ACCEPT 2>/dev/null || true
+                    while iptables -D INPUT -s "$SUBNET" -p tcp --dport 50051 -m comment --comment "AndroGrid Control Plane gRPC" -j ACCEPT 2>/dev/null; do :; done
+                    while iptables -D INPUT -s "$SUBNET" -p udp --dport 5353 -m comment --comment "AndroGrid mDNS Responder" -j ACCEPT 2>/dev/null; do :; done
                 fi
-                iptables -D INPUT -p tcp --dport 50051 -m comment --comment "AndroGrid Control Plane gRPC" -j ACCEPT 2>/dev/null || true
-                iptables -D INPUT -p udp --dport 5353 -m comment --comment "AndroGrid mDNS Responder" -j ACCEPT 2>/dev/null || true
-                iptables -D INPUT -p tcp --dport 8080 -m comment --comment "AndroGrid Operator Dashboard" -j ACCEPT 2>/dev/null || true
-                iptables -D INPUT -p tcp --dport 50051 -j ACCEPT 2>/dev/null || true
-                iptables -D INPUT -p udp --dport 5353 -j ACCEPT 2>/dev/null || true
-                iptables -D INPUT -p tcp --dport 8080 -j ACCEPT 2>/dev/null || true
                 ;;
             *)
                 echo "No active firewall manager found to remove rules from."

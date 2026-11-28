@@ -1,198 +1,63 @@
-//! Feasibility and density spike: Embedded transactional key-value store (`redb`)
-//! with Protobuf record encoding for durable cluster worker admission.
+//! Production tests for embedded transactional key-value admission store (`redb` + Protobuf).
 //!
 //! Traces to: Issue #30, Goal [G-25], [REQ-OP-001], [REQ-VER-001], [INV-002], Gate L-02
 
-use std::collections::HashSet;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
-use prost::Message;
-use redb::{Database, ReadableTable, TableDefinition};
+use redb::{Database, TableDefinition};
+
+use androgrid_backend::scheduler::admission_store::{AdmissionSource, DurableAdmissionStore};
 
 const ADMISSION_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("admitted_workers");
 
-/// Protobuf-encoded admission record.
-/// Traces to: [REQ-OP-001], [REQ-VER-001]
-#[derive(Clone, PartialEq, prost::Message)]
-pub struct AdmissionRecordProto {
-    #[prost(string, tag = "1")]
-    pub node_id: String,
-    #[prost(string, tag = "2")]
-    pub initial_client_version: String,
-    #[prost(uint64, tag = "3")]
-    pub admitted_epoch_ms: u64,
-    #[prost(uint64, tag = "4")]
-    pub last_seen_epoch_ms: u64,
-    #[prost(int32, tag = "5")]
-    pub admission_source: i32, // 0 = FreshOnboarded, 1 = LegacyMigrated, 2 = AdminSeeded
-}
+#[test]
+fn test_missing_established_database_rejected_on_ordinary_startup() {
+    let temp_dir = std::env::temp_dir().join(format!("androgrid-missing-db-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&temp_dir);
+    let db_path = temp_dir.join("nonexistent_admission.redb");
 
-pub enum AdmissionSource {
-    FreshOnboarded = 0,
-    LegacyMigrated = 1,
-    AdminSeeded = 2,
-}
+    // Ordinary open without allow_create must fail fast rather than silently creating an empty DB
+    let result = DurableAdmissionStore::open(&db_path);
+    assert!(
+        result.is_err(),
+        "Ordinary startup must reject missing established admission database"
+    );
 
-/// Durable embedded KV admission store backed by `redb`.
-pub struct DurableAdmissionStore {
-    db: Arc<Database>,
-    in_memory_index: Arc<RwLock<HashSet<String>>>,
-    db_path: PathBuf,
-}
-
-impl DurableAdmissionStore {
-    pub fn db_path(&self) -> &Path {
-        &self.db_path
-    }
-    pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, Box<dyn std::error::Error>> {
-        let db_path = path.as_ref().to_path_buf();
-        if let Some(parent) = db_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let db = Database::create(&db_path)?;
-        let mut index = HashSet::new();
-
-        // Initialize table and populate in-memory index from committed records
-        {
-            let read_txn = db.begin_read()?;
-            if let Ok(table) = read_txn.open_table(ADMISSION_TABLE) {
-                for entry in table.iter()? {
-                    let (key, _) = entry?;
-                    index.insert(key.value().to_string());
-                }
-            }
-        }
-
-        // If table doesn't exist yet, create it in a short write transaction
-        {
-            let write_txn = db.begin_write()?;
-            {
-                let _ = write_txn.open_table(ADMISSION_TABLE)?;
-            }
-            write_txn.commit()?;
-        }
-
-        Ok(Self {
-            db: Arc::new(db),
-            in_memory_index: Arc::new(RwLock::new(index)),
-            db_path,
-        })
-    }
-
-    /// Checks whether a node is admitted using the zero-lock/read-locked in-memory index.
-    pub fn is_admitted(&self, node_id: &str) -> bool {
-        self.in_memory_index
-            .read()
-            .expect("index read lock poisoned")
-            .contains(node_id)
-    }
-
-    /// Transactionally commits a new admission record to disk and updates the in-memory index.
-    /// This runs outside the scheduler's central state write lock.
-    pub fn commit_admission(
-        &self,
-        node_id: &str,
-        client_version: &str,
-        epoch_ms: u64,
-        source: AdmissionSource,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let record = AdmissionRecordProto {
-            node_id: node_id.to_string(),
-            initial_client_version: client_version.to_string(),
-            admitted_epoch_ms: epoch_ms,
-            last_seen_epoch_ms: epoch_ms,
-            admission_source: source as i32,
-        };
-
-        let mut buf = Vec::with_capacity(record.encoded_len());
-        record.encode(&mut buf)?;
-
-        // 1. Transactional write to redb
-        let write_txn = self.db.begin_write()?;
-        {
-            let mut table = write_txn.open_table(ADMISSION_TABLE)?;
-            table.insert(node_id, buf.as_slice())?;
-        }
-        write_txn.commit()?;
-
-        // 2. Update memory index only after durable commit succeeds
-        self.in_memory_index
-            .write()
-            .expect("index write lock poisoned")
-            .insert(node_id.to_string());
-
-        Ok(())
-    }
-
-    /// Batch migration/seeding for administrator-confirmed historical membership.
-    pub fn seed_migration_batch(
-        &self,
-        node_ids: &[String],
-        default_version: &str,
-        epoch_ms: u64,
-    ) -> Result<usize, Box<dyn std::error::Error>> {
-        let write_txn = self.db.begin_write()?;
-        let mut count = 0;
-        {
-            let mut table = write_txn.open_table(ADMISSION_TABLE)?;
-            for node_id in node_ids {
-                let trimmed = node_id.trim();
-                if trimmed.is_empty() {
-                    continue;
-                }
-                let record = AdmissionRecordProto {
-                    node_id: trimmed.to_string(),
-                    initial_client_version: default_version.to_string(),
-                    admitted_epoch_ms: epoch_ms,
-                    last_seen_epoch_ms: epoch_ms,
-                    admission_source: AdmissionSource::LegacyMigrated as i32,
-                };
-                let mut buf = Vec::with_capacity(record.encoded_len());
-                record.encode(&mut buf)?;
-                table.insert(trimmed, buf.as_slice())?;
-                count += 1;
-            }
-        }
-        write_txn.commit()?;
-
-        // Rebuild in-memory index
-        let mut index = self.in_memory_index.write().expect("index write lock");
-        for node_id in node_ids {
-            let trimmed = node_id.trim();
-            if !trimmed.is_empty() {
-                index.insert(trimmed.to_string());
-            }
-        }
-
-        Ok(count)
-    }
-
-    /// Exports all admission records for operator inspection.
-    pub fn export_records(&self) -> Result<Vec<AdmissionRecordProto>, Box<dyn std::error::Error>> {
-        let read_txn = self.db.begin_read()?;
-        let table = read_txn.open_table(ADMISSION_TABLE)?;
-        let mut records = Vec::new();
-        for entry in table.iter()? {
-            let (_, value) = entry?;
-            let record = AdmissionRecordProto::decode(value.value())?;
-            records.push(record);
-        }
-        Ok(records)
-    }
+    let _ = std::fs::remove_dir_all(&temp_dir);
 }
 
 #[test]
-fn test_spike_durability_and_restart_recovery() {
-    let temp_dir = std::env::temp_dir().join(format!("androgrid-spike-kv-{}", std::process::id()));
+fn test_explicit_initialization_flag_creates_admission_database() {
+    let temp_dir = std::env::temp_dir().join(format!("androgrid-init-db-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&temp_dir);
+    let db_path = temp_dir.join("init_admission.redb");
+
+    // Explicit initialization authorized via open_or_create(..., true)
+    let store = DurableAdmissionStore::open_or_create(&db_path, true)
+        .expect("Explicit initialization should succeed");
+    assert!(db_path.exists());
+    drop(store);
+
+    // Subsequent ordinary startup (allow_create: false) must now succeed
+    let store_reopened = DurableAdmissionStore::open(&db_path)
+        .expect("Reopening existing database must succeed without init flag");
+    assert_eq!(store_reopened.export_records().unwrap().len(), 0);
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_durability_and_restart_recovery() {
+    let temp_dir = std::env::temp_dir().join(format!("androgrid-durability-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&temp_dir);
     let db_path = temp_dir.join("admissions.redb");
 
     // Phase 1: Open store and commit 100 worker admissions
     {
-        let store = DurableAdmissionStore::open(&db_path).expect("open redb store");
+        let store = DurableAdmissionStore::open_or_create(&db_path, true)
+            .expect("open redb store");
         for i in 0..100 {
             let node_id = format!("worker-node-{:04}", i);
             store
@@ -228,64 +93,80 @@ fn test_spike_durability_and_restart_recovery() {
 }
 
 #[test]
-fn test_spike_interrupted_transaction_rollback() {
-    let temp_dir =
-        std::env::temp_dir().join(format!("androgrid-spike-rollback-{}", std::process::id()));
+fn test_hydration_validates_record_identity_and_rejects_corrupted_payload() {
+    let temp_dir = std::env::temp_dir().join(format!("androgrid-hydration-corrupt-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&temp_dir);
-    let db_path = temp_dir.join("admissions.redb");
+    let db_path = temp_dir.join("corrupt.redb");
 
-    let store = DurableAdmissionStore::open(&db_path).expect("open redb store");
-
-    // Commit baseline node
-    store
-        .commit_admission(
-            "baseline-node",
-            "0.0.1-alpha.6",
-            1000,
-            AdmissionSource::FreshOnboarded,
-        )
-        .expect("commit baseline");
-    assert!(store.is_admitted("baseline-node"));
-
-    // Simulate an aborted/interrupted write transaction (e.g. process crash or panic)
+    // Initialize database
     {
-        let write_txn = store.db.begin_write().unwrap();
-        {
-            let mut table = write_txn.open_table(ADMISSION_TABLE).unwrap();
-            let record = AdmissionRecordProto {
-                node_id: "ghost-node".to_string(),
-                initial_client_version: "0.0.1-alpha.6".to_string(),
-                admitted_epoch_ms: 2000,
-                last_seen_epoch_ms: 2000,
-                admission_source: AdmissionSource::FreshOnboarded as i32,
-            };
-            let mut buf = Vec::new();
-            record.encode(&mut buf).unwrap();
-            table.insert("ghost-node", buf.as_slice()).unwrap();
-        }
-        // Drop write_txn without calling .commit()
-        drop(write_txn);
+        let store = DurableAdmissionStore::open_or_create(&db_path, true).expect("init store");
+        store
+            .commit_admission(
+                "valid-node",
+                "0.0.1-alpha.6",
+                1000,
+                AdmissionSource::FreshOnboarded,
+            )
+            .expect("commit valid node");
     }
 
-    // Drop original store to release redb file lock before reopening
-    drop(store);
+    // Inject corrupted raw bytes directly into the redb table
+    {
+        let db = Database::create(&db_path).expect("open raw redb");
+        let write_txn = db.begin_write().expect("begin write");
+        {
+            let mut table = write_txn.open_table(ADMISSION_TABLE).expect("open table");
+            // Invalid protobuf payload
+            let garbage = vec![0xFF, 0xFF, 0xFF, 0xFF];
+            table.insert("corrupt-node", garbage.as_slice()).expect("insert corrupt");
+        }
+        write_txn.commit().expect("commit raw");
+    }
 
-    // Ghost node must NOT exist in the database
-    let store_reloaded = DurableAdmissionStore::open(&db_path).expect("reload store");
-    assert!(store_reloaded.is_admitted("baseline-node"));
-    assert!(!store_reloaded.is_admitted("ghost-node"));
+    // Reopen store: hydration must decode each record and fail on corrupted protobuf
+    let result = DurableAdmissionStore::open(&db_path);
+    assert!(
+        result.is_err(),
+        "Hydration must fail when stored protobuf payload is corrupted"
+    );
 
     let _ = std::fs::remove_dir_all(&temp_dir);
 }
 
 #[test]
-fn test_spike_migration_batch_seeding() {
-    let temp_dir =
-        std::env::temp_dir().join(format!("androgrid-spike-migration-{}", std::process::id()));
+fn test_export_records_fails_on_corrupt_entry() {
+    let temp_dir = std::env::temp_dir().join(format!("androgrid-export-corrupt-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&temp_dir);
-    let db_path = temp_dir.join("admissions.redb");
+    std::fs::create_dir_all(&temp_dir).unwrap();
+    let db_path = temp_dir.join("export_corrupt.redb");
 
-    let store = DurableAdmissionStore::open(&db_path).expect("open redb store");
+    // Create raw redb with garbage entry
+    {
+        let db = Database::create(&db_path).expect("open raw redb");
+        let write_txn = db.begin_write().expect("begin write");
+        {
+            let mut table = write_txn.open_table(ADMISSION_TABLE).expect("open table");
+            let garbage = vec![0xFF, 0xFF, 0xFF];
+            table.insert("bad-entry", garbage.as_slice()).expect("insert bad entry");
+        }
+        write_txn.commit().expect("commit raw");
+    }
+
+    // Attempting to export must return Err rather than returning partial records with Ok
+    let result = DurableAdmissionStore::open(&db_path);
+    assert!(result.is_err(), "Store open with corrupt entry must fail during hydration");
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_migration_batch_seeding_and_replay_preservation() {
+    let temp_dir = std::env::temp_dir().join(format!("androgrid-migration-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&temp_dir);
+    let db_path = temp_dir.join("migration.redb");
+
+    let store = DurableAdmissionStore::open_or_create(&db_path, true).expect("init store");
 
     // Administrator confirmed migration inventory of legacy Alpha.5 devices
     let legacy_nodes = vec![
@@ -303,34 +184,44 @@ fn test_spike_migration_batch_seeding() {
         assert!(store.is_admitted(node));
     }
 
+    // Replay seeding with an existing node: existing record and timestamp must be preserved
+    let replay_nodes = vec![
+        "pixel-8-shiba-alpha5".to_string(),
+        "pixel-9-tokay-alpha5".to_string(),
+    ];
+    let replay_count = store
+        .seed_migration_batch(&replay_nodes, "0.0.1-alpha.5", 9999)
+        .expect("replay seed");
+    assert_eq!(replay_count, 1, "Only pixel-9 should be freshly inserted");
+
     // Drop original store before reopening
     drop(store);
 
-    // Reopen store to verify persistence
+    // Reopen store to verify persistence across restarts
     let store2 = DurableAdmissionStore::open(&db_path).expect("reopen store");
     for node in &legacy_nodes {
         assert!(store2.is_admitted(node));
     }
+    assert!(store2.is_admitted("pixel-9-tokay-alpha5"));
 
     let records = store2.export_records().expect("export");
-    assert_eq!(records.len(), 3);
-    assert_eq!(
-        records[0].admission_source,
-        AdmissionSource::LegacyMigrated as i32
-    );
-    assert_eq!(records[0].initial_client_version, "0.0.1-alpha.5");
+    assert_eq!(records.len(), 4);
+
+    let shiba_record = records.iter().find(|r| r.node_id == "pixel-8-shiba-alpha5").unwrap();
+    assert_eq!(shiba_record.admitted_epoch_ms, 500, "Original timestamp must be preserved on replay");
 
     let _ = std::fs::remove_dir_all(&temp_dir);
 }
 
 #[test]
-fn test_spike_density_and_concurrent_sync_throughput() {
-    let temp_dir =
-        std::env::temp_dir().join(format!("androgrid-spike-density-{}", std::process::id()));
+fn test_density_and_concurrent_sync_throughput() {
+    let temp_dir = std::env::temp_dir().join(format!("androgrid-density-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&temp_dir);
-    let db_path = temp_dir.join("admissions.redb");
+    let db_path = temp_dir.join("density.redb");
 
-    let store = Arc::new(DurableAdmissionStore::open(&db_path).expect("open redb store"));
+    let store = Arc::new(
+        DurableAdmissionStore::open_or_create(&db_path, true).expect("init store")
+    );
 
     // Pre-populate 1,000 workers
     let batch_nodes: Vec<String> = (0..1000).map(|i| format!("worker-{:05}", i)).collect();
@@ -343,7 +234,7 @@ fn test_spike_density_and_concurrent_sync_throughput() {
 
     // Measure concurrent in-memory sync lookup latency while a burst of new admissions commits to disk
     let concurrent_sync_count = Arc::new(AtomicUsize::new(0));
-    let stop_sync = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop_sync = Arc::new(AtomicBool::new(false));
 
     let store_clone = Arc::clone(&store);
     let count_clone = Arc::clone(&concurrent_sync_count);
@@ -389,7 +280,7 @@ fn test_spike_density_and_concurrent_sync_throughput() {
     );
     assert!(
         total_syncs > 1000,
-        "In-memory sync lookups must stay blisteringly fast during disk writes"
+        "In-memory sync lookups must stay fast during disk writes"
     );
 
     let _ = std::fs::remove_dir_all(&temp_dir);

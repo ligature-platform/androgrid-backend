@@ -122,6 +122,10 @@ pub struct ClusterConfig {
     /// Traces to: [REQ-OP-001], Gate L-02
     pub seeded_admitted_nodes: Option<String>,
 
+    /// Whether explicit initialization of the admission database is authorized (default: false).
+    /// Traces to: [REQ-OP-001], Gate L-02
+    pub init_admission_db: bool,
+
     /// Maximum allowed byte length for uploaded APK artifacts (default: 128 MB).
     /// Traces to: [NFR-PERF-001]
     pub max_apk_bytes: usize,
@@ -200,6 +204,7 @@ impl Default for ClusterConfig {
             admission_db_path: None,
             admission_inventory_path: None,
             seeded_admitted_nodes: None,
+            init_admission_db: false,
             max_apk_bytes: 128 * 1024 * 1024,
             enforce_hardware_attestation: false,
             require_attestation_challenge: false,
@@ -348,6 +353,10 @@ impl ClusterConfig {
 
         if let Ok(val) = std::env::var("ANDROGRID_SEEDED_ADMITTED_NODES") {
             config.seeded_admitted_nodes = Some(val);
+        }
+
+        if let Ok(val) = std::env::var("ANDROGRID_INIT_ADMISSION_DB") {
+            config.init_admission_db = parse_env_bool("ANDROGRID_INIT_ADMISSION_DB", &val)?;
         }
 
         if let Ok(val) = std::env::var("ANDROGRID_MAX_APK_BYTES") {

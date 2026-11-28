@@ -190,6 +190,10 @@ impl From<SchedulingError> for Status {
             } => Status::failed_precondition(format!(
                 "ONBOARDING_VERSION_BELOW_BASELINE: worker client version '{client_version}' is below approved onboarding baseline '{min_version}'. Manual APK upgrade required before first admission."
             )),
+
+            SchedulingError::InvalidClientVersion(msg) => {
+                Status::invalid_argument(format!("INVALID_ARGUMENT: {msg}"))
+            }
         }
     }
 }

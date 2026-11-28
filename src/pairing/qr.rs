@@ -124,6 +124,14 @@ pub fn resolve_direct_pairing_endpoint(cluster_endpoint: &str) -> (Option<String
     if let Some((h, p)) = stripped.rsplit_once(':') {
         if let Ok(port) = p.parse::<u16>() {
             let host = h.trim_start_matches('[').trim_end_matches(']').to_string();
+            // 1. Check explicit override ANDROGRID_HOST_IP first
+            if let Ok(host_ip) = std::env::var("ANDROGRID_HOST_IP") {
+                let trimmed = host_ip.trim();
+                if !trimmed.is_empty() {
+                    return (Some(trimmed.to_string()), Some(port));
+                }
+            }
+            // 2. If cluster endpoint host is non-loopback, non-unspecified IP/hostname, use it
             if host != "127.0.0.1"
                 && host != "localhost"
                 && host != "::1"
@@ -133,14 +141,7 @@ pub fn resolve_direct_pairing_endpoint(cluster_endpoint: &str) -> (Option<String
             {
                 return (Some(host), Some(port));
             }
-            // Check explicit override
-            if let Ok(host_ip) = std::env::var("ANDROGRID_HOST_IP") {
-                let trimmed = host_ip.trim();
-                if !trimmed.is_empty() {
-                    return (Some(trimmed.to_string()), Some(port));
-                }
-            }
-            // Fallback to route detection
+            // 3. Fallback to outbound LAN route detection
             if let Some(lan_ip) = crate::config::detect_outbound_lan_ipv4() {
                 return (Some(lan_ip.to_string()), Some(port));
             }

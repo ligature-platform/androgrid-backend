@@ -73,34 +73,28 @@ pub struct ClusterScheduler {
 /// Traces to: [REQ-VER-001], [REQ-OP-001], Gate L-02
 pub const APPROVED_ONBOARDING_BASELINE: &str = "0.0.1-alpha.6";
 
-/// Compares two client version strings (e.g. "0.0.1-alpha.5" and "0.0.1-alpha.6").
+/// Parses a client version string into a SemVer 2.0.0 Version.
 ///
+/// Strips leading 'v' or 'V' prefixes and whitespace. Rejects malformed version strings.
 /// Traces to: [REQ-VER-001]
-pub fn compare_client_versions(v1: &str, v2: &str) -> std::cmp::Ordering {
-    fn parse_version(v: &str) -> (u32, u32, u32, u32) {
-        let trimmed = v.trim().trim_start_matches('v');
-        // Strip SemVer build metadata (+...) before parsing pre-release component
-        let (without_build, _) = trimmed.split_once('+').unwrap_or((trimmed, ""));
-        let (core, pre) = without_build.split_once('-').unwrap_or((without_build, ""));
-        let mut core_parts = core.split('.').filter_map(|s| s.parse::<u32>().ok());
-        let major = core_parts.next().unwrap_or(0);
-        let minor = core_parts.next().unwrap_or(0);
-        let patch = core_parts.next().unwrap_or(0);
-        let alpha_num = if let Some((_, num_str)) = pre.split_once("alpha.") {
-            num_str.parse::<u32>().unwrap_or(0)
-        } else if pre.starts_with("alpha") {
-            pre.trim_start_matches("alpha").parse::<u32>().unwrap_or(0)
-        } else if pre.is_empty() {
-            // General release: higher than any pre-release
-            u32::MAX
-        } else {
-            // Non-alpha pre-release (beta, rc, etc)
-            100_000
-        };
-        (major, minor, patch, alpha_num)
-    }
+pub fn parse_client_version(v: &str) -> Result<semver::Version, SchedulingError> {
+    let trimmed = v.trim().trim_start_matches(|c| c == 'v' || c == 'V');
+    semver::Version::parse(trimmed).map_err(|e| {
+        SchedulingError::InvalidClientVersion(format!("Invalid SemVer client version '{v}': {e}"))
+    })
+}
 
-    parse_version(v1).cmp(&parse_version(v2))
+/// Compares two client version strings according to SemVer 2.0.0 precedence rules.
+///
+/// Build metadata (+...) is ignored during precedence comparison as per SemVer 2.0.0 Section 10.
+/// Traces to: [REQ-VER-001]
+pub fn compare_client_versions(v1: &str, v2: &str) -> Result<std::cmp::Ordering, SchedulingError> {
+    let mut p1 = parse_client_version(v1)?;
+    let mut p2 = parse_client_version(v2)?;
+    // SemVer 2.0.0 Section 10: Build metadata MUST be ignored when determining version precedence
+    p1.build = semver::BuildMetadata::EMPTY;
+    p2.build = semver::BuildMetadata::EMPTY;
+    Ok(p1.cmp(&p2))
 }
 
 impl Default for ClusterScheduler {
@@ -338,9 +332,8 @@ impl ClusterScheduler {
         let is_existing_member =
             inner.workers.contains_key(&node_id) || self.admission_store.is_admitted(&node_id);
         if !is_existing_member {
-            if compare_client_versions(&client_version, APPROVED_ONBOARDING_BASELINE)
-                == std::cmp::Ordering::Less
-            {
+            let ordering = compare_client_versions(&client_version, APPROVED_ONBOARDING_BASELINE)?;
+            if ordering == std::cmp::Ordering::Less {
                 tracing::warn!(
                     node_id = %node_id,
                     client_version = %client_version,
@@ -6121,29 +6114,50 @@ mod tests {
     #[test]
     fn test_compare_client_versions() {
         assert_eq!(
-            compare_client_versions("0.0.1-alpha.5", "0.0.1-alpha.6"),
+            compare_client_versions("0.0.1-alpha.5", "0.0.1-alpha.6").unwrap(),
             std::cmp::Ordering::Less
         );
         assert_eq!(
-            compare_client_versions("0.0.1-alpha.6", "0.0.1-alpha.6"),
+            compare_client_versions("0.0.1-alpha.6", "0.0.1-alpha.6").unwrap(),
             std::cmp::Ordering::Equal
         );
         assert_eq!(
-            compare_client_versions("0.0.1-alpha.7", "0.0.1-alpha.6"),
+            compare_client_versions("0.0.1-alpha.7", "0.0.1-alpha.6").unwrap(),
             std::cmp::Ordering::Greater
         );
         assert_eq!(
-            compare_client_versions("0.1.0", "0.0.1-alpha.6"),
+            compare_client_versions("0.1.0", "0.0.1-alpha.6").unwrap(),
             std::cmp::Ordering::Greater
         );
         assert_eq!(
-            compare_client_versions("1.0.0", "0.0.1-alpha.6"),
+            compare_client_versions("1.0.0", "0.0.1-alpha.6").unwrap(),
             std::cmp::Ordering::Greater
         );
         assert_eq!(
-            compare_client_versions("v0.0.1-alpha.6", "0.0.1-alpha.6"),
+            compare_client_versions("v0.0.1-alpha.6", "0.0.1-alpha.6").unwrap(),
             std::cmp::Ordering::Equal
         );
+        assert_eq!(
+            compare_client_versions("0.0.1-alpha.6+build.100", "0.0.1-alpha.6+build.200").unwrap(),
+            std::cmp::Ordering::Equal
+        );
+        // Numeric prerelease has lower precedence than alphanumeric prerelease (0 < alpha)
+        assert_eq!(
+            compare_client_versions("0.0.1-0", "0.0.1-alpha.6").unwrap(),
+            std::cmp::Ordering::Less
+        );
+        // Prerelease precedence: alpha < beta < rc
+        assert_eq!(
+            compare_client_versions("0.0.1-alpha.1", "0.0.1-beta.1").unwrap(),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            compare_client_versions("0.0.1-beta.1", "0.0.1-rc.1").unwrap(),
+            std::cmp::Ordering::Less
+        );
+        // Malformed versions return Err
+        assert!(compare_client_versions("0.bad.0.1-alpha.6", "0.0.1-alpha.6").is_err());
+        assert!(parse_client_version("not-a-version").is_err());
     }
 
     /// Verifies newly joining workers reporting client version below baseline are rejected.
