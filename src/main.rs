@@ -89,17 +89,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let admission_db_path = config.resolve_admission_db_path();
-    let admission_store = match androgrid_backend::DurableAdmissionStore::open(&admission_db_path) {
-        Ok(store) => Arc::new(store),
-        Err(e) => {
-            warn!(
+    let admission_store = Arc::new(
+        androgrid_backend::DurableAdmissionStore::open(&admission_db_path).map_err(|e| {
+            error!(
                 path = %admission_db_path.display(),
                 error = %e,
-                "Failed to open redb admission store; falling back to ephemeral in-memory store"
+                "Failed to open durable redb admission database: refusing silent fallback to ephemeral memory [REQ-OP-001, Gate L-02]"
             );
-            Arc::new(androgrid_backend::DurableAdmissionStore::new_in_memory())
-        }
-    };
+            e
+        })?,
+    );
 
     // Load administrator-confirmed historical membership inventory or environment seeds
     if let Some(ref inv_path) = config.admission_inventory_path {
@@ -369,15 +368,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Initialize mDNS DNS-SD service responder
     let mdns_responder = if config.enable_mdns {
-        let (direct_ip, _) =
+        let (direct_ip_or_host, _) =
             androgrid_backend::resolve_direct_pairing_endpoint(&config.resolve_cluster_endpoint());
+        let validated_ip = match direct_ip_or_host {
+            Some(ref ip_or_host) if ip_or_host.parse::<std::net::IpAddr>().is_ok() => {
+                Some(ip_or_host.clone())
+            }
+            Some(ref host) => match androgrid_backend::detect_outbound_lan_ipv4() {
+                Some(lan_ip) => Some(lan_ip.to_string()),
+                None => {
+                    warn!(
+                        endpoint = %host,
+                        "Cluster endpoint hostname is not a numeric IP and outbound LAN IPv4 was not detected; mDNS responder omitted direct IP"
+                    );
+                    None
+                }
+            },
+            None => androgrid_backend::detect_outbound_lan_ipv4().map(|ip| ip.to_string()),
+        };
         let mdns_cfg = MdnsConfig {
             instance_name: config.mdns_service_name.clone(),
             host_name: "androgrid.local.".to_string(),
             port: config.listen_addr.port(),
             version: env!("CARGO_PKG_VERSION").to_string(),
             ca_fingerprint: ca_fingerprint.clone(),
-            ip: direct_ip,
+            ip: validated_ip,
         };
         match MdnsResponder::start(mdns_cfg) {
             Ok(resp) => {

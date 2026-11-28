@@ -130,7 +130,9 @@ switch ($Action) {
                 $direction = $rule.Direction
                 $ruleProfile = $rule.Profile
 
-                $statusStr = if ($enabled -and $ruleAction -eq "Allow" -and $direction -eq "Inbound") { "ACTIVE" } else { "MISCONFIGURED" }
+                $portMatches = $portFilter.LocalPort -eq "$($r.Port)"
+                $protocolMatches = $rule.Protocol -eq $r.Protocol
+                $statusStr = if ($enabled -and $ruleAction -eq "Allow" -and $direction -eq "Inbound" -and $portMatches -and $protocolMatches) { "ACTIVE" } else { "MISCONFIGURED" }
                 $color = if ($statusStr -eq "ACTIVE") { "Green" } else { "Red" }
 
                 Write-Host "  [$statusStr] $($r.DisplayName) ($($r.Protocol) Port $($portFilter.LocalPort))" -ForegroundColor $color
@@ -182,8 +184,8 @@ switch ($Action) {
         if (-not (Test-IsAdmin)) {
             Write-Host "Administrative elevation required to remove firewall rules." -ForegroundColor Red
             Write-Host "Re-launching with elevation..." -ForegroundColor Yellow
-            Start-Process powershell -Verb RunAs -ArgumentList "-ExecutionPolicy Bypass -File `"$PSCommandPath`" -Action Remove"
-            exit 0
+            $proc = Start-Process powershell -Verb RunAs -ArgumentList "-ExecutionPolicy Bypass -File `"$PSCommandPath`" -Action Remove" -PassThru -Wait
+            exit $proc.ExitCode
         }
 
         Write-Host "[Tear Down] Removing all AndroGrid firewall rules..." -ForegroundColor Cyan

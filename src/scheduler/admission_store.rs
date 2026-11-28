@@ -106,22 +106,7 @@ impl DurableAdmissionStore {
             ))
         })?;
 
-        let mut index = HashSet::new();
-
-        // Hydrate in-memory index from existing committed records
-        {
-            if let Ok(read_txn) = db.begin_read() {
-                if let Ok(table) = read_txn.open_table(ADMISSION_TABLE) {
-                    if let Ok(mut iter) = table.iter() {
-                        while let Some(Ok((key, _))) = iter.next() {
-                            index.insert(key.value().to_string());
-                        }
-                    }
-                }
-            }
-        }
-
-        // Ensure table exists via short write transaction
+        // Ensure table exists via short write transaction before hydration
         {
             let write_txn = db.begin_write().map_err(|e| {
                 SchedulingError::StorageError(format!(
@@ -138,6 +123,35 @@ impl DurableAdmissionStore {
                     "Failed to commit init write transaction: {e}"
                 ))
             })?;
+        }
+
+        let mut index = HashSet::new();
+
+        // Hydrate in-memory index from existing committed records, propagating errors
+        {
+            let read_txn = db.begin_read().map_err(|e| {
+                SchedulingError::StorageError(format!(
+                    "Failed to begin read transaction for hydration: {e}"
+                ))
+            })?;
+            let table = read_txn.open_table(ADMISSION_TABLE).map_err(|e| {
+                SchedulingError::StorageError(format!(
+                    "Failed to open admission table for hydration: {e}"
+                ))
+            })?;
+            let iter = table.iter().map_err(|e| {
+                SchedulingError::StorageError(format!(
+                    "Failed to iterate admission table during hydration: {e}"
+                ))
+            })?;
+            for item in iter {
+                let (key, _) = item.map_err(|e| {
+                    SchedulingError::StorageError(format!(
+                        "Failed to read hydration item from admission table: {e}"
+                    ))
+                })?;
+                index.insert(key.value().to_string());
+            }
         }
 
         info!(
@@ -247,6 +261,18 @@ impl DurableAdmissionStore {
                     if trimmed.is_empty() {
                         continue;
                     }
+                    if table
+                        .get(trimmed)
+                        .map_err(|e| {
+                            SchedulingError::StorageError(format!(
+                                "Failed to check existing admission record during migration: {e}"
+                            ))
+                        })?
+                        .is_some()
+                    {
+                        // Node is already admitted; preserve existing record and timestamp
+                        continue;
+                    }
                     let record = AdmissionRecordProto {
                         node_id: trimmed.to_string(),
                         initial_client_version: default_version.to_string(),
@@ -348,8 +374,14 @@ impl DurableAdmissionStore {
                         "Failed to read admission table entry: {e}"
                     ))
                 })?;
-                if let Ok(record) = AdmissionRecordProto::decode(value.value()) {
-                    records.push(record);
+                match AdmissionRecordProto::decode(value.value()) {
+                    Ok(record) => records.push(record),
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "Corrupted or invalid protobuf payload in admission table entry"
+                        );
+                    }
                 }
             }
             Ok(records)

@@ -26,6 +26,7 @@ pub struct AndroGridServiceImpl {
     scheduler: Arc<ClusterScheduler>,
     artifact_store: Arc<ArtifactStore>,
     renewal_manager: Arc<CertRenewalManager>,
+    admission_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 impl AndroGridServiceImpl {
@@ -36,6 +37,7 @@ impl AndroGridServiceImpl {
             scheduler,
             artifact_store: Arc::new(ArtifactStore::new()),
             renewal_manager: Arc::new(CertRenewalManager::new(None, CertRenewalPolicy::default())),
+            admission_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
         }
     }
 
@@ -48,6 +50,7 @@ impl AndroGridServiceImpl {
             scheduler,
             artifact_store,
             renewal_manager: Arc::new(CertRenewalManager::new(None, CertRenewalPolicy::default())),
+            admission_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
         }
     }
 
@@ -63,6 +66,7 @@ impl AndroGridServiceImpl {
             scheduler,
             artifact_store,
             renewal_manager,
+            admission_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
         }
     }
 
@@ -118,14 +122,41 @@ impl AndroGridService for AndroGridServiceImpl {
             .ok_or_else(|| Status::invalid_argument("NodeCapabilities must be provided"))?;
 
         let now_ms = Self::now_epoch_ms();
-        let response = self.scheduler.register_node_full(
-            req.node_id,
-            capabilities,
-            req.client_version,
-            req.labels,
-            req.last_upgrade_outcome,
-            now_ms,
-        )?;
+        let is_existing = self.scheduler.is_node_admitted(&req.node_id);
+        let scheduler = self.scheduler.clone();
+
+        let response = if is_existing {
+            scheduler.register_node_full(
+                req.node_id,
+                capabilities,
+                req.client_version,
+                req.labels,
+                req.last_upgrade_outcome,
+                now_ms,
+            )?
+        } else {
+            // New worker admission involves durable disk I/O; isolate on blocking pool guarded by single-permit semaphore
+            let permit = self
+                .admission_semaphore
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|_| Status::internal("Admission semaphore closed"))?;
+            tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                scheduler.register_node_full(
+                    req.node_id,
+                    capabilities,
+                    req.client_version,
+                    req.labels,
+                    req.last_upgrade_outcome,
+                    now_ms,
+                )
+            })
+            .await
+            .map_err(|e| Status::internal(format!("Admission task panicked: {e}")))?
+            .map_err(Status::from)?
+        };
 
         Ok(Response::new(response))
     }

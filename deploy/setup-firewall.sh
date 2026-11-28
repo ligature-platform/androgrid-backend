@@ -130,8 +130,13 @@ case "$ACTION" in
                 ;;
             firewalld)
                 echo "Configuring firewalld rules..."
-                firewall-cmd --permanent --add-port=50051/tcp
-                firewall-cmd --permanent --add-port=5353/udp
+                if [ -n "$SUBNET" ]; then
+                    firewall-cmd --permanent --add-rich-rule="rule family='ipv4' source address='$SUBNET' port port='50051' protocol='tcp' accept"
+                    firewall-cmd --permanent --add-rich-rule="rule family='ipv4' source address='$SUBNET' port port='5353' protocol='udp' accept"
+                else
+                    firewall-cmd --permanent --add-port=50051/tcp
+                    firewall-cmd --permanent --add-port=5353/udp
+                fi
                 firewall-cmd --permanent --remove-port=8080/tcp 2>/dev/null || true
                 firewall-cmd --reload
                 echo "[OK] firewalld configuration updated."
@@ -172,12 +177,20 @@ case "$ACTION" in
         case "$MANAGER" in
             ufw)
                 echo "Removing ufw rules..."
+                if [ -n "$SUBNET" ]; then
+                    ufw delete allow from "$SUBNET" to any port 50051 proto tcp 2>/dev/null || true
+                    ufw delete allow from "$SUBNET" to any port 5353 proto udp 2>/dev/null || true
+                fi
                 ufw delete allow 50051/tcp 2>/dev/null || true
                 ufw delete allow 5353/udp 2>/dev/null || true
                 ufw delete allow 8080/tcp 2>/dev/null || true
                 ;;
             firewalld)
                 echo "Removing firewalld rules..."
+                if [ -n "$SUBNET" ]; then
+                    firewall-cmd --permanent --remove-rich-rule="rule family='ipv4' source address='$SUBNET' port port='50051' protocol='tcp' accept" 2>/dev/null || true
+                    firewall-cmd --permanent --remove-rich-rule="rule family='ipv4' source address='$SUBNET' port port='5353' protocol='udp' accept" 2>/dev/null || true
+                fi
                 firewall-cmd --permanent --remove-port=50051/tcp 2>/dev/null || true
                 firewall-cmd --permanent --remove-port=5353/udp 2>/dev/null || true
                 firewall-cmd --permanent --remove-port=8080/tcp 2>/dev/null || true
@@ -185,6 +198,10 @@ case "$ACTION" in
                 ;;
             iptables)
                 echo "Removing iptables rules..."
+                if [ -n "$SUBNET" ]; then
+                    iptables -D INPUT -s "$SUBNET" -p tcp --dport 50051 -m comment --comment "AndroGrid Control Plane gRPC" -j ACCEPT 2>/dev/null || true
+                    iptables -D INPUT -s "$SUBNET" -p udp --dport 5353 -m comment --comment "AndroGrid mDNS Responder" -j ACCEPT 2>/dev/null || true
+                fi
                 iptables -D INPUT -p tcp --dport 50051 -m comment --comment "AndroGrid Control Plane gRPC" -j ACCEPT 2>/dev/null || true
                 iptables -D INPUT -p udp --dport 5353 -m comment --comment "AndroGrid mDNS Responder" -j ACCEPT 2>/dev/null || true
                 iptables -D INPUT -p tcp --dport 8080 -m comment --comment "AndroGrid Operator Dashboard" -j ACCEPT 2>/dev/null || true

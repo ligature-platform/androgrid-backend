@@ -79,7 +79,9 @@ pub const APPROVED_ONBOARDING_BASELINE: &str = "0.0.1-alpha.6";
 pub fn compare_client_versions(v1: &str, v2: &str) -> std::cmp::Ordering {
     fn parse_version(v: &str) -> (u32, u32, u32, u32) {
         let trimmed = v.trim().trim_start_matches('v');
-        let (core, pre) = trimmed.split_once('-').unwrap_or((trimmed, ""));
+        // Strip SemVer build metadata (+...) before parsing pre-release component
+        let (without_build, _) = trimmed.split_once('+').unwrap_or((trimmed, ""));
+        let (core, pre) = without_build.split_once('-').unwrap_or((without_build, ""));
         let mut core_parts = core.split('.').filter_map(|s| s.parse::<u32>().ok());
         let major = core_parts.next().unwrap_or(0);
         let minor = core_parts.next().unwrap_or(0);
